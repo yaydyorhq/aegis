@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "aevora-clone",
+  "productName": "Aevora",
   "version": "0.1.0",
   "identifier": "com.lenovo-log.aevora-clone",
   "build": {
@@ -12,9 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "aevora-clone",
-        "width": 800,
-        "height": 600
+        "title": "Aevora",
+        "width": 1280,
+        "height": 720,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "decorations": false,
+        "transparent": false
       }
     ],
     "security": {
