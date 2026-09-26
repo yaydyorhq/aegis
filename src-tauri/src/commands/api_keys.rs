@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::vault;
 use crate::wallet_store;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 #[derive(Serialize)]
 pub struct ApiKeyRow {
@@ -56,10 +57,21 @@ pub fn api_key_list() -> AppResult<Vec<ApiKeyRow>> {
         // still show providers without decrypting? show empty for safety
         return Ok(vec![]);
     }
-    crate::db::with_conn(|conn| {
+    // M02: decrypt into a Zeroizing buffer so the plaintext bytes are wiped
+    // on drop instead of lingering in an owned String on the heap.  The mask
+    // borrows from the Zeroizing buffer (Cow<str> → &str, no copy for valid
+    // UTF-8) and only head[4] + tail[4] chars survive in the returned String.
+    //
+    // M03: a decrypt failure marks the row `<unreadable>` instead of
+    // `unwrap_or_default()` → "" → which renders identically to a short key.
+    // Corrupt providers are collected here and logged AFTER the connection
+    // guard drops — log_activity re-acquires the same global DB mutex and
+    // would deadlock inside this closure.
+    let (rows, corrupt) = crate::db::with_conn(|conn| {
         let mut stmt =
             conn.prepare("SELECT id, provider, key_enc, nonce, base_url FROM api_keys ORDER BY provider")?;
         let mut out = Vec::new();
+        let mut corrupt: Vec<String> = Vec::new();
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
@@ -67,17 +79,33 @@ pub fn api_key_list() -> AppResult<Vec<ApiKeyRow>> {
             let ct: Vec<u8> = row.get(2)?;
             let nonce: Vec<u8> = row.get(3)?;
             let base_url: Option<String> = row.get(4)?;
-            let plain = vault::decrypt(&nonce, &ct).unwrap_or_default();
-            let key = String::from_utf8_lossy(&plain).to_string();
+            let masked = match vault::decrypt(&nonce, &ct) {
+                Ok(bytes) => mask_key(&String::from_utf8_lossy(&Zeroizing::new(bytes))),
+                Err(_) => {
+                    corrupt.push(provider.clone());
+                    "<unreadable>".to_string()
+                }
+            };
             out.push(ApiKeyRow {
                 id,
                 provider,
-                masked: mask_key(&key),
+                masked,
                 base_url,
             });
         }
-        Ok(out)
-    })
+        Ok((out, corrupt))
+    })?;
+    for provider in &corrupt {
+        wallet_store::log_activity(
+            "api_key.error",
+            &format!(
+                "Failed to decrypt API key for provider `{provider}` (corrupt row or wrong vault session)"
+            ),
+            None,
+            false,
+        );
+    }
+    Ok(rows)
 }
 
 #[tauri::command]

@@ -66,7 +66,40 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// SQLite identifiers (table/column) interpolated into raw SQL.
+/// Only `[A-Za-z0-9_]` up to 64 chars — a future caller can never smuggle
+/// user input into `PRAGMA table_info()` / `ALTER TABLE` via these params.
+fn valid_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Column declarations come from hardcoded callers, but still guard them:
+/// no `;`, `--`, backticks or double quotes (comments / statement stacking).
+fn valid_decl(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 160
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '_' | ',' | '(' | ')' | '\'' | '.')
+        })
+        && !s.contains("--")
+        && !s.contains(';')
+}
+
 fn ensure_column(conn: &Connection, table: &str, name: &str, decl: &str) -> AppResult<()> {
+    if !valid_ident(table) || !valid_ident(name) {
+        return Err(AppError::Other(format!(
+            "unsafe SQL identifier: {table}.{name}"
+        )));
+    }
+    if !valid_decl(decl) {
+        return Err(AppError::Other(format!(
+            "unsafe column declaration for {name}"
+        )));
+    }
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     let mut found = false;
@@ -147,11 +180,21 @@ fn seed_chains(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// `SystemTime::now().duration_since(UNIX_EPOCH)` with an honest fallback:
+/// if the clock sits before 1970 we report *negative* milliseconds instead
+/// of collapsing to epoch 0.  Epoch 0 would freeze every `scheduled_at` gate
+/// (`0 < scheduled_at` never fires → queued mints silently stall forever).
+fn millis_since_epoch(
+    since: Result<std::time::Duration, std::time::SystemTimeError>,
+) -> i64 {
+    match since {
+        Ok(d) => d.as_millis() as i64,
+        Err(e) => -(e.duration().as_millis() as i64),
+    }
+}
+
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    millis_since_epoch(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
 }
 
 pub fn meta_get(key: &str) -> AppResult<Option<String>> {

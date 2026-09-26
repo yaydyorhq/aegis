@@ -2,6 +2,8 @@ mod chain;
 mod collection_pnl;
 mod commands;
 mod db;
+#[cfg(test)]
+mod e2e_integration_tests;
 mod error;
 mod fund;
 mod mint;
