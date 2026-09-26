@@ -74,6 +74,10 @@ export function MintingPage() {
   const [fetchingOpenSea, setFetchingOpenSea] = useState(false);
   const [openSeaErr, setOpenSeaErr] = useState<string | null>(null);
   const [enqueueingOpenSea, setEnqueueingOpenSea] = useState(false);
+  const [encodedPreview, setEncodedPreview] = useState<string | null>(null);
+  const [encoding, setEncoding] = useState(false);
+  const [encodeErr, setEncodeErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const seenTaskIds = useRef<Set<number>>(new Set());
   const seenStatuses = useRef<Map<number, string>>(new Map());
   const primedTasks = useRef(false);
@@ -602,6 +606,72 @@ export function MintingPage() {
     }
   }
 
+  /// Preview the exact calldata that will be signed for the first selected
+  /// wallet.  Catches ABI mistakes (unpadded address, wrong arg count) before
+  /// the batch is enqueued.
+  async function onEncode() {
+    setEncodeErr(null);
+    setEncodedPreview(null);
+    if (!form.functionPreset && !form.customFn) {
+      setEncodeErr("Pick or type a function first");
+      return;
+    }
+    if (form.isHex) {
+      setEncodeErr("Encode works on Function mode — switch HEX off, or paste raw calldata");
+      return;
+    }
+    const fn =
+      form.functionPreset === "custom" ? form.customFn.trim() : form.functionPreset;
+    if (!fn.includes("(")) {
+      setEncodeErr("Function must look like name(types)");
+      return;
+    }
+    if (selectedWalletIds.length === 0) {
+      setEncodeErr("Select a wallet first — calldata embeds its address");
+      return;
+    }
+    const w = wallets.find((x) => x.id === selectedWalletIds[0]);
+    if (!w) {
+      setEncodeErr("Selected wallet not found");
+      return;
+    }
+    setEncoding(true);
+    try {
+      const cd = await ipc<string>("mint_encode_calldata", {
+        functionName: fn,
+        parameters: form.parameters.trim(),
+        quantity: Math.max(1, Math.floor(Number(form.quantity) || 1)),
+        walletAddress: w.address,
+      });
+      setEncodedPreview(cd);
+    } catch (e) {
+      setEncodeErr(String(e));
+    } finally {
+      setEncoding(false);
+    }
+  }
+
+  async function onCopyEncoded() {
+    if (!encodedPreview) return;
+    try {
+      await navigator.clipboard.writeText(encodedPreview);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setEncodeErr("Clipboard blocked — select and copy manually");
+    }
+  }
+
+  /// Ship the previewed calldata into the HEX field, so you can queue it
+  /// verbatim without relying on the encoder at run time.
+  function onUseEncodedAsHex() {
+    if (!encodedPreview) return;
+    setForm({ ...form, isHex: true, hexCalldata: encodedPreview });
+    setEncodedPreview(null);
+    setEncodeErr(null);
+    pushToast("Copied to HEX field", "ok", "Re-select your wallets, then Queue");
+  }
+
   async function onCancel(id: number) {
     try {
       await ipc("mint_cancel", { id });
@@ -846,7 +916,13 @@ export function MintingPage() {
           {/* Function + HEX checkbox */}
           <div className="mb-3 grid grid-cols-[1fr_auto] gap-2">
             <div>
-              <label className="mb-1 block text-[11px] text-muted">Function</label>
+              <label className="mb-1 block text-[11px] text-muted">
+                {form.isHex ? (
+                  <>Raw calldata <span className="opacity-60">— {"{address}"} auto-padded to 32 bytes</span></>
+                ) : (
+                  <>Function</>
+                )}
+              </label>
               {form.isHex ? (
                 <input
                   placeholder="0xcalldata… ({address} allowed)"
@@ -887,6 +963,55 @@ export function MintingPage() {
               </label>
             </div>
           </div>
+
+          {/* Encode preview — only in Function mode */}
+          {!form.isHex && form.functionPreset === "custom" && form.customFn.trim() && (
+            <div className="mb-3 rounded-lg border border-accent/30 bg-accent/5 p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] text-accent">Calldata Preview</span>
+                <button
+                  type="button"
+                  onClick={onEncode}
+                  disabled={encoding || selectedWalletIds.length === 0}
+                  className="flex items-center gap-1 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1 text-[12px] text-accent hover:bg-accent/20 disabled:opacity-40"
+                >
+                  <Zap className="h-3 w-3" />
+                  {encoding ? "Encoding..." : "Encode"}
+                </button>
+              </div>
+              {encodeErr && (
+                <p className="mb-2 text-[12px] text-danger">{encodeErr}</p>
+              )}
+              {encodedPreview && (
+                <>
+                  <div className="group relative">
+                    <pre className="max-h-24 overflow-x-auto rounded-lg border border-line bg-bg p-2 font-mono text-[11px] text-fg leading-relaxed break-all whitespace-pre-wrap">
+                      {encodedPreview}
+                    </pre>
+                    <button
+                      type="button"
+                      onClick={onCopyEncoded}
+                      className="absolute right-2 top-2 rounded-md border border-line bg-card px-1.5 py-0.5 text-[10px] text-muted opacity-0 transition hover:text-fg group-hover:opacity-100"
+                    >
+                      {copied ? "copied" : "copy"}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onUseEncodedAsHex}
+                    className="mt-2 rounded-lg border border-line bg-card px-2.5 py-1 text-[12px] text-fg hover:border-muted/40"
+                  >
+                    Use as HEX calldata →
+                  </button>
+                </>
+              )}
+              {!encodedPreview && !encodeErr && !encoding && (
+                <p className="text-[11px] text-muted">
+                  Click Encode to see the exact calldata for wallet #{selectedWalletIds[0] ?? "?"}
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Parameters + Value */}
           <div className="mb-3 grid grid-cols-2 gap-2">

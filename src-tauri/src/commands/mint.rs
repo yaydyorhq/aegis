@@ -430,3 +430,22 @@ pub fn mint_cancel(id: i64) -> AppResult<()> {
 pub async fn mint_run() -> AppResult<Vec<MintTaskRow>> {
     mint::run_pending().await
 }
+
+/// Encode calldata snapshot for one wallet + function signature.
+/// Used by the UI "Encode" button so users can preview the exact hex
+/// (and fix template mistakes) before enqueueing a batch.
+#[tauri::command]
+pub fn mint_encode_calldata(
+    function_name: String,
+    parameters: String,
+    quantity: i64,
+    wallet_address: String,
+) -> AppResult<String> {
+    mint::build_calldata_from_fn(
+        &function_name,
+        Some(&parameters),
+        quantity,
+        &wallet_address,
+    )
+}
+

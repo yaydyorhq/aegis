@@ -99,6 +99,7 @@ pub fn run() {
             commands::mint::mint_opensea_enqueue,
             commands::mint::mint_allowlist_parse,
             commands::mint::mint_allowlist_match,
+            commands::mint::mint_encode_calldata,
             // funds (disperse / consolidate)
             commands::fund::funds_preview,
             commands::fund::funds_start,
