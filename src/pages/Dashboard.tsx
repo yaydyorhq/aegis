@@ -67,7 +67,15 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
   const flow = pf?.net_flow_eth ?? null;
   const lastAt = col?.scanned_at ?? pf?.latest_at ?? null;
   const netNum = col?.net_eth != null ? Number(col.net_eth) : null;
+  const netStr =
+    col?.net_eth != null
+      ? netNum != null && netNum > 0 && !col.net_eth.startsWith("+")
+        ? `+${col.net_eth}`
+        : col.net_eth
+      : null;
   const netCls = netNum == null ? "text-muted" : netNum >= 0 ? "text-ok" : "text-danger";
+  const flowStr =
+    flow != null && Number(flow) > 0 && !flow.startsWith("+") ? `+${flow}` : flow;
   const flowCls = flow == null ? "text-muted" : Number(flow) < 0 ? "text-danger" : "text-ok";
   const hasData = !!(col || (pf && pf.pairs > 0));
 
@@ -146,9 +154,7 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
                       ) : null}
                     </div>
                     <div className={`mt-1 text-[30px] font-semibold tracking-tight ${netCls}`}>
-                      {netNum != null
-                        ? `${netNum > 0 ? "+" : ""}${col.net_eth} ${col.native_symbol}`
-                        : `n/a ${col.native_symbol}`}
+                      {netStr != null ? `${netStr} ${col.native_symbol}` : `n/a ${col.native_symbol}`}
                     </div>
                     {col.roi_pct != null ? (
                       <div className={`text-[12px] ${netCls}`}>
@@ -183,7 +189,7 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
                       Portfolio net flow · {pf.wallets} wallet(s), {pf.pairs} chain scan(s)
                     </span>
                     <span className={flowCls}>
-                      {flow != null ? `${flow} ETH` : "n/a"}
+                      {flowStr != null ? `${flowStr} ETH` : "n/a"}
                     </span>
                   </div>
                 ) : null}
