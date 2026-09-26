@@ -1,5 +1,9 @@
+mod commands;
 mod db;
 mod error;
+mod vault;
+mod wallet;
+mod wallet_store;
 
 use tauri::Manager;
 
@@ -13,7 +17,16 @@ pub fn run() {
             db::init(&db_path)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![])
+        .invoke_handler(tauri::generate_handler![
+            commands::vault::vault_status,
+            commands::vault::vault_unlock,
+            commands::vault::vault_lock,
+            commands::vault::wallet_list,
+            commands::vault::wallet_generate,
+            commands::vault::wallet_import,
+            commands::vault::wallet_delete,
+            commands::vault::wallet_export,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
