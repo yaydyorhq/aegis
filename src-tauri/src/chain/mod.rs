@@ -35,6 +35,10 @@ pub struct RpcTestResult {
     pub chain_id_returned: Option<i64>,
     pub latency_ms: Option<u64>,
     pub error: Option<String>,
+    /// Whether this endpoint supports `eth_call` (contract interaction).
+    /// Free gateways like Cloudflare sometimes fail this — indicates the
+    /// endpoint will break on mint tasks.
+    pub eth_call_ok: Option<bool>,
 }
 
 pub fn list_chains() -> AppResult<Vec<ChainRow>> {
@@ -194,26 +198,37 @@ pub async fn test_chain(id: i64) -> AppResult<RpcTestResult> {
         Ok(chain_id) => {
             let latency = start.elapsed().as_millis() as u64;
             let ok = chain_id == chain.chain_id;
+            // Probe eth_call capability — catches Cloudflare/gateway nodes that
+            // accept eth_chainId but fail on contract interaction (-32603).
+            let (cid, _blk, call_ok, probe_latency, probe_err) =
+                rpc_health_probe(&chain.rpc_url).await;
+            let latency = probe_latency.max(latency);
+            let eth_call_ok = Some(call_ok);
+            let err_msg = if !ok {
+                Some(format!("expected {}, got {}", chain.chain_id, chain_id))
+            } else if !call_ok {
+                probe_err.or_else(|| Some("eth_call failed".into()))
+            } else {
+                None
+            };
             wallet_store::log_activity(
                 "rpc.test",
                 &format!(
-                    "{} RPC {} ({} ms)",
+                    "{} RPC {} ({} ms, eth_call {})",
                     chain.name,
                     if ok { "OK" } else { "chain mismatch" },
-                    latency
+                    latency,
+                    if call_ok { "ok" } else { "FAILED" }
                 ),
                 None,
-                ok,
+                ok && call_ok,
             );
             Ok(RpcTestResult {
-                ok,
-                chain_id_returned: Some(chain_id),
+                ok: ok && call_ok,
+                chain_id_returned: cid.or(Some(chain_id)),
                 latency_ms: Some(latency),
-                error: if ok {
-                    None
-                } else {
-                    Some(format!("expected {}, got {}", chain.chain_id, chain_id))
-                },
+                error: err_msg,
+                eth_call_ok,
             })
         }
         Err(e) => {
@@ -228,6 +243,7 @@ pub async fn test_chain(id: i64) -> AppResult<RpcTestResult> {
                 chain_id_returned: None,
                 latency_ms: Some(start.elapsed().as_millis() as u64),
                 error: Some(e.to_string()),
+                eth_call_ok: Some(false),
             })
         }
     }
@@ -243,6 +259,64 @@ pub async fn eth_chain_id(rpc_url: &str) -> AppResult<i64> {
         .map_err(|_| AppError::Rpc("bad chainId".into()))
 }
 
+/// Light capability probe: eth_chainId + eth_blockNumber + a trivial
+/// eth_call (ERC20 totalSupply selector 0x18160ddd on the zero address).
+/// Returns (chain_id, block_number_ms, eth_call_ok, latency_ms, error_msg).
+pub async fn rpc_health_probe(url: &str) -> (Option<i64>, Option<u64>, bool, u64, Option<String>) {
+    let start = std::time::Instant::now();
+
+    // 1. chainId
+    let chain_id = eth_chain_id(url).await.ok();
+
+    // 2. blockNumber
+    let block_number = match rpc_call(url, "eth_blockNumber", serde_json::json!([])).await {
+        Ok(v) => v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+        Err(_) => None,
+    };
+
+    // 3. eth_call — the test that Cloudflare (and other lightweight gateways)
+    //    fail.  We call `totalSupply()` on the zero address; the revert is
+    //    expected — what we check is whether the node *tries* to execute it
+    //    (returns error code 3 = revert) instead of crashing with -32603.
+    let call_ok = match rpc_call(
+        url,
+        "eth_call",
+        serde_json::json!([{ "to": "0x0000000000000000000000000000000000000000", "data": "0x18160ddd" }, "latest"]),
+    )
+    .await
+    {
+        Ok(v) => {
+            // A revert (code 3) means the node executed the call — that's OK.
+            // -32603 / "Internal error" means it could not even try.
+            let is_internal = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|m| m.contains("Internal error") || m.contains("-32603"))
+                .unwrap_or(false);
+            !is_internal
+        }
+        Err(_) => false,
+    };
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    (
+        chain_id,
+        block_number,
+        call_ok,
+        latency_ms,
+        if !call_ok {
+            Some("eth_call capability missing (this RPC may fail on mint tasks — add another endpoint as fallback)".into())
+        } else if chain_id.is_none() {
+            Some("chainId unreachable".into())
+        } else {
+            None
+        },
+    )
+}
 pub async fn native_balance(rpc_url: &str, address: &str) -> AppResult<String> {
     let v = rpc_call(
         rpc_url,

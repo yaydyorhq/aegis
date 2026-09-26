@@ -205,10 +205,40 @@ fn opt_trim(s: &Option<String>) -> Option<String> {
         .filter(|x| !x.is_empty() && x != "auto")
 }
 
+/// Pick the first endpoint whose chain_id matches `expected`, else the first
+/// endpoint that responds at all.  Used before signing so a dead primary RPC
+/// (node-specific -32603, 503, timeout) does not block the whole task when a
+/// fallback endpoint is configured.
+async fn pick_healthy_endpoint(endpoints: &[String], expected_chain: i64) -> (String, Vec<String>) {
+    let mut mismatch: Option<String> = None;
+    for url in endpoints {
+        match chain::eth_chain_id(url).await {
+            Ok(cid) if cid == expected_chain => {
+                return (url.clone(), endpoints.to_vec());
+            }
+            Ok(cid) => {
+                mismatch = Some(format!("{url} is chain {cid}, expected {expected_chain}"));
+            }
+            Err(_) => continue, // unreachable node → try the next one
+        }
+    }
+    // No chain-matched endpoint; fall back to the first entry and let the
+    // downstream chain-id check report the mismatch explicitly.
+    if let Some(m) = mismatch {
+        wallet_store::log_activity(
+            "rpc.warn",
+            &format!("No endpoint matches the task chain: {m}"),
+            None,
+            false,
+        );
+    }
+    (endpoints[0].clone(), endpoints.to_vec())
+}
+
 /// Transient errors worth one automatic requeue (never reverts/param errors).
 fn is_transient_err(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
-    const TRANSIENT: [&str; 14] = [
+    const TRANSIENT: [&str; 16] = [
         "transport",
         "timeout",
         "timed out",
@@ -223,7 +253,12 @@ fn is_transient_err(msg: &str) -> bool {
         "dns",
         "temporarily",
         "eof",
+        // RPC node-side failures that a different endpoint may not share.
+        "-32603",
+        "internal error",
     ];
+    // NOTE: a decoded contract revert is deliberately NOT transient — retrying
+    // the same calldata on another node returns the same revert.
     const PERMANENT: [&str; 6] = [
         "revert",
         "insufficient funds",
@@ -236,6 +271,88 @@ fn is_transient_err(msg: &str) -> bool {
         return false;
     }
     TRANSIENT.iter().any(|t| m.contains(t))
+}
+
+/// Map Solidity custom error selectors to readable text.  Bare 4-byte payloads
+/// like `0x13da22f2` are otherwise useless to a user staring at a failed task.
+///
+/// Selectors computed from `keccak256("Name(args)")[..4]`.  Sourced from the
+/// verified SeaDrop singleton ABI + ERC721SeaDropCloneable ABI (Blockscout),
+/// so every entry is checked against a real deployed contract rather than
+/// guessed from a name.
+fn decode_revert_selector(hex: &str) -> Option<&'static str> {
+    let sel = hex.trim_start_matches("0x").get(..8)?.to_ascii_lowercase();
+    Some(match sel.as_str() {
+        // ── SeaDrop: timing / stage state ────────────────────────────────
+        // NotActive(currentTimestamp, startTimestamp, endTimestamp)
+        "13da22f2" => "NotActive(...) — the drop is not open at this time (window not started or already ended)",
+        "80cb55e2" => "NotActive() — this stage is not currently active",
+        "333d33d0" => "InvalidSignedStartTime(got, minimum) — signed stage starts before the allowed minimum",
+        "6e1d357d" => "InvalidSignedEndTime(got, maximum) — signed stage ends after the allowed maximum",
+        // ── SeaDrop: authorization ───────────────────────────────────────
+        // OnlyINonFungibleSeaDropToken(sender)
+        "32c5d8cf" => "OnlyINonFungibleSeaDropToken(sender) — the NFT contract does not implement the SeaDrop token interface",
+        "1fe7da08" => "PayerNotAllowed() — the payer address is not permitted for this mint",
+        "4cc11713" => "PayerNotPresent() — no payer registered for the supplied fee recipient",
+        // ── SeaDrop: payment ────────────────────────────────────────────
+        "0d35e921" => "IncorrectPayment(got, want) — ETH value sent does not match the required mint price",
+        "798701ac" => "DuplicateFeeRecipient() — the same fee recipient was supplied twice",
+        "0998fbbd" => "FeeRecipientNotPresent() — fee recipient is not registered on the collection",
+        "f477d26f" => "FeeRecipientNotAllowed() — feeRecipient rejected by the collection",
+        "a0c3ed0a" => "InvalidSignedMintPrice(got, minimum) — signed mint price is below the required minimum",
+        "79fc44ed" => "InvalidSignedFeeBps(got, minOrMax) — signed fee basis points outside the allowed range",
+        // ── SeaDrop: quantity / supply ──────────────────────────────────
+        "edc01273" => "MintQuantityExceedsMaxMintedPerWallet(total, allowed) — wallet hit its per-wallet cap",
+        "e12d2314" => "MintQuantityExceedsMaxSupply(total, maxSupply) — collection sold out",
+        "b98dabea" => "MintQuantityExceedsMaxTokenSupplyForStage(total, stageMax) — stage supply exhausted",
+        "198441cb" => "MintQuantityCannotBeZero() — quantity must be > 0",
+        // ── SeaDrop: signed mints / allowlist ───────────────────────────
+        "09bde339" => "InvalidProof() — Merkle proof does not match the collection's allowlist root",
+        "d855c4f4" => "InvalidSignature(recoveredSigner) — signed-mint signature rejected",
+        "db8b2fad" => "SignedMintsMustRestrictFeeRecipients() — signed drop misconfigured",
+        // ── SeaDrop clone (NFT side) ────────────────────────────────────
+        "15e26ff3" => "OnlyAllowedSeaDrop() — caller is not an allowed SeaDrop implementation for this NFT",
+        // ── OpenZeppelin ────────────────────────────────────────────────
+        "08c379a0" => "Error(string) — revert reason in calldata (check the return data)",
+        "4e487b71" => "Panic(uint256) — arithmetic overflow, division by zero, or failed assertion",
+        _ => return None,
+    })
+}
+
+/// Turn a raw RPC error into something a human can act on.  Detects:
+///   * JSON-RPC error codes (-32603 node fault, 3 revert)
+///   * `data: "0x........"` custom-error selectors
+///   * Solidity `Error(string)` / `Panic(uint256)` payloads
+fn decode_rpc_error(e: &AppError) -> String {
+    let raw = e.to_string();
+    let lower = raw.to_ascii_lowercase();
+
+    // Pull the revert data payload if present — Aegis formats RPC failures as
+    // `rpc: {"code":3,"message":"execution reverted","data":"0x13da22f2"}`.
+    let data_hex = raw
+        .split("data")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(2))
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("0x") && s.len() >= 10);
+
+    if let Some(d) = data_hex {
+        if let Some(name) = decode_revert_selector(&d) {
+            return format!("reverted: {name} (raw {d})");
+        }
+        return format!("reverted: unrecognised custom error {d}");
+    }
+
+    if lower.contains("-32603") || lower.contains("internal error") {
+        return format!(
+            "{raw} — the RPC node could not execute this call. \
+             Try another endpoint for this chain (node-side limitation, not calldata)."
+        );
+    }
+    if lower.contains("execution reverted") {
+        return format!("{raw} — call reverted without a readable reason");
+    }
+    raw
 }
 
 pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
@@ -946,8 +1063,9 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         Err(e) => return fail(format!("{e}")),
     };
 
-    let endpoints = parse_rpc_list(&task, &chain_row.rpc_url);
-    let primary = endpoints[0].clone();
+    let endpoints_raw = parse_rpc_list(&task, &chain_row.rpc_url);
+    let (primary, endpoints) =
+        pick_healthy_endpoint(&endpoints_raw, task.chain_id).await;
 
     let tx = serde_json::json!({
         "from": wallet.address,
@@ -960,74 +1078,110 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     // Chain-id check runs concurrently so a wrong-chain RPC fails fast instead
     // of returning a misleading result from another network.
     if task.mode == "simulate" {
-        let (chk, call_result) = tokio::join!(
-            chain::eth_chain_id(&primary),
-            chain::rpc_call(&primary, "eth_call", serde_json::json!([tx, "latest"]))
-        );
-        if let Ok(cid) = chk {
-            if cid != task.chain_id {
-                return fail(format!(
-                    "RPC chain mismatch: endpoint is chain {cid}, task expects {}",
-                    task.chain_id
-                ));
+        // Try each endpoint in order — a transient RPC failure (-32603,
+        // timeout, 429) on one node should not kill the task when a
+        // fallback endpoint would succeed.
+        let mut sim_err: Option<AppError> = None;
+        for url in &endpoints {
+            let (chk, call_result) = tokio::join!(
+                chain::eth_chain_id(url),
+                chain::rpc_call(url, "eth_call", serde_json::json!([tx, "latest"]))
+            );
+            if let Ok(cid) = chk {
+                if cid != task.chain_id {
+                    sim_err = Some(AppError::Rpc(format!(
+                        "RPC chain mismatch on {url}: endpoint is chain {cid}, task expects {}",
+                        task.chain_id
+                    )));
+                    continue;
+                }
+            }
+            match call_result {
+                Ok(v) => {
+                    let ret = v
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("0x")
+                        .to_string();
+                    set_status(id, "simulated", None, None);
+                    let _ = crate::db::with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE mint_tasks SET error=?1, updated_at=?2 WHERE id=?3",
+                            rusqlite::params![format!("eth_call ok: {ret}"), crate::db::now_ms(), id],
+                        )?;
+                        Ok(())
+                    });
+                    wallet_store::log_activity(
+                        "mint.simulate",
+                        &format!("Mint #{id} simulated ok via {url}"),
+                        None,
+                        true,
+                    );
+                    return get_task(id);
+                }
+                Err(e) => {
+                    // Decode revert selectors into human-readable text.
+                    let msg = format!("eth_call via {url}: {}", decode_rpc_error(&e));
+                    // Transient (network/RPC) errors → try next endpoint.
+                    // Contract reverts → the call itself is invalid, no point
+                    // retrying other nodes with the same payload.
+                    if is_transient_err(&msg) {
+                        sim_err = Some(AppError::Rpc(msg));
+                        continue;
+                    }
+                    return fail(msg);
+                }
             }
         }
-        return match call_result {
-            Ok(v) => {
-                let ret = v
-                    .get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("0x")
-                    .to_string();
-                set_status(id, "simulated", None, None);
-                let _ = crate::db::with_conn(|conn| {
-                    conn.execute(
-                        "UPDATE mint_tasks SET error=?1, updated_at=?2 WHERE id=?3",
-                        rusqlite::params![format!("eth_call ok: {ret}"), crate::db::now_ms(), id],
-                    )?;
-                    Ok(())
-                });
-                wallet_store::log_activity(
-                    "mint.simulate",
-                    &format!("Mint #{id} simulated ok"),
-                    None,
-                    true,
-                );
-                get_task(id)
-            }
-            Err(e) => fail(format!("eth_call: {e}")),
-        };
+        return fail(format!(
+            "eth_call: all {} endpoint(s) failed: {}",
+            endpoints.len(),
+            sim_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ));
     }
 
     // Verify the primary endpoint's chain_id concurrently with the nonce fetch —
     // a mismatched RPC would otherwise sign a valid tx for the wrong network.
-    let nonce_task = task.nonce_override.clone();
-    let primary_for_nonce = primary.clone();
-    let addr_for_nonce = wallet.address.clone();
-    let (chk, nonce_res) = tokio::join!(
-        chain::eth_chain_id(&primary),
-        async move {
-            match &nonce_task {
-                Some(n) => n
-                    .parse::<u64>()
-                    .map_err(|_| AppError::Invalid(format!("bad nonce override: {n}"))),
-                None => {
-                    chain::get_transaction_count(&primary_for_nonce, &addr_for_nonce).await
-                }
+    // When nonce fetch fails with a transient error, try the next endpoint.
+    let mut last_err: Option<String> = None;
+    let mut nonce: Option<u64> = None;
+    for url in &endpoints {
+        let rpc = url.clone();
+        let addr = wallet.address.clone();
+        let cid = chain::eth_chain_id(url).await;
+        if let Ok(cid) = cid {
+            if cid != task.chain_id {
+                last_err = Some(format!("{url} is chain {cid}, expected {}", task.chain_id));
+                continue;
             }
         }
-    );
-    if let Ok(cid) = chk {
-        if cid != task.chain_id {
-            return fail(format!(
-                "RPC chain mismatch: endpoint is chain {cid}, task expects {}",
-                task.chain_id
-            ));
+        let res = match &task.nonce_override {
+            Some(n) => n
+                .parse::<u64>()
+                .map_err(|_| AppError::Invalid(format!("bad nonce override: {n}"))),
+            None => chain::get_transaction_count(&rpc, &addr).await,
+        };
+        match res {
+            Ok(n) => {
+                nonce = Some(n);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(format!("{url}: {e}"));
+            }
         }
     }
-    let nonce = match nonce_res {
-        Ok(n) => n,
-        Err(e) => return fail(format!("nonce: {e}")),
+    let nonce = match nonce {
+        Some(n) => n,
+        None => {
+            return fail(format!(
+                "nonce: all {} endpoint(s) failed: {}",
+                endpoints.len(),
+                last_err.unwrap_or_else(|| "unknown".into())
+            ))
+        }
     };
 
     let gas = if let Some(gl) = &task.gas_limit {
@@ -1041,16 +1195,43 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         // RTT loses FCFS races. 300k covers typical SeaDrop/SeaDropV2 mints.
         300_000
     } else {
-        match chain::estimate_gas(&primary, tx.clone()).await {
-            Ok(g) => g.saturating_mul(115) / 100,
-            Err(e) => {
-                // A revert means the mint would burn gas and fail on-chain —
-                // surface it instead of broadcasting a doomed tx.
-                if e.to_string().to_lowercase().contains("revert") {
-                    return fail(format!("estimate_gas reverted (check params/value/timing): {e}"));
+        // Try eth_estimateGas across all endpoints before falling back.
+        let mut gas_est: Option<u64> = None;
+        let mut last_est_err: Option<AppError> = None;
+        for url in &endpoints {
+            match chain::estimate_gas(url, tx.clone()).await {
+                Ok(g) => {
+                    gas_est = Some(g.saturating_mul(115) / 100);
+                    break;
                 }
-                // Some RPCs (e.g. Robinhood) omit/fail eth_estimateGas — use a
-                // safe default for mint calldata rather than blocking the run.
+                Err(e) => {
+                    let msg = format!("{url}: {}", decode_rpc_error(&e));
+                    if msg.to_ascii_lowercase().contains("revert") {
+                        // Revert is deterministic — retrying other nodes won't help.
+                        return fail(format!(
+                            "estimate_gas reverted (check params/value/timing): {msg}"
+                        ));
+                    }
+                    last_est_err = Some(e);
+                }
+            }
+        }
+        match gas_est {
+            Some(g) => g,
+            None => {
+                // All endpoints failed estimateGas (non-revert) — some RPCs
+                // (Robinhood) omit/fail it; use a safe default for mint calldata.
+                wallet_store::log_activity(
+                    "rpc.warn",
+                    &format!(
+                        "estimateGas failed on all endpoints, using 300k default: {}",
+                        last_est_err
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    ),
+                    None,
+                    false,
+                );
                 300_000
             }
         }
@@ -1154,7 +1335,6 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         _ => vec![primary],
     };
 
-    let mut last_err: Option<String> = None;
     let mut first_hash: Option<String> = None;
 
     for (i, url) in send_targets.iter().enumerate() {

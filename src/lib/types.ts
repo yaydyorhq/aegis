@@ -106,6 +106,8 @@ export interface RpcTestResult {
   chain_id_returned: number | null;
   latency_ms: number | null;
   error: string | null;
+  /** Whether this endpoint supports eth_call (contract interaction). */
+  eth_call_ok?: boolean | null;
 }
 
 export interface PublicDrop {

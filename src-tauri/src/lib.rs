@@ -82,6 +82,7 @@ pub fn run() {
             commands::chains::chain_upsert,
             commands::chains::chain_delete,
             commands::chains::chain_test,
+            commands::chains::chain_probe,
             // nft + gallery
             commands::nft::nft_scan,
             commands::nft::gallery_list,

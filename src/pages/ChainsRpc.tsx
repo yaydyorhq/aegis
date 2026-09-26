@@ -225,6 +225,14 @@ export function ChainsRpcPage() {
                 <div className="flex items-center gap-1.5 text-[12px]">
                   <StatusDot ok={!!t?.ok} />
                   {t ? (t.ok ? "OK" : "Fail") : "—"}
+                  {t?.eth_call_ok === false && (
+                    <span
+                      className="rounded bg-warn/15 px-1 py-0.5 text-[10px] text-warn"
+                      title="This RPC cannot execute eth_call — contract calls (mints) will fail. Add another endpoint as fallback or replace this one."
+                    >
+                      no eth_call
+                    </span>
+                  )}
                 </div>
                 <div className="text-[12px] text-muted" title={t?.error ?? undefined}>
                   {testing === c.id
