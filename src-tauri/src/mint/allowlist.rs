@@ -352,7 +352,12 @@ pub fn resolve_hex_template(
         }
     }
     let mut out = template.to_string();
-    out = out.replace("{address}", wallet_address.trim_start_matches("0x"));
+    // ABI-encode address: zero-pad to 32 bytes (64 hex chars).
+    // Without padding, the EVM reverts on malformed calldata length.
+    out = out.replace("{address}", &format!(
+        "{:0>64}",
+        wallet_address.trim_start_matches("0x")
+    ));
     if out.contains("{signature}") {
         let sig = entry
             .and_then(|e| e.signature.as_ref())
@@ -440,7 +445,12 @@ mod tests {
             Some(&entry),
         )
         .unwrap();
-        assert!(out.starts_with("0x123456786152b57c"));
+        // Address must be ABI word-padded (64 hex chars), not raw 40.
+        assert!(
+            out.starts_with("0x123456780000000000000000000000006152b57c"),
+            "expected ABI-padded address, got: {}",
+            &out[..80.min(out.len())]
+        );
         assert!(out.contains(sig.trim_start_matches("0x")));
     }
 

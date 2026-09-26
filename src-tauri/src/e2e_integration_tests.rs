@@ -852,4 +852,122 @@ mod e2e_integration {
             assert!(!a.summary.is_empty());
         }
     }
+
+    /// Same test but with raw HEX calldata mode (HEX checkbox on).
+   
+    /// Reproduce Aegis UI code path: function mode vs HEX mode.
+    #[test]
+    fn e2e_aegis_ui_public_mint_path() {
+        let _g = serial_guard();
+        fresh_state("aegis_ui");
+        ensure_unlocked();
+
+        let w = wallet_store::create_wallet("ui-mint-w", None).unwrap();
+
+        let task = mint::enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: 11155111,
+            contract: "0xD95CAADb6AC9a921CF9dEbBf0b44d5E0dBf2D28A".into(),
+            quantity: 1,
+            value_wei: Some("0".into()),
+            function_name: Some("mint(address)".into()),
+            is_hex: false,
+            parameters: Some("{address}".into()),
+            calldata: None,
+            rpc_endpoints: Some(vec!["https://sepolia.gateway.tenderly.co".into()]),
+            flashbots: false,
+            gas_limit: None, max_fee_gwei: None, priority_fee_gwei: None,
+            nonce_override: None, scheduled_at: None, delay_ms: None,
+            mode: Some("simulate".into()),
+        }).unwrap();
+
+        assert_eq!(task.status, "pending");
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let result = rt.block_on(mint::process_task(task.id)).unwrap();
+        assert!(matches!(result.status.as_str(), "simulated" | "failed"),
+            "unexpected: {}", result.status);
+        eprintln!("FUNC mode: status={} err={:?}", result.status, result.error);
+    }
+
+    /// HEX mode: pre-built calldata with {address} placeholder.
+    #[test]
+    fn e2e_aegis_ui_hex_mode_mint() {
+        let _g = serial_guard();
+        fresh_state("aegis_hex");
+        ensure_unlocked();
+
+        let w = wallet_store::create_wallet("hex-mint-w", None).unwrap();
+
+        // HEX mode: calldata with {address} placeholder
+        let task = mint::enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: 11155111,
+            contract: "0xD95CAADb6AC9a921CF9dEbBf0b44d5E0dBf2D28A".into(),
+            quantity: 1,
+            value_wei: Some("0".into()),
+            function_name: None,
+            is_hex: true,
+            parameters: None,
+            calldata: Some("0x6a627842{address}".into()),
+            rpc_endpoints: Some(vec!["https://sepolia.gateway.tenderly.co".into()]),
+            flashbots: false,
+            gas_limit: None, max_fee_gwei: None, priority_fee_gwei: None,
+            nonce_override: None, scheduled_at: None, delay_ms: None,
+            mode: Some("simulate".into()),
+        }).unwrap();
+
+        assert_eq!(task.status, "pending");
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let result = rt.block_on(mint::process_task(task.id)).unwrap();
+        assert!(matches!(result.status.as_str(), "simulated" | "failed"),
+            "unexpected: {}", result.status);
+        eprintln!("HEX mode: status={} err={:?}", result.status, result.error);
+    }
+
+    /// HEX mode: raw pre-built calldata (already has address in it).
+    #[test]
+    fn e2e_aegis_ui_hex_mode_raw_calldata() {
+        let _g = serial_guard();
+        fresh_state("aegis_hex_raw");
+        ensure_unlocked();
+
+        let w = wallet_store::create_wallet("hexraw-w", None).unwrap();
+        // Pre-build calldata with the actual address
+        let raw_cd = format!("0x6a627842{}", &w.address[2..].to_lowercase());
+
+        let task = mint::enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: 11155111,
+            contract: "0xD95CAADb6AC9a921CF9dEbBf0b44d5E0dBf2D28A".into(),
+            quantity: 1,
+            value_wei: Some("0".into()),
+            function_name: None,
+            is_hex: true,
+            parameters: None,
+            calldata: Some(raw_cd.clone()),
+            rpc_endpoints: Some(vec!["https://sepolia.gateway.tenderly.co".into()]),
+            flashbots: false,
+            gas_limit: None, max_fee_gwei: None, priority_fee_gwei: None,
+            nonce_override: None, scheduled_at: None, delay_ms: None,
+            mode: Some("simulate".into()),
+        }).unwrap();
+
+        // Debug: verify what calldata will be sent
+        let resolved = mint::build_calldata_from_fn(
+            "mint(address)", Some("{address}"), 1, &w.address
+        ).unwrap();
+        eprintln!("wallet addr: {}", w.address);
+        eprintln!("raw_cd:      {}", raw_cd);
+        eprintln!("resolved:    {}", resolved);
+        eprintln!("match:       {}", raw_cd == resolved);
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let result = rt.block_on(mint::process_task(task.id)).unwrap();
+        assert!(matches!(result.status.as_str(), "simulated" | "failed"),
+            "unexpected: {}", result.status);
+        eprintln!("HEX raw mode: status={} err={:?}", result.status, result.error);
+    }
+
 }

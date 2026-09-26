@@ -781,14 +781,19 @@ fn resolve_calldata(task: &MintTaskRow, wallet_address: &str) -> AppResult<Strin
             .clone()
             .ok_or_else(|| AppError::Invalid("hex task missing calldata".into()))?;
         // Allow {address} placeholder in hex payloads.
+        // ABI-encode: address is 20 bytes = 40 hex chars, but the EVM
+        // word is 32 bytes = 64 hex chars.  Zero-pad to 64 so the calldata
+        // byte length is correct; otherwise the EVM reverts.
         if cd.contains("{address}") {
             let needle = "{address}";
+            let raw_addr = wallet_address.trim_start_matches("0x");
+            let padded = format!("{:0>64}", raw_addr);  // 32-byte word
             let mut out = String::with_capacity(cd.len());
             let rest = cd.as_str();
             let mut s = rest;
             while let Some(pos) = s.find(needle) {
                 out.push_str(&s[..pos]);
-                out.push_str(wallet_address.trim_start_matches("0x"));
+                out.push_str(&padded);
                 s = &s[pos + needle.len()..];
             }
             out.push_str(s);
