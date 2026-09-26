@@ -1,4 +1,6 @@
 import { useLocation } from "react-router-dom";
+import { Zap } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const titles: Record<string, string> = {
   "/": "Dashboard",
@@ -14,9 +16,10 @@ const titles: Record<string, string> = {
   "/settings": "Settings",
 };
 
-export function TopBar() {
+export function TopBar({ onQuickTask }: { onQuickTask: () => void }) {
   const { pathname } = useLocation();
   const page = titles[pathname] ?? "Dashboard";
+  const win = getCurrentWindow();
 
   return (
     <header
@@ -24,14 +27,40 @@ export function TopBar() {
       data-tauri-drag-region
     >
       <div className="flex items-center gap-2 text-[13px]">
-        <span className="text-muted">Aevora</span>
+        <span className="text-muted">Aegis</span>
         <span className="text-muted/50">/</span>
         <span className="font-medium text-fg">{page}</span>
       </div>
-      <div className="flex items-center gap-1.5 pr-1">
-        <span className="h-3 w-3 rounded-full bg-[#28c840]" />
-        <span className="h-3 w-3 rounded-full bg-[#f5bf4f]" />
-        <span className="h-3 w-3 rounded-full bg-[#f74c3a]" />
+      <div className="flex items-center gap-3 pr-1">
+        <button
+          onClick={onQuickTask}
+          className="flex items-center gap-1.5 rounded-lg border border-line bg-card px-2.5 py-1.5 text-[12px] text-muted transition-colors hover:border-muted/40 hover:text-fg"
+          title="Quick task (Ctrl+K)"
+        >
+          <Zap className="h-3.5 w-3.5" />
+          Quick task
+          <kbd className="rounded border border-line px-1 text-[10px]">Ctrl+K</kbd>
+        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => void win.minimize()}
+            className="h-3 w-3 rounded-full bg-[#28c840] hover:brightness-110"
+            title="Minimize"
+            aria-label="Minimize"
+          />
+          <button
+            onClick={() => void win.toggleMaximize()}
+            className="h-3 w-3 rounded-full bg-[#f5bf4f] hover:brightness-110"
+            title="Maximize"
+            aria-label="Maximize"
+          />
+          <button
+            onClick={() => void win.close()}
+            className="h-3 w-3 rounded-full bg-[#f74c3a] hover:brightness-110"
+            title="Close"
+            aria-label="Close"
+          />
+        </div>
       </div>
     </header>
   );

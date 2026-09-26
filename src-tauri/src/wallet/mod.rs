@@ -70,21 +70,6 @@ pub fn load_signer(nonce: &[u8], ct: &[u8]) -> AppResult<PrivateKeySigner> {
     PrivateKeySigner::from_bytes(&b).map_err(|e| AppError::Crypto(format!("signer: {e}")))
 }
 
-pub fn chain_id_address(id: i64) -> Address {
-    let _ = id;
-    Address::ZERO
-}
-
-/// Normalize any address-like string to EIP-55 checksum hex.
-pub fn checksum_address(input: &str) -> AppResult<Address> {
-    let raw = input.trim().trim_start_matches("0x");
-    let bytes = hex::decode(raw).map_err(|_| AppError::Invalid("bad address hex".into()))?;
-    if bytes.len() != 20 {
-        return Err(AppError::Invalid("address must be 20 bytes".into()));
-    }
-    Ok(Address::from_slice(&bytes))
-}
-
 pub fn to_checksum_str(addr: &Address) -> String {
     addr.to_checksum(None)
 }

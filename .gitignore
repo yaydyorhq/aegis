@@ -12,6 +12,18 @@ dist
 dist-ssr
 *.local
 
+# Secrets / local state — never commit
+.env
+.env*
+*.db
+*.sqlite
+*.sqlite3
+.opencode/
+.hermes/
+
+# Rust
+src-tauri/target/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -1,7 +1,26 @@
-# Tauri + React + Typescript
+# Aegis
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Dark Web3 / EVM command center — Tauri 2 + React + TypeScript + Tailwind + SQLite.
 
-## Recommended IDE Setup
+Local vault (Argon2id + AES-256-GCM), multi-wallet, mint queue, NFT scanner, eligibility checks, multi-chain RPC.
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Develop
+
+```bash
+npm install
+npm run tauri dev
+```
+
+## Build
+
+```bash
+npm run tauri build
+```
+
+Installers land in `src-tauri/target/release/bundle/`.
+
+## Stack
+
+- Frontend: React 19, Vite, Tailwind v4, zustand
+- Backend: Tauri 2 (Rust), rusqlite, alloy, argon2, aes-gcm
+- Secrets never leave the device

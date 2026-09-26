@@ -1,5 +1,5 @@
 import { createBrowserRouter, Navigate } from "react-router-dom";
-import { AppShell } from "./components/layout/AppShell";
+import { AppShell, useShell } from "./components/layout/AppShell";
 import { DashboardPage } from "./pages/Dashboard";
 import { ActivityPage } from "./pages/Activity";
 import { WalletsPage } from "./pages/Wallets";
@@ -18,11 +18,16 @@ function Shell() {
   return <AppShell profileName={profileName} />;
 }
 
+function DashboardRoute() {
+  const { openQuickTask } = useShell();
+  return <DashboardPage onQuickTask={openQuickTask} />;
+}
+
 export const router = createBrowserRouter([
   {
     element: <Shell />,
     children: [
-      { path: "/", element: <DashboardPage /> },
+      { path: "/", element: <DashboardRoute /> },
       { path: "/activity", element: <ActivityPage /> },
       { path: "/wallets", element: <WalletsPage /> },
       { path: "/minting", element: <MintingPage /> },

@@ -1,6 +1,8 @@
 use crate::error::AppResult;
 use crate::vault;
-use crate::wallet_store::{self, WalletRow};
+use crate::wallet_store::{
+    self, BulkImportItem, BulkImportResultItem, GroupRow, WalletRow,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -42,8 +44,30 @@ pub fn wallet_generate(label: String) -> AppResult<WalletRow> {
 }
 
 #[tauri::command]
+pub fn wallet_generate_in_group(label: String, group_id: Option<i64>) -> AppResult<WalletRow> {
+    wallet_store::create_wallet_in_group(&label, None, group_id)
+}
+
+#[tauri::command]
 pub fn wallet_import(label: String, private_key: String) -> AppResult<WalletRow> {
     wallet_store::create_wallet(&label, Some(&private_key))
+}
+
+#[tauri::command]
+pub fn wallet_import_in_group(
+    label: String,
+    private_key: String,
+    group_id: Option<i64>,
+) -> AppResult<WalletRow> {
+    wallet_store::create_wallet_in_group(&label, Some(&private_key), group_id)
+}
+
+#[tauri::command]
+pub fn wallet_import_bulk(
+    items: Vec<BulkImportItem>,
+    group_id: Option<i64>,
+) -> AppResult<Vec<BulkImportResultItem>> {
+    wallet_store::import_bulk(&items, group_id)
 }
 
 #[tauri::command]
@@ -54,4 +78,36 @@ pub fn wallet_delete(id: i64) -> AppResult<()> {
 #[tauri::command]
 pub fn wallet_export(id: i64, pass_confirm: String) -> AppResult<String> {
     wallet_store::export_private_key(id, &pass_confirm)
+}
+
+#[tauri::command]
+pub fn wallet_set_group(wallet_id: i64, group_id: Option<i64>) -> AppResult<()> {
+    wallet_store::set_wallet_group(wallet_id, group_id)
+}
+
+#[tauri::command]
+pub fn wallet_rename(id: i64, label: String) -> AppResult<WalletRow> {
+    wallet_store::rename_wallet(id, &label)
+}
+
+// ── Groups ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn group_list() -> AppResult<Vec<GroupRow>> {
+    wallet_store::list_groups()
+}
+
+#[tauri::command]
+pub fn group_create(name: String) -> AppResult<GroupRow> {
+    wallet_store::create_group(&name)
+}
+
+#[tauri::command]
+pub fn group_rename(id: i64, name: String) -> AppResult<GroupRow> {
+    wallet_store::rename_group(id, &name)
+}
+
+#[tauri::command]
+pub fn group_delete(id: i64) -> AppResult<()> {
+    wallet_store::delete_group(id)
 }

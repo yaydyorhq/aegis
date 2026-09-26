@@ -1,0 +1,461 @@
+use crate::error::{AppError, AppResult};
+use crate::wallet_store;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+pub mod eligibility;
+pub mod erc20;
+pub mod nft;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ChainRow {
+    pub id: i64,
+    pub name: String,
+    pub chain_id: i64,
+    pub rpc_url: String,
+    pub symbol: String,
+    pub explorer: Option<String>,
+    pub enabled: i64,
+}
+
+#[derive(Deserialize)]
+pub struct ChainInput {
+    pub id: Option<i64>,
+    pub name: String,
+    pub chain_id: i64,
+    pub rpc_url: String,
+    pub symbol: String,
+    pub explorer: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct RpcTestResult {
+    pub ok: bool,
+    pub chain_id_returned: Option<i64>,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+pub fn list_chains() -> AppResult<Vec<ChainRow>> {
+    crate::db::with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, chain_id, rpc_url, symbol, explorer, enabled
+             FROM chains ORDER BY enabled DESC, name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ChainRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                chain_id: r.get(2)?,
+                rpc_url: r.get(3)?,
+                symbol: r.get(4)?,
+                explorer: r.get(5)?,
+                enabled: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+}
+
+pub fn upsert_chain(c: &ChainInput) -> AppResult<ChainRow> {
+    if c.name.trim().is_empty() {
+        return Err(AppError::Invalid("chain name required".into()));
+    }
+    if !c.rpc_url.starts_with("http://") && !c.rpc_url.starts_with("https://") {
+        return Err(AppError::Invalid("rpc_url must be http(s)".into()));
+    }
+    if c.chain_id <= 0 {
+        return Err(AppError::Invalid("chain_id must be positive".into()));
+    }
+    let enabled = c.enabled.unwrap_or(true) as i64;
+    crate::db::with_conn(|conn| {
+        if let Some(id) = c.id {
+            let n = conn.execute(
+                "UPDATE chains SET name=?1, chain_id=?2, rpc_url=?3, symbol=?4, explorer=?5, enabled=?6 WHERE id=?7",
+                rusqlite::params![c.name.trim(), c.chain_id, c.rpc_url.trim(), c.symbol.trim(), c.explorer, enabled, id],
+            )?;
+            if n == 0 {
+                return Err(AppError::NotFound(format!("chain {id}")));
+            }
+        } else {
+            // Insert; if chain_id already exists, update that row instead of
+            // failing on UNIQUE(chain_id) — friendlier "add/edit by chain id".
+            let n = conn.execute(
+                "INSERT INTO chains(name, chain_id, rpc_url, symbol, explorer, enabled)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(chain_id) DO UPDATE SET
+                   name=excluded.name,
+                   rpc_url=excluded.rpc_url,
+                   symbol=excluded.symbol,
+                   explorer=excluded.explorer,
+                   enabled=excluded.enabled",
+                rusqlite::params![c.name.trim(), c.chain_id, c.rpc_url.trim(), c.symbol.trim(), c.explorer, enabled],
+            )?;
+            let _ = n;
+        }
+        Ok(())
+    })?;
+    wallet_store::log_activity(
+        "chain.upsert",
+        &format!("Saved chain {} ({})", c.name, c.chain_id),
+        None,
+        true,
+    );
+    list_chains()?
+        .into_iter()
+        .find(|x| x.chain_id == c.chain_id)
+        .ok_or_else(|| AppError::NotFound("chain".into()))
+}
+
+pub fn delete_chain(id: i64) -> AppResult<()> {
+    let n = crate::db::with_conn(|conn| {
+        Ok(conn.execute("DELETE FROM chains WHERE id = ?1", [id])?)
+    })?;
+    if n == 0 {
+        return Err(AppError::NotFound(format!("chain {id}")));
+    }
+    wallet_store::log_activity("chain.delete", &format!("Deleted chain #{id}"), None, true);
+    Ok(())
+}
+
+pub async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> AppResult<serde_json::Value> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(concat!("aegis/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| AppError::Rpc(e.to_string()))?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+
+    let mut attempt = 0u32;
+    loop {
+        let attempt_result: AppResult<serde_json::Value> = async {
+            let resp = client
+                .post(rpc_url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| AppError::Rpc(e.to_string()))?;
+            let status = resp.status();
+            if is_transient_status(status.as_u16()) {
+                return Err(AppError::Rpc(format!("HTTP {status}")));
+            }
+            if !status.is_success() {
+                return Err(AppError::Rpc(format!("HTTP {status}")));
+            }
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AppError::Rpc(e.to_string()))?;
+            if let Some(err) = v.get("error") {
+                return Err(AppError::Rpc(err.to_string()));
+            }
+            Ok(v)
+        }
+        .await;
+
+        match attempt_result {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let retryable = match &e {
+                    AppError::Rpc(msg) => {
+                        msg.starts_with("HTTP 429")
+                            || msg.starts_with("HTTP 5")
+                            || !msg.starts_with("HTTP ")
+                    }
+                    _ => false,
+                };
+                if !retryable || attempt >= RPC_MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(backoff_delay_ms(attempt))).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+pub async fn test_chain(id: i64) -> AppResult<RpcTestResult> {
+    let chain = list_chains()?
+        .into_iter()
+        .find(|c| c.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("chain {id}")))?;
+    let start = std::time::Instant::now();
+    match eth_chain_id(&chain.rpc_url).await {
+        Ok(chain_id) => {
+            let latency = start.elapsed().as_millis() as u64;
+            let ok = chain_id == chain.chain_id;
+            wallet_store::log_activity(
+                "rpc.test",
+                &format!(
+                    "{} RPC {} ({} ms)",
+                    chain.name,
+                    if ok { "OK" } else { "chain mismatch" },
+                    latency
+                ),
+                None,
+                ok,
+            );
+            Ok(RpcTestResult {
+                ok,
+                chain_id_returned: Some(chain_id),
+                latency_ms: Some(latency),
+                error: if ok {
+                    None
+                } else {
+                    Some(format!("expected {}, got {}", chain.chain_id, chain_id))
+                },
+            })
+        }
+        Err(e) => {
+            wallet_store::log_activity(
+                "rpc.test",
+                &format!("{} RPC failed: {e}", chain.name),
+                None,
+                false,
+            );
+            Ok(RpcTestResult {
+                ok: false,
+                chain_id_returned: None,
+                latency_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(e.to_string()),
+            })
+        }
+    }
+}
+
+pub async fn eth_chain_id(rpc_url: &str) -> AppResult<i64> {
+    let v = rpc_call(rpc_url, "eth_chainId", serde_json::json!([])).await?;
+    let hex_id = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| AppError::Rpc("missing result".into()))?;
+    i64::from_str_radix(hex_id.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::Rpc("bad chainId".into()))
+}
+
+pub async fn native_balance(rpc_url: &str, address: &str) -> AppResult<String> {
+    let v = rpc_call(
+        rpc_url,
+        "eth_getBalance",
+        serde_json::json!([address, "latest"]),
+    )
+    .await?;
+    v.get("result")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| AppError::Rpc("missing balance".into()))
+}
+
+pub async fn block_number(rpc_url: &str) -> AppResult<u64> {
+    let v = rpc_call(rpc_url, "eth_blockNumber", serde_json::json!([])).await?;
+    let hex_id = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| AppError::Rpc("missing blockNumber".into()))?;
+    u64::from_str_radix(hex_id.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::Rpc("bad block".into()))
+}
+
+pub async fn get_logs(
+    rpc_url: &str,
+    from_block: u64,
+    to_block: u64,
+    address: Option<&str>,
+    topics: Vec<Option<String>>,
+) -> AppResult<serde_json::Value> {
+    let topics = topics
+        .into_iter()
+        .map(|t| match t {
+            Some(s) => serde_json::json!(s),
+            None => serde_json::Value::Null,
+        })
+        .collect();
+    get_logs_value(rpc_url, from_block, to_block, address, topics).await
+}
+
+/// eth_getLogs with raw topic values (string | array | null) — supports
+/// OR-lists (`[addrA, addrB]`) that Option<String> topics cannot express.
+pub async fn get_logs_value(
+    rpc_url: &str,
+    from_block: u64,
+    to_block: u64,
+    address: Option<&str>,
+    topics: Vec<serde_json::Value>,
+) -> AppResult<serde_json::Value> {
+    let mut filter = serde_json::json!({
+        "fromBlock": format!("0x{:x}", from_block),
+        "toBlock": format!("0x{:x}", to_block),
+    });
+    if let Some(a) = address {
+        filter["address"] = serde_json::json!(a);
+    }
+    if !topics.is_empty() {
+        filter["topics"] = serde_json::Value::Array(topics);
+    }
+    let v = rpc_call(rpc_url, "eth_getLogs", serde_json::json!([filter])).await?;
+    Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// RPC rejected the block range (result/size limits) — the adaptive fetcher
+/// should halve its span. Transient HTTP errors (429/5xx) are NOT matched so
+/// they stay with rpc_call's retry/backoff.
+pub fn is_range_error(e: &AppError) -> bool {
+    let s = e.to_string().to_lowercase();
+    [
+        "range",
+        "too large",
+        "too many",
+        "more than",
+        "exceed",
+        "max results",
+        "query returned",
+        "block span",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
+}
+
+/// eth_getLogs over [from..to] that tries the whole range in one request
+/// (fast chains allow 70M+ blocks) and halves the span when the RPC enforces
+/// range/result limits. `on_tick(scanned_blocks, total_blocks)` fires after
+/// each successful chunk.
+pub async fn get_logs_adaptive(
+    rpc_url: &str,
+    from_block: u64,
+    to_block: u64,
+    address: Option<&str>,
+    topics: Vec<serde_json::Value>,
+    on_tick: Option<&(dyn Fn(u64, u64) + Sync)>,
+) -> AppResult<Vec<serde_json::Value>> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    if to_block < from_block {
+        return Ok(out);
+    }
+    let total = to_block - from_block + 1;
+    let min_span = 2_000u64;
+    let mut start = from_block;
+    let mut span = total;
+    let mut scanned = 0u64;
+    while start <= to_block {
+        let end = (start + span - 1).min(to_block);
+        match get_logs_value(rpc_url, start, end, address, topics.clone()).await {
+            Ok(res) => {
+                if let Some(arr) = res.as_array() {
+                    out.extend(arr.iter().cloned());
+                }
+                scanned += end - start + 1;
+                if let Some(t) = on_tick {
+                    t(scanned, total);
+                }
+                start = end + 1;
+            }
+            Err(e) if is_range_error(&e) && (end - start + 1) > min_span => {
+                span = ((end - start + 1) / 2).max(min_span);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+pub async fn get_transaction_count(rpc_url: &str, address: &str) -> AppResult<u64> {
+    let v = rpc_call(
+        rpc_url,
+        "eth_getTransactionCount",
+        serde_json::json!([address, "pending"]),
+    )
+    .await?;
+    let hex_id = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| AppError::Rpc("missing nonce".into()))?;
+    u64::from_str_radix(hex_id.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::Rpc("bad nonce".into()))
+}
+
+pub async fn estimate_gas(rpc_url: &str, tx: serde_json::Value) -> AppResult<u64> {
+    let v = rpc_call(rpc_url, "eth_estimateGas", serde_json::json!([tx])).await?;
+    let hex_id = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| AppError::Rpc("missing gas".into()))?;
+    u64::from_str_radix(hex_id.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::Rpc("bad gas".into()))
+}
+
+pub async fn gas_price(rpc_url: &str) -> AppResult<u128> {
+    let v = rpc_call(rpc_url, "eth_gasPrice", serde_json::json!([])).await?;
+    let hex_id = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| AppError::Rpc("missing gasPrice".into()))?;
+    u128::from_str_radix(hex_id.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::Rpc("bad gasPrice".into()))
+}
+
+pub async fn send_raw_transaction(rpc_url: &str, raw: &str) -> AppResult<String> {
+    let v = rpc_call(
+        rpc_url,
+        "eth_sendRawTransaction",
+        serde_json::json!([raw]),
+    )
+    .await?;
+    v.get("result")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| AppError::Rpc("missing tx hash".into()))
+}
+
+pub async fn get_receipt(rpc_url: &str, tx_hash: &str) -> AppResult<Option<serde_json::Value>> {
+    let v = rpc_call(rpc_url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await?;
+    let result = v.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    if result.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
+}
+
+const RPC_MAX_ATTEMPTS: u32 = 3;
+
+fn is_transient_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+fn backoff_delay_ms(attempt: u32) -> u64 {
+    1_000u64 << attempt.min(3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_statuses_are_429_and_5xx() {
+        assert!(is_transient_status(429));
+        assert!(is_transient_status(500));
+        assert!(is_transient_status(502));
+        assert!(is_transient_status(503));
+        assert!(!is_transient_status(400));
+        assert!(!is_transient_status(401));
+        assert!(!is_transient_status(404));
+    }
+
+    #[test]
+    fn backoff_delays_grow_exponentially() {
+        assert_eq!(backoff_delay_ms(0), 1_000);
+        assert_eq!(backoff_delay_ms(1), 2_000);
+        assert_eq!(backoff_delay_ms(2), 4_000);
+        assert_eq!(backoff_delay_ms(3), 8_000);
+    }
+}

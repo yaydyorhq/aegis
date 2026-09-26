@@ -100,11 +100,14 @@ pub fn unlock_or_create(pass: &str) -> AppResult<()> {
         }
         let nonce = hex::decode(parts[0]).map_err(|e| AppError::Crypto(e.to_string()))?;
         let ct = hex::decode(parts[1]).map_err(|e| AppError::Crypto(e.to_string()))?;
+        if nonce.len() != NONCE_LEN {
+            return Err(AppError::Crypto("bad verifier nonce".into()));
+        }
         let cipher = cipher_from(&dek);
         let plain = cipher
             .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
             .map_err(|_| AppError::BadPassphrase)?;
-        if plain != b"aevora-vault-v1" {
+        if plain != b"aegis-vault-v1" {
             return Err(AppError::BadPassphrase);
         }
         let mut g = vault()
@@ -120,7 +123,7 @@ pub fn unlock_or_create(pass: &str) -> AppResult<()> {
     let mut nonce = [0u8; NONCE_LEN];
     AeadOsRng.fill_bytes(&mut nonce);
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), b"aevora-vault-v1".as_ref())
+        .encrypt(Nonce::from_slice(&nonce), b"aegis-vault-v1".as_ref())
         .map_err(|e| AppError::Crypto(e.to_string()))?;
     set_meta(
         "vault_verifier",
@@ -186,6 +189,9 @@ pub fn confirm_passphrase(pass: &str) -> AppResult<()> {
     }
     let nonce = hex::decode(parts[0]).map_err(|e| AppError::Crypto(e.to_string()))?;
     let ct = hex::decode(parts[1]).map_err(|e| AppError::Crypto(e.to_string()))?;
+    if nonce.len() != NONCE_LEN {
+        return Err(AppError::Crypto("bad verifier nonce".into()));
+    }
     let cipher = cipher_from(&dek);
     cipher
         .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
@@ -200,7 +206,7 @@ mod tests {
 
     fn fresh_db() {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("aevora_vault_{nanos}"));
+        let dir = std::env::temp_dir().join(format!("aegis_vault_{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let _ = db::init(&dir.join("v.db"));
     }
@@ -209,9 +215,7 @@ mod tests {
     fn encrypt_decrypt_roundtrip() {
         fresh_db();
         // may already be initialized in same process; use unique meta keys via re-init path
-        if !is_initialized().unwrap() {
-            unlock_or_create("test-pass-123").unwrap();
-        } else if !is_unlocked().unwrap() {
+        if !is_unlocked().unwrap() {
             unlock_or_create("test-pass-123").unwrap();
         }
         let (n, c) = encrypt(b"secret-key-material").unwrap();
@@ -222,15 +226,16 @@ mod tests {
     #[test]
     fn wrong_passphrase_fails() {
         fresh_db();
-        if !is_initialized().unwrap() {
-            unlock_or_create("correct-horse-1").unwrap();
-        } else if !is_unlocked().unwrap() {
+        if !is_unlocked().unwrap() {
             unlock_or_create("correct-horse-1").unwrap();
         }
-        lock().unwrap();
+        // Do NOT call lock() here — tests run in parallel and locking the
+        // process-global vault would race with mint e2e tests mid-run.
+        // unlock_or_create still fails: the stored verifier rejects the pass
+        // before any vault state is touched.
         let err = unlock_or_create("wrong-pass-xxx");
         assert!(err.is_err());
-        // restore
-        let _ = unlock_or_create("correct-horse-1");
+        assert!(confirm_passphrase("wrong-pass-xxx").is_err());
+        assert!(is_unlocked().unwrap(), "vault must stay unlocked for other tests");
     }
 }

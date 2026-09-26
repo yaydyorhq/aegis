@@ -1,5 +1,99 @@
 import type { ReactNode } from "react";
+import { useEffect, useState } from "react";
+import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
 import { cn } from "../lib/utils";
+
+export type ToastTone = "ok" | "warn" | "info" | "error";
+
+export interface ToastItem {
+  id: number;
+  title: string;
+  detail?: string | null;
+  tone: ToastTone;
+  at: number;
+}
+
+let toastSeq = 1;
+
+/** Fire a toast from anywhere (page or store) — host is mounted in AppShell. */
+export function pushToast(
+  title: string,
+  tone: ToastTone = "info",
+  detail?: string | null,
+): void {
+  window.dispatchEvent(
+    new CustomEvent("aegis:toast", {
+      detail: { id: toastSeq++, title, detail: detail ?? null, tone, at: Date.now() },
+    }),
+  );
+}
+
+export function ToastHost() {
+  const [items, setItems] = useState<ToastItem[]>([]);
+
+  useEffect(() => {
+    function onToast(e: Event) {
+      const item = (e as CustomEvent<ToastItem>).detail;
+      setItems((prev) => [...prev, item].slice(-5));
+      window.setTimeout(() => {
+        setItems((prev) => prev.filter((x) => x.id !== item.id));
+      }, 5000);
+    }
+    window.addEventListener("aegis:toast", onToast);
+    return () => window.removeEventListener("aegis:toast", onToast);
+  }, []);
+
+  if (items.length === 0) return null;
+
+  return (
+    <div
+      className="pointer-events-none fixed bottom-4 right-4 z-[80] flex w-[340px] flex-col gap-2"
+      role="status"
+      aria-live="polite"
+    >
+      {items.map((t) => (
+        <div
+          key={t.id}
+          className={cn(
+            "pointer-events-auto flex items-start gap-2 rounded-[12px] border bg-card px-3 py-2.5 shadow-lg",
+            t.tone === "ok" && "border-ok/50",
+            t.tone === "warn" && "border-warn/50",
+            t.tone === "error" && "border-danger/50",
+            t.tone === "info" && "border-accent/50",
+          )}
+        >
+          <span className="mt-0.5 shrink-0">
+            {t.tone === "ok" ? (
+              <CheckCircle2 className="h-4 w-4 text-ok" />
+            ) : t.tone === "warn" ? (
+              <AlertTriangle className="h-4 w-4 text-warn" />
+            ) : t.tone === "error" ? (
+              <AlertTriangle className="h-4 w-4 text-danger" />
+            ) : (
+              <Info className="h-4 w-4 text-accent" />
+            )}
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium text-fg">{t.title}</div>
+            {t.detail ? (
+              <div className="mt-0.5 break-words text-[11.5px] leading-snug text-muted">
+                {t.detail}
+              </div>
+            ) : null}
+          </div>
+          <button
+            type="button"
+            onClick={() => setItems((prev) => prev.filter((x) => x.id !== t.id))}
+            className="shrink-0 rounded p-0.5 text-muted hover:text-fg"
+            aria-label="Dismiss"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export function EmptyState({
   icon,

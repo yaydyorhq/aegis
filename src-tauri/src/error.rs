@@ -8,8 +8,6 @@ pub enum AppError {
     Crypto(String),
     #[error("vault locked")]
     VaultLocked,
-    #[error("vault already initialized")]
-    VaultExists,
     #[error("invalid passphrase")]
     BadPassphrase,
     #[error("not found: {0}")]

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Aevora",
+  "productName": "Aegis",
   "version": "0.1.0",
-  "identifier": "com.lenovo-log.aevora-clone",
+  "identifier": "com.lenovo-log.aegis",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Aevora",
+        "title": "Aegis",
         "width": 1280,
         "height": 720,
         "minWidth": 1100,
@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://ipfs.io https://*.ipfs.io blob:; connect-src 'self' ipc: http://ipc.localhost https: http:; font-src 'self' data:"
     }
   },
   "bundle": {

@@ -1,0 +1,267 @@
+use crate::chain;
+use crate::error::{AppError, AppResult};
+use crate::mint::seadrop::{self, PublicDrop};
+
+/// balanceOf(address)
+const SEL_BALANCE_OF: &str = "0x70a08231";
+/// SeaDrop.getMintStats(address minter, address nftContract) → (mintable, minted, price)
+const SEL_GET_MINT_STATS: &str = "0xec1c35be";
+/// ERC721SeaDrop.mintStatsForMinter(address) → (mintable, minted, price)
+const SEL_MINT_STATS_FOR_MINTER: &str = "0x25e31cd4";
+
+fn pad_word_addr(addr: &str) -> AppResult<String> {
+    let a = alloy::primitives::Address::parse_checksummed(addr, None)
+        .or_else(|_| addr.parse::<alloy::primitives::Address>())
+        .map_err(|_| AppError::Invalid(format!("bad address: {addr}")))?;
+    Ok(format!("{:0>64}", hex::encode(a.as_slice())))
+}
+
+async fn eth_call(rpc: &str, to: &str, data: &str) -> AppResult<String> {
+    let out = chain::rpc_call(
+        rpc,
+        "eth_call",
+        serde_json::json!([{ "to": to, "data": data }, "latest"]),
+    )
+    .await?;
+    out.get("result")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| AppError::Rpc("eth_call missing result".into()))
+}
+
+fn decode_u256_words(data_hex: &str) -> AppResult<Vec<alloy::primitives::U256>> {
+    let raw = data_hex.trim_start_matches("0x");
+    if raw.is_empty() || !raw.len().is_multiple_of(64) {
+        return Err(AppError::Rpc(format!(
+            "unexpected eth_call length {}",
+            raw.len()
+        )));
+    }
+    Ok(raw
+        .as_bytes()
+        .chunks(64)
+        .map(|c| {
+            let s = std::str::from_utf8(c).unwrap_or("");
+            alloy::primitives::U256::from_str_radix(s, 16).unwrap_or_default()
+        })
+        .collect())
+}
+
+/// ERC-721 balanceOf — O(1); replaces multi-chunk eth_getLogs scans.
+pub async fn erc721_balance_of(rpc: &str, collection: &str, owner: &str) -> AppResult<u64> {
+    let data = format!("{SEL_BALANCE_OF}{}", pad_word_addr(owner)?);
+    let ret = eth_call(rpc, collection, &data).await?;
+    let w = decode_u256_words(&ret)?;
+    let v = w.first().copied().unwrap_or_default();
+    Ok(u64::try_from(v).unwrap_or(u64::MAX))
+}
+
+/// Minted count for the wallet on a SeaDrop public drop (0 when unknown).
+/// Tries SeaDrop.getMintStats, then ERC721SeaDrop.mintStatsForMinter.
+pub async fn minted_quantity(rpc: &str, collection: &str, minter: &str) -> Option<u64> {
+    let m = pad_word_addr(minter).ok()?;
+    let n = pad_word_addr(collection).ok()?;
+    if let Ok(ret) = eth_call(rpc, seadrop::SEADROP_ADDRESS, &format!("{SEL_GET_MINT_STATS}{m}{n}")).await
+    {
+        if let Ok(w) = decode_u256_words(&ret) {
+            if w.len() >= 2 {
+                return Some(u64::try_from(w[1]).unwrap_or(u64::MAX));
+            }
+        }
+    }
+    if let Ok(ret) = eth_call(rpc, collection, &format!("{SEL_MINT_STATS_FOR_MINTER}{m}")).await {
+        if let Ok(w) = decode_u256_words(&ret) {
+            if w.len() >= 2 {
+                return Some(u64::try_from(w[1]).unwrap_or(u64::MAX));
+            }
+        }
+    }
+    None
+}
+
+/// Public-drop window: live iff start ≤ now, and now < end when end is set.
+/// `end_time == 0` means open-ended (SeaDrop unset only when start/end/max are all 0).
+pub fn public_drop_live(drop: &PublicDrop, now_secs: i64) -> bool {
+    if now_secs < drop.start_time {
+        return false;
+    }
+    drop.end_time == 0 || now_secs < drop.end_time
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn format_ts(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+fn format_wei_eth(wei_str: &str) -> String {
+    match wei_str.parse::<alloy::primitives::U256>() {
+        Ok(v) => {
+            let s = v.to_string();
+            if s == "0" {
+                return "0".into();
+            }
+            let out = if s.len() <= 18 {
+                let pad = format!("{}{}", "0".repeat(18 - s.len()), s);
+                format!("0.{pad}")
+            } else {
+                let (h, f) = s.split_at(s.len() - 18);
+                format!("{h}.{f}")
+            };
+            let out = out.trim_end_matches('0');
+            out.strip_suffix('.').map(|x| x.to_string()).unwrap_or_else(|| out.to_string())
+        }
+        Err(_) => wei_str.to_string(),
+    }
+}
+
+/// Load the public drop once per collection. `None` = not a public SeaDrop drop
+/// (missing entry or non-SeaDrop contract) — caller falls back to holdings.
+pub async fn fetch_drop_or_none(rpc: &str, collection: &str) -> Option<PublicDrop> {
+    seadrop::fetch_public_drop(rpc, collection).await.ok()
+}
+
+/// Eligibility for one wallet.
+/// - Public drop configured → stage rules (window, max/wallet, balance).
+/// - Else → ERC-721 balanceOf (holder-gated / already owns).
+pub async fn check_eligibility(
+    rpc: &str,
+    wallet: &str,
+    collection: &str,
+    drop: Option<&PublicDrop>,
+) -> AppResult<(bool, String)> {
+    let col = collection.trim();
+    if col.len() != 42 || !col.starts_with("0x") {
+        return Err(AppError::Invalid(
+            "collection must be 0x + 40 hex".into(),
+        ));
+    }
+
+    if let Some(drop) = drop {
+        return check_public_drop(rpc, wallet, col, drop).await;
+    }
+
+    let held = erc721_balance_of(rpc, col, wallet).await?;
+    if held > 0 {
+        Ok((true, format!("{held} token(s) held")))
+    } else {
+        Ok((
+            false,
+            "no SeaDrop public drop; wallet holds 0 tokens".into(),
+        ))
+    }
+}
+
+async fn check_public_drop(
+    rpc: &str,
+    wallet: &str,
+    collection: &str,
+    drop: &PublicDrop,
+) -> AppResult<(bool, String)> {
+    let now = now_secs();
+    let price = format_wei_eth(&drop.mint_price_wei);
+    let max = drop.max_per_wallet;
+
+    if now < drop.start_time {
+        return Ok((
+            false,
+            format!(
+                "public drop opens {} (price {price} ETH, max {max}/wallet)",
+                format_ts(drop.start_time)
+            ),
+        ));
+    }
+    if !public_drop_live(drop, now) {
+        return Ok((
+            false,
+            format!(
+                "public drop ended {} (price {price} ETH)",
+                format_ts(drop.end_time)
+            ),
+        ));
+    }
+
+    let minted = minted_quantity(rpc, collection, wallet).await.unwrap_or(0);
+    let held = erc721_balance_of(rpc, collection, wallet).await.unwrap_or(0);
+    let used = minted.max(held);
+
+    if max > 0 && used >= max as u64 {
+        return Ok((
+            false,
+            format!("public drop live but max reached ({used}/{max})"),
+        ));
+    }
+
+    let price_wei = drop
+        .mint_price_wei
+        .parse::<alloy::primitives::U256>()
+        .unwrap_or_default();
+    if !price_wei.is_zero() {
+        let bal_hex = chain::native_balance(rpc, wallet).await?;
+        let bal = alloy::primitives::U256::from_str_radix(
+            bal_hex.trim_start_matches("0x"),
+            16,
+        )
+        .unwrap_or_default();
+        if bal < price_wei {
+            return Ok((
+                false,
+                format!(
+                    "public drop live but balance short (need {price} ETH, have {} ETH)",
+                    format_wei_eth(&bal.to_string())
+                ),
+            ));
+        }
+    }
+
+    Ok((
+        true,
+        format!(
+            "public drop live (price {price} ETH, max {max}/wallet, minted {used})"
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drop(start: i64, end: i64, max: i64) -> PublicDrop {
+        PublicDrop {
+            mint_price_wei: "380000000000000".into(),
+            start_time: start,
+            end_time: end,
+            max_per_wallet: max,
+            fee_bps: 0,
+            restrict_fee_recipients: false,
+        }
+    }
+
+    #[test]
+    fn live_window() {
+        let d = drop(100, 200, 1);
+        assert!(!public_drop_live(&d, 99));
+        assert!(public_drop_live(&d, 100));
+        assert!(public_drop_live(&d, 199));
+        assert!(!public_drop_live(&d, 200));
+    }
+
+    #[test]
+    fn open_ended_window() {
+        let d = drop(100, 0, 5);
+        assert!(public_drop_live(&d, 1000));
+    }
+
+    #[test]
+    fn format_wei() {
+        assert_eq!(format_wei_eth("380000000000000"), "0.00038");
+        assert_eq!(format_wei_eth("1000000000000000000"), "1");
+    }
+}

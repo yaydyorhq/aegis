@@ -55,7 +55,7 @@ export function Sidebar({ profileName }: { profileName: string }) {
         <div className="flex h-7 w-7 items-center justify-center rounded-md bg-fg text-[13px] font-black text-bg">
           ∥
         </div>
-        <span className="text-[15px] font-semibold tracking-tight">Aevora</span>
+        <span className="text-[15px] font-semibold tracking-tight">Aegis</span>
       </div>
 
       <nav className="flex-1 overflow-y-auto px-2.5 py-3">
