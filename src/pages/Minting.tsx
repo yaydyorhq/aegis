@@ -1455,7 +1455,7 @@ export function MintingPage() {
       </div>
 
       <div className="overflow-x-auto rounded-[14px] border border-line bg-card">
-        <div className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_200px_60px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_260px_60px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
           <div>ID</div>
           <div>Contract</div>
           <div>Gas</div>
@@ -1476,7 +1476,7 @@ export function MintingPage() {
           filteredTasks.map((t) => (
             <div
               key={t.id}
-              className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_200px_60px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
+              className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_260px_60px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
             >
               <div className="text-muted">#{t.id}</div>
               <div className="truncate font-mono text-[12px]" title={t.contract}>
@@ -1514,43 +1514,46 @@ export function MintingPage() {
                   <span className="opacity-50">+{t.delay_ms}ms</span>
                 ) : null)}
               </div>
-              <div className="flex min-w-0 items-center gap-1.5 text-[12px] capitalize">
-                <StatusDot
-                  ok={t.status === "confirmed" || t.status === "simulated"}
-                />
-                <span className="truncate">
-                {t.status === "confirmed" && t.tx_hash
-                  ? `minted · ${shortAddress(t.tx_hash, 4)}`
-                  : t.status}
-                </span>
-                {t.error && t.status !== "confirmed" ? (
-                  <span className="ml-1 truncate text-[10px] text-danger/80" title={t.error}>
-                    ·{t.error.slice(0, 40)}{t.error.length > 40 ? "…" : ""}
+              <div className="flex min-w-0 flex-col gap-0.5 text-[12px] capitalize">
+                <div className="flex items-center gap-1.5">
+                  <StatusDot ok={t.status === "confirmed" || t.status === "simulated"} />
+                  <span className="truncate">
+                    {t.status === "confirmed" && t.tx_hash
+                      ? `minted · ${shortAddress(t.tx_hash, 4)}`
+                      : t.status}
                   </span>
-                ) : null}
-                {(t.status === "failed" || t.status === "canceled" || t.status === "cancelled") && !t.tx_hash ? (
-                  <button
-                    type="button"
-                    onClick={() => void onRetry(t.id)}
-                    className="ml-1 rounded border border-warn/40 px-1.5 py-0.5 text-[10px] text-warn hover:bg-warn/20"
-                    title="Retry this task"
-                  >
-                    retry
-                  </button>
-                ) : null}
-                {t.tx_hash ? (
-                  <button
-                    type="button"
-                    title={t.tx_hash}
-                    onClick={() => {
-                      const base = explorerByChain.get(t.chain_id);
-                      if (!base || !t.tx_hash) return;
-                      void openUrl(`${base}/tx/${t.tx_hash}`);
-                    }}
-                    className="inline-flex shrink-0 items-center text-muted transition hover:text-fg"
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" />
-                  </button>
+                  {t.tx_hash ? (
+                    <button
+                      type="button"
+                      title={t.tx_hash}
+                      onClick={() => {
+                        const base = explorerByChain.get(t.chain_id);
+                        if (!base || !t.tx_hash) return;
+                        void openUrl(`${base}/tx/${t.tx_hash}`);
+                      }}
+                      className="inline-flex shrink-0 items-center text-muted transition hover:text-fg"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </button>
+                  ) : null}
+                </div>
+                {t.error && t.status !== "confirmed" ? (
+                  <div className="flex items-center gap-1 pl-[13px]">
+                    <span className="truncate text-[10px] text-danger/80" title={t.error}>
+                      {t.error.slice(0, 60)}
+                      {t.error.length > 60 ? "..." : ""}
+                    </span>
+                    {(t.status === "failed" || t.status === "canceled" || t.status === "cancelled") && !t.tx_hash ? (
+                      <button
+                        type="button"
+                        onClick={() => void onRetry(t.id)}
+                        className="shrink-0 rounded border border-warn/40 px-1.5 py-0.5 text-[10px] text-warn hover:bg-warn/20"
+                        title="Retry this task"
+                      >
+                        retry
+                      </button>
+                    ) : null}
+                  </div>
                 ) : null}
               </div>
               <div className="flex items-center justify-end gap-1.5 text-right">
