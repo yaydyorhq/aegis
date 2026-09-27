@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   BadgeCheck,
   CheckCircle2,
@@ -36,17 +37,22 @@ interface HistRow {
 type GroupFilter = number | "all" | "ungrouped";
 type ViewMode = "table" | "cards";
 
-/** Friendly labels for common stage names. */
+/** Friendly labels for OpenSea + SeaDrop stage enum values. */
 function stageLabel(name: string): string {
   const map: Record<string, string> = {
+    // OpenSea stage types
     PUBLIC_SALE: "Public",
+    SIGNED_PRESALE: "Pre-sale",
+    MERKLE_PRESALE: "Allowlist",
     PRESALE: "Pre-sale",
     FCFS: "FCFS",
     GTD: "GTD",
     WL: "Allowlist",
+    ALLOWLIST: "Allowlist",
     CLAIM: "Claim",
-    ONCHAIN: "On-chain",
     PRIVATE: "Private",
+    // On-chain fallback
+    ONCHAIN: "On-chain",
   };
   return map[name] ?? name;
 }
@@ -67,6 +73,7 @@ export function EligibleCheckPage() {
   /** Row indices (into matrix.rows) selected for manual queue. */
   const [manualSel, setManualSel] = useState<number[]>([]);
 
+  const navigate = useNavigate();
   const groupNames = useMemo(() => groupNameMap(groups), [groups]);
   const visibleWallets = useMemo(
     () => filterWalletsByGroup(wallets, groupFilter),
@@ -140,7 +147,7 @@ export function EligibleCheckPage() {
   const allVisibleSelected =
     visibleWallets.length > 0 && visibleWallets.every((w) => selected.includes(w.id));
 
-  async function queueWallets(walletIds: number[], label: string) {
+  async function createDraftTasks(walletIds: number[], label: string) {
     if (!chainId || !collection.trim() || walletIds.length === 0) return;
     setQueueing(true);
     setErr(null);
@@ -153,24 +160,27 @@ export function EligibleCheckPage() {
           quantity: 1,
           token_id: "0",
           mode: "execute",
+          draft: true, // store as draft — user schedules & runs on Minting page
         },
       });
-      const queued = result.tasks.length;
+      const drafted = result.tasks.length;
       const skipped = result.skipped.length;
-      if (queued === 0) {
+      if (drafted === 0) {
         const reason =
           result.skipped
             .map((s) => `#${s.wallet_id}: ${s.reason}`)
             .join("; ")
-            .slice(0, 400) || "Nothing enqueued";
+            .slice(0, 400) || "Nothing created";
         setErr(reason);
-        pushToast("Queue failed", "error", reason);
+        pushToast("Task creation failed", "error", reason);
         return;
       }
       pushToast(
-        `${label} queued`,
+        `${label} created`,
         "ok",
-        skipped > 0 ? `${queued} queued · ${skipped} skipped` : `${queued} wallet(s)`,
+        skipped > 0
+          ? `${drafted} draft task(s) · ${skipped} skipped — opening Minting`
+          : `${drafted} draft task(s) — schedule & run on Minting`,
       );
       if (skipped > 0) {
         setErr(
@@ -181,26 +191,28 @@ export function EligibleCheckPage() {
         );
       }
       setManualSel([]);
+      // Navigate to Minting so the user can schedule and run.
+      setTimeout(() => navigate("/minting"), 600);
     } catch (e) {
       setErr(String(e));
-      pushToast("Queue failed", "error", String(e).slice(0, 160));
+      pushToast("Task creation failed", "error", String(e).slice(0, 160));
     } finally {
       setQueueing(false);
     }
   }
 
-  function onQueueAll() {
-    void queueWallets(
+  function onCreateAll() {
+    void createDraftTasks(
       eligibleRows.map((r) => r.wallet_id as number),
-      "Auto-queue eligible",
+      "Auto-create eligible",
     );
   }
 
-  function onQueueManual() {
+  function onCreateManual() {
     const ids = manualSel
       .map((i) => matrix?.rows[i]?.wallet_id)
       .filter((id): id is number => id != null);
-    void queueWallets(ids, "Manual queue");
+    void createDraftTasks(ids, "Manual create");
   }
 
   function toggleManual(idx: number) {
@@ -237,7 +249,7 @@ export function EligibleCheckPage() {
               </button>
               <button
                 type="button"
-                onClick={onQueueAll}
+                onClick={onCreateAll}
                 disabled={queueing || eligibleRows.length === 0}
                 className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-40"
               >
@@ -246,7 +258,7 @@ export function EligibleCheckPage() {
                 ) : (
                   <Zap className="h-3.5 w-3.5" />
                 )}
-                Queue eligible ({eligibleRows.length})
+                Create tasks ({eligibleRows.length})
               </button>
             </div>
           ) : undefined
@@ -380,7 +392,7 @@ export function EligibleCheckPage() {
             <div className="flex gap-1.5">
               <button
                 type="button"
-                onClick={onQueueManual}
+                onClick={onCreateManual}
                 disabled={queueing || manualSel.length === 0}
                 className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] text-muted hover:text-fg disabled:opacity-40"
               >
@@ -389,7 +401,7 @@ export function EligibleCheckPage() {
                 ) : (
                   <Zap className="h-3.5 w-3.5" />
                 )}
-                Queue selected ({manualSel.length})
+                Create selected ({manualSel.length})
               </button>
             </div>
           </div>

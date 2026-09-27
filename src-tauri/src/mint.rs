@@ -355,7 +355,8 @@ fn decode_rpc_error(e: &AppError) -> String {
     raw
 }
 
-pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
+/// Core enqueue logic. `status` is `"pending"` (auto-run) or `"draft"` (manual promote).
+fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
     if !crate::vault::is_unlocked()? {
         return Err(AppError::VaultLocked);
     }
@@ -510,7 +511,7 @@ pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
                 gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override,
                 scheduled_at, delay_ms, mode
              )
-             VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?7, ?8,?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19)",
+             VALUES (?1,?2,?3,?4,?5,?20,?6,?7,?7, ?8,?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19)",
             rusqlite::params![
                 a.chain_id,
                 c,
@@ -531,6 +532,7 @@ pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
                 a.scheduled_at,
                 delay,
                 mode,
+                status,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -539,8 +541,10 @@ pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
     wallet_store::log_activity(
         "mint.enqueue",
         &format!(
-            "Queued mint #{id} → {c} x{} on chain {} ({mode})",
-            a.quantity, a.chain_id
+            "{} mint #{id} → {c} x{} on chain {} ({mode})",
+            if status == "draft" { "Drafted" } else { "Queued" },
+            a.quantity,
+            a.chain_id
         ),
         None,
         true,
@@ -548,10 +552,68 @@ pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
     get_task(id)
 }
 
+/// Queue a mint task for immediate processing by the auto-run scheduler.
+pub fn enqueue(a: EnqueueArgs) -> AppResult<MintTaskRow> {
+    enqueue_inner(a, "pending")
+}
+
+/// Store a mint task as a draft — visible on the Minting page but NOT run
+/// until the user promotes it (`promote_task` / `promote_all_drafts`).
+pub fn enqueue_draft(a: EnqueueArgs) -> AppResult<MintTaskRow> {
+    enqueue_inner(a, "draft")
+}
+
+/// Promote a draft task to `pending` so the auto-run scheduler picks it up.
+pub fn promote_task(id: i64) -> AppResult<MintTaskRow> {
+    let now = crate::db::now_ms();
+    let n = crate::db::with_conn(|conn| {
+        Ok(conn.execute(
+            "UPDATE mint_tasks SET status='pending', updated_at=?1 WHERE id=?2 AND status='draft'",
+            rusqlite::params![now, id],
+        )?)
+    })?;
+    if n == 0 {
+        let t = get_task(id)?;
+        if t.status != "draft" {
+            return Err(AppError::Invalid(format!(
+                "task {id} is '{}' — only drafts can be promoted",
+                t.status
+            )));
+        }
+    }
+    wallet_store::log_activity(
+        "mint.promote",
+        &format!("Promoted draft mint #{id} → pending"),
+        None,
+        true,
+    );
+    get_task(id)
+}
+
+/// Promote every draft task in one call (bulk "queue all drafts").
+pub fn promote_all_drafts() -> AppResult<i64> {
+    let now = crate::db::now_ms();
+    let n = crate::db::with_conn(|conn| {
+        Ok(conn.execute(
+            "UPDATE mint_tasks SET status='pending', updated_at=?1 WHERE status='draft'",
+            rusqlite::params![now],
+        )?)
+    })?;
+    if n > 0 {
+        wallet_store::log_activity(
+            "mint.promote",
+            &format!("Promoted {n} draft task(s) → pending"),
+            None,
+            true,
+        );
+    }
+    Ok(n as i64)
+}
+
 pub fn cancel_task(id: i64) -> AppResult<()> {
     let n = crate::db::with_conn(|conn| {
         Ok(conn.execute(
-            "DELETE FROM mint_tasks WHERE id = ?1 AND status = 'pending'",
+            "DELETE FROM mint_tasks WHERE id = ?1 AND status IN ('pending','draft')",
             [id],
         )?)
     })?;

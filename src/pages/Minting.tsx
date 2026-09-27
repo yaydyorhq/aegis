@@ -606,6 +606,33 @@ export function MintingPage() {
     }
   }
 
+  async function onPromoteDrafts() {
+    setPromoting(true);
+    setErr(null);
+    try {
+      const n = await ipc<number>("mint_promote_all");
+      pushToast("Drafts promoted", "ok", `${n} task(s) → pending — auto-run will pick them up`);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+      pushToast("Promote failed", "error", String(e).slice(0, 160));
+    } finally {
+      setPromoting(false);
+    }
+  }
+
+  async function onPromote(id: number) {
+    setErr(null);
+    try {
+      await ipc("mint_promote", { id });
+      pushToast("Draft promoted", "ok", `Task #${id} → pending`);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+      pushToast("Promote failed", "error", String(e).slice(0, 160));
+    }
+  }
+
   /// Preview the exact calldata that will be signed for the first selected
   /// wallet.  Catches ABI mistakes (unpadded address, wrong arg count) before
   /// the batch is enqueued.
@@ -682,6 +709,9 @@ export function MintingPage() {
   }
 
   const hasPending = tasks.some((t) => t.status === "pending");
+  const hasDrafts = tasks.some((t) => t.status === "draft");
+  const draftCount = tasks.filter((t) => t.status === "draft").length;
+  const [promoting, setPromoting] = useState(false);
   const matchedAllowlist =
     allowlistMatch?.filter((m) => m.matched).length ?? selectedWalletIds.length;
   const canSubmit =
@@ -714,6 +744,21 @@ export function MintingPage() {
         subtitle="Queue mint tasks — signed and broadcast from local vault"
         action={
           <div className="flex gap-2">
+            {hasDrafts ? (
+              <button
+                onClick={onPromoteDrafts}
+                disabled={promoting}
+                className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
+                title="Promote all draft tasks to pending so the auto-run scheduler picks them up"
+              >
+                {promoting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4" />
+                )}
+                Promote {draftCount} draft{draftCount !== 1 ? "s" : ""}
+              </button>
+            ) : null}
             <button
               onClick={onRun}
               disabled={running || !hasPending}
@@ -1418,8 +1463,25 @@ export function MintingPage() {
                   </button>
                 ) : null}
               </div>
-              <div className="text-right">
-                {t.status === "pending" ? (
+              <div className="flex items-center justify-end gap-1.5 text-right">
+                {t.status === "draft" ? (
+                  <>
+                    <span
+                      className="rounded border border-warn/40 bg-warn/10 px-2 py-0.5 text-[10px] uppercase tracking-wide text-warn"
+                      title="Draft — promote to queue"
+                    >
+                      draft
+                    </span>
+                    <button
+                      onClick={() => onPromote(t.id)}
+                      className="rounded p-1 text-accent hover:bg-line"
+                      title="Promote to pending"
+                    >
+                      <Play className="h-3.5 w-3.5" />
+                    </button>
+                  </>
+                ) : null}
+                {t.status === "pending" || t.status === "draft" ? (
                   <button
                     onClick={() => onCancel(t.id)}
                     className="rounded p-1 text-muted hover:bg-line hover:text-danger"

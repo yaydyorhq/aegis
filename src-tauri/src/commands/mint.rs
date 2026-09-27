@@ -308,6 +308,8 @@ pub struct MintOpenSeaEnqueueArgs {
     pub scheduled_at: Option<i64>,
     pub delay_ms: Option<i64>,
     pub mode: Option<String>,
+    /// When true, tasks are stored as `draft` — not auto-run until promoted.
+    pub draft: Option<bool>,
 }
 
 /// Per-wallet OpenSea stage mint: SIWE → eligible stage → MintAction → mint queue.
@@ -395,7 +397,8 @@ pub async fn mint_opensea_enqueue(args: MintOpenSeaEnqueueArgs) -> AppResult<Enq
             delay_ms: args.delay_ms,
             mode: args.mode.clone(),
         };
-        match mint::enqueue(enqueue) {
+        let enqueue_fn = if args.draft.unwrap_or(false) { mint::enqueue_draft } else { mint::enqueue };
+        match enqueue_fn(enqueue) {
             Ok(task) => out.push(task),
             Err(e) => skipped.push(SkippedWallet {
                 wallet_id,
@@ -449,3 +452,15 @@ pub fn mint_encode_calldata(
     )
 }
 
+
+/// Promote a single draft mint task to pending (auto-run will pick it up).
+#[tauri::command]
+pub fn mint_promote(id: i64) -> AppResult<MintTaskRow> {
+    mint::promote_task(id)
+}
+
+/// Promote ALL draft mint tasks to pending.
+#[tauri::command]
+pub fn mint_promote_all() -> AppResult<i64> {
+    mint::promote_all_drafts()
+}
