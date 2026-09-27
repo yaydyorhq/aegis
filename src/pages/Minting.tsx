@@ -1455,7 +1455,7 @@ export function MintingPage() {
       </div>
 
       <div className="overflow-x-auto rounded-[14px] border border-line bg-card">
-        <div className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_260px_60px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid min-w-[820px] grid-cols-[40px_1fr_88px_72px_92px_78px_220px_56px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
           <div>ID</div>
           <div>Contract</div>
           <div>Gas</div>
@@ -1476,7 +1476,7 @@ export function MintingPage() {
           filteredTasks.map((t) => (
             <div
               key={t.id}
-              className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_260px_60px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
+              className="grid min-w-[820px] grid-cols-[40px_1fr_88px_72px_92px_78px_220px_56px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
             >
               <div className="text-muted">#{t.id}</div>
               <div className="truncate font-mono text-[12px]" title={t.contract}>
@@ -1517,7 +1517,7 @@ export function MintingPage() {
               <div className="flex min-w-0 flex-col gap-0.5 text-[12px] capitalize">
                 <div className="flex items-center gap-1.5">
                   <StatusDot ok={t.status === "confirmed" || t.status === "simulated"} />
-                  <span className="truncate">
+                  <span className="min-w-0 truncate">
                     {t.status === "confirmed" && t.tx_hash
                       ? `minted · ${shortAddress(t.tx_hash, 4)}`
                       : t.status}
@@ -1538,8 +1538,8 @@ export function MintingPage() {
                   ) : null}
                 </div>
                 {t.error && t.status !== "confirmed" ? (
-                  <div className="flex items-center gap-1 pl-[13px]">
-                    <span className="truncate text-[10px] text-danger/80" title={t.error}>
+                  <div className="flex min-w-0 items-center gap-1 pl-[13px]">
+                    <span className="min-w-0 flex-1 truncate text-[10px] text-danger/80" title={t.error}>
                       {t.error.slice(0, 60)}
                       {t.error.length > 60 ? "..." : ""}
                     </span>
