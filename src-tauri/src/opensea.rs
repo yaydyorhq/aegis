@@ -1191,6 +1191,63 @@ pub async fn plan_mint(
         .await
 }
 
+/// Per-stage result for a single wallet, returned by the matrix check.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletStageResult {
+    pub stage_type: String,
+    pub eligible: bool,
+    pub max_quantity: Option<u64>,
+    pub price_usd: Option<f64>,
+}
+
+/// Check one wallet against all stages of a collection.
+/// Returns `(slug, per-stage results)` or `None` if not on OpenSea.
+/// Requires vault unlocked (SIWE signing).
+pub async fn check_wallet_stages(
+    wallet_id: i64,
+    wallet_addr: &str,
+    collection: &str,
+    expected_network: u64,
+) -> AppResult<Option<(String, Vec<WalletStageResult>)>> {
+    if !crate::vault::is_unlocked().unwrap_or(false) {
+        return Err(AppError::VaultLocked);
+    }
+    let wallet: Address = wallet_addr
+        .parse()
+        .map_err(|_| AppError::Invalid("bad wallet address".into()))?;
+    let client = OpenSeaClient::new()?;
+    let Some(resolved) = client
+        .resolve_collection(collection, Some(expected_network))
+        .await?
+    else {
+        return Ok(None); // collection not on OpenSea
+    };
+    let network = if resolved.network_id != 0 {
+        resolved.network_id
+    } else {
+        expected_network
+    };
+    if network == 0 {
+        return Err(os_err("unknown collection network"));
+    }
+    client
+        .authenticate(wallet_id, &wallet, network, &resolved.slug)
+        .await?;
+    let stages = client.fetch_stages(&resolved.slug, &wallet).await?;
+    let results: Vec<WalletStageResult> = stages
+        .into_iter()
+        .map(|s| WalletStageResult {
+            stage_type: s.stage_type,
+            eligible: s.is_eligible.unwrap_or(false),
+            max_quantity: s
+                .eligible_max_total_mintable_by_wallet
+                .or(s.max_total_mintable_by_wallet),
+            price_usd: s.price_usd,
+        })
+        .collect();
+    Ok(Some((resolved.slug, results)))
+}
+
 /// Full check for one wallet. `Ok(None)` = collection not on OpenSea (caller falls back).
 /// Requires vault unlocked (SIWE signing).
 pub async fn check_wallet(

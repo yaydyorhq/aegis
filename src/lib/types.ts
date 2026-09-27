@@ -396,3 +396,31 @@ export interface CollectionPnlResult {
   warnings: string[];
   scanned_at: number;
 }
+
+/** Per-stage eligibility cell for one wallet. */
+export interface StageMatrixCell {
+  stage_name: string;
+  eligible: boolean;
+  max_quantity: number | null;
+  price_usd: number | null;
+}
+
+/** One wallet row in the eligibility matrix. */
+export interface StageMatrixRow {
+  wallet_id: number | null;
+  address: string;
+  collection: string;
+  slug: string;
+  stages: StageMatrixCell[];
+  error: string | null;
+  checked_at: number;
+}
+
+/** Full matrix result from eligibility_matrix_run. */
+export interface StageMatrixResult {
+  slug: string;
+  collection: string;
+  stage_names: string[];
+  rows: StageMatrixRow[];
+  checked_at: number;
+}

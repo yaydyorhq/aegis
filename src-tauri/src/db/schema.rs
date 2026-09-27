@@ -79,6 +79,19 @@ CREATE TABLE IF NOT EXISTS eligibility_checks(
   checked_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS eligibility_matrix(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  wallet_id INTEGER NOT NULL,
+  collection TEXT NOT NULL,
+  stage_name TEXT NOT NULL,
+  eligible INTEGER NOT NULL DEFAULT 0,
+  max_quantity INTEGER,
+  detail TEXT,
+  checked_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_elig_matrix_lookup
+  ON eligibility_matrix(collection, wallet_id, checked_at DESC);
+
 CREATE TABLE IF NOT EXISTS activity(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,

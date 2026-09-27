@@ -89,6 +89,7 @@ pub fn run() {
             commands::nft::nft_metadata,
             // eligibility
             commands::eligibility::eligibility_run,
+            commands::eligibility::eligibility_matrix_run,
             commands::eligibility::eligibility_history,
             // mint
             commands::mint::mint_list,

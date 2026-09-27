@@ -1,23 +1,28 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import { BadgeCheck, CheckSquare, Loader2, Square, Zap } from "lucide-react";
+import {
+  BadgeCheck,
+  CheckCircle2,
+  CheckSquare,
+  LayoutGrid,
+  Loader2,
+  Rows3,
+  Square,
+  XCircle,
+  Zap,
+} from "lucide-react";
 import { ipc } from "../lib/ipc";
-import type { ChainRow, EnqueueBatchResult } from "../lib/types";
-import { EmptyState, PageHeader, StatusDot, pushToast } from "../components/ui";
+import type {
+  ChainRow,
+  EnqueueBatchResult,
+  StageMatrixResult,
+} from "../lib/types";
+import { EmptyState, PageHeader, pushToast } from "../components/ui";
 import { shortAddress } from "../lib/utils";
 import {
   filterWalletsByGroup,
   groupNameMap,
   useWalletStore,
 } from "../store/app";
-
-interface EligRow {
-  wallet_id: number | null;
-  address: string;
-  collection: string;
-  eligible: boolean | null;
-  detail: string;
-  checked_at: number;
-}
 
 interface HistRow {
   id: number;
@@ -29,6 +34,22 @@ interface HistRow {
 }
 
 type GroupFilter = number | "all" | "ungrouped";
+type ViewMode = "table" | "cards";
+
+/** Friendly labels for common stage names. */
+function stageLabel(name: string): string {
+  const map: Record<string, string> = {
+    PUBLIC_SALE: "Public",
+    PRESALE: "Pre-sale",
+    FCFS: "FCFS",
+    GTD: "GTD",
+    WL: "Allowlist",
+    CLAIM: "Claim",
+    ONCHAIN: "On-chain",
+    PRIVATE: "Private",
+  };
+  return map[name] ?? name;
+}
 
 export function EligibleCheckPage() {
   const { wallets, groups, load: loadWallets } = useWalletStore();
@@ -36,12 +57,15 @@ export function EligibleCheckPage() {
   const [selected, setSelected] = useState<number[]>([]);
   const [chainId, setChainId] = useState("");
   const [collection, setCollection] = useState("");
-  const [results, setResults] = useState<EligRow[]>([]);
+  const [matrix, setMatrix] = useState<StageMatrixResult | null>(null);
   const [history, setHistory] = useState<HistRow[]>([]);
   const [running, setRunning] = useState(false);
-  const [minting, setMinting] = useState(false);
+  const [queueing, setQueueing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [groupFilter, setGroupFilter] = useState<GroupFilter>("all");
+  const [viewMode, setViewMode] = useState<ViewMode>("table");
+  /** Row indices (into matrix.rows) selected for manual queue. */
+  const [manualSel, setManualSel] = useState<number[]>([]);
 
   const groupNames = useMemo(() => groupNameMap(groups), [groups]);
   const visibleWallets = useMemo(
@@ -82,19 +106,29 @@ export function EligibleCheckPage() {
     setSelected((s) => s.filter((id) => !ids.has(id)));
   }
 
+  /** Rows where at least one stage is eligible. */
+  const eligibleRows = useMemo(
+    () =>
+      (matrix?.rows ?? []).filter(
+        (r) => r.wallet_id != null && r.stages.some((s) => s.eligible),
+      ),
+    [matrix],
+  );
+
   async function onRun(e: FormEvent) {
     e.preventDefault();
     if (selected.length === 0 || !chainId || !collection.trim()) return;
     setRunning(true);
     setErr(null);
-    setResults([]);
+    setMatrix(null);
+    setManualSel([]);
     try {
-      const rows = await ipc<EligRow[]>("eligibility_run", {
+      const result = await ipc<StageMatrixResult>("eligibility_matrix_run", {
         walletIds: selected,
         chainId: Number(chainId),
         collection: collection.trim(),
       });
-      setResults(rows);
+      setMatrix(result);
       await load();
     } catch (e2) {
       setErr(String(e2));
@@ -106,22 +140,14 @@ export function EligibleCheckPage() {
   const allVisibleSelected =
     visibleWallets.length > 0 && visibleWallets.every((w) => selected.includes(w.id));
 
-  const eligibleWalletIds = useMemo(
-    () =>
-      results
-        .filter((r) => r.eligible === true && r.wallet_id != null)
-        .map((r) => r.wallet_id as number),
-    [results],
-  );
-
-  async function onMintEligible() {
-    if (!chainId || !collection.trim() || eligibleWalletIds.length === 0) return;
-    setMinting(true);
+  async function queueWallets(walletIds: number[], label: string) {
+    if (!chainId || !collection.trim() || walletIds.length === 0) return;
+    setQueueing(true);
     setErr(null);
     try {
       const result = await ipc<EnqueueBatchResult>("mint_opensea_enqueue", {
         args: {
-          wallet_ids: eligibleWalletIds,
+          wallet_ids: walletIds,
           chain_id: Number(chainId),
           collection: collection.trim(),
           quantity: 1,
@@ -138,15 +164,13 @@ export function EligibleCheckPage() {
             .join("; ")
             .slice(0, 400) || "Nothing enqueued";
         setErr(reason);
-        pushToast("OpenSea mint failed", "error", reason);
+        pushToast("Queue failed", "error", reason);
         return;
       }
       pushToast(
-        "OpenSea stage mint queued",
+        `${label} queued`,
         "ok",
-        skipped > 0
-          ? `${queued} queued · ${skipped} skipped`
-          : `${queued} wallet(s) · qty 1`,
+        skipped > 0 ? `${queued} queued · ${skipped} skipped` : `${queued} wallet(s)`,
       );
       if (skipped > 0) {
         setErr(
@@ -156,24 +180,81 @@ export function EligibleCheckPage() {
             .slice(0, 400),
         );
       }
+      setManualSel([]);
     } catch (e) {
       setErr(String(e));
-      pushToast("OpenSea mint failed", "error", String(e).slice(0, 160));
+      pushToast("Queue failed", "error", String(e).slice(0, 160));
     } finally {
-      setMinting(false);
+      setQueueing(false);
     }
   }
+
+  function onQueueAll() {
+    void queueWallets(
+      eligibleRows.map((r) => r.wallet_id as number),
+      "Auto-queue eligible",
+    );
+  }
+
+  function onQueueManual() {
+    const ids = manualSel
+      .map((i) => matrix?.rows[i]?.wallet_id)
+      .filter((id): id is number => id != null);
+    void queueWallets(ids, "Manual queue");
+  }
+
+  function toggleManual(idx: number) {
+    setManualSel((s) =>
+      s.includes(idx) ? s.filter((x) => x !== idx) : [...s, idx],
+    );
+  }
+
+  const stageCols = matrix?.stage_names ?? [];
 
   return (
     <div className="p-6">
       <PageHeader
         suite="Operations"
-        title="Eligible Check"
-        subtitle="OpenSea stages (FCFS/presale via SIWE) first, then SeaDrop public drop or holdings"
+        title="Eligibility Check"
+        subtitle="Hybrid: OpenSea stages (GTD/FCFS/WL/Public) + SeaDrop on-chain fallback"
+        action={
+          matrix ? (
+            <div className="flex gap-1.5">
+              <button
+                type="button"
+                onClick={() => setViewMode(viewMode === "table" ? "cards" : "table")}
+                className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] text-muted hover:text-fg"
+              >
+                {viewMode === "table" ? (
+                  <>
+                    <LayoutGrid className="h-3.5 w-3.5" /> Cards
+                  </>
+                ) : (
+                  <>
+                    <Rows3 className="h-3.5 w-3.5" /> Table
+                  </>
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={onQueueAll}
+                disabled={queueing || eligibleRows.length === 0}
+                className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-40"
+              >
+                {queueing ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Zap className="h-3.5 w-3.5" />
+                )}
+                Queue eligible ({eligibleRows.length})
+              </button>
+            </div>
+          ) : undefined
+        }
       />
 
+      {/* ── Input form ─────────────────────────────────────────── */}
       <form onSubmit={onRun} className="mb-4 space-y-3 rounded-[14px] border border-line bg-card p-4">
-        {/* group filter chips */}
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] uppercase tracking-wide text-muted">Group</span>
           <button
@@ -257,13 +338,14 @@ export function EligibleCheckPage() {
             <span className="text-[13px] text-muted">No wallets in this group filter.</span>
           ) : null}
         </div>
+
         <div className="flex gap-2">
           <select
             value={chainId}
             onChange={(e) => setChainId(e.target.value)}
             className="rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
           >
-            <option value="">Chain…</option>
+            <option value="">Chain...</option>
             {chains.map((c) => (
               <option key={c.id} value={c.chain_id}>
                 {c.name}
@@ -271,7 +353,7 @@ export function EligibleCheckPage() {
             ))}
           </select>
           <input
-            placeholder="Collection address (0x…)"
+            placeholder="Collection address (0x...) or OpenSea slug"
             value={collection}
             onChange={(e) => setCollection(e.target.value)}
             className="flex-1 rounded-lg border border-line bg-bg px-3 py-2 font-mono text-[13px] outline-none focus:border-accent"
@@ -282,67 +364,215 @@ export function EligibleCheckPage() {
             className="flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
           >
             <BadgeCheck className="h-4 w-4" />
-            {running ? "Checking…" : `Run (${selected.length})`}
+            {running ? "Checking..." : `Run (${selected.length})`}
           </button>
         </div>
         {err ? <div className="text-[12px] text-danger">{err}</div> : null}
       </form>
 
-      {results.length > 0 ? (
-        <div className="mb-4 overflow-hidden rounded-[14px] border border-line bg-card">
+      {/* ── Matrix results ─────────────────────────────────────── */}
+      {matrix && viewMode === "table" ? (
+        <div className="mb-4 overflow-x-auto rounded-[14px] border border-line bg-card">
           <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
-            <span className="text-[12px] font-semibold">Results</span>
-            <button
-              type="button"
-              onClick={() => void onMintEligible()}
-              disabled={
-                minting ||
-                eligibleWalletIds.length === 0 ||
-                !chainId ||
-                !collection.trim()
-              }
-              className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-40"
-            >
-              {minting ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Zap className="h-3.5 w-3.5" />
-              )}
-              {minting
-                ? "Queueing…"
-                : `Mint eligible via OpenSea (${eligibleWalletIds.length})`}
-            </button>
-          </div>
-          {results.map((r, i) => (
-            <div
-              key={i}
-              className="flex items-center justify-between border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0"
-            >
-              <div className="font-mono text-[12px]">{r.address}</div>
-              <div className="flex items-center gap-3 text-[12px]">
-                <span className="text-muted">{r.detail}</span>
-                <span
-                  className={
-                    r.eligible === true
-                      ? "text-ok"
-                      : r.eligible === null
-                        ? "text-danger"
-                        : "text-muted"
-                  }
-                >
-                  {r.eligible === true
-                    ? "ELIGIBLE"
-                    : r.eligible === null
-                      ? "ERROR"
-                      : "NOT ELIGIBLE"}
-                </span>
-                <StatusDot ok={r.eligible === true} />
-              </div>
+            <span className="text-[12px] font-semibold">
+              {matrix.slug} — {eligibleRows.length}/{matrix.rows.length} eligible
+            </span>
+            <div className="flex gap-1.5">
+              <button
+                type="button"
+                onClick={onQueueManual}
+                disabled={queueing || manualSel.length === 0}
+                className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] text-muted hover:text-fg disabled:opacity-40"
+              >
+                {queueing ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Zap className="h-3.5 w-3.5" />
+                )}
+                Queue selected ({manualSel.length})
+              </button>
             </div>
-          ))}
+          </div>
+
+          {/* Table header */}
+          <div className="grid border-b border-line bg-line/30 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted"
+            style={{
+              gridTemplateColumns: `28px minmax(100px,1fr) minmax(140px,1.4fr) ${stageCols
+                .map(() => "68px")
+                .join(" ")} 70px`,
+            }}
+          >
+            <div>#</div>
+            <div>Slug</div>
+            <div>Wallet</div>
+            {stageCols.map((s) => (
+              <div key={s} className="text-center">
+                {stageLabel(s)}
+              </div>
+            ))}
+            <div className="text-center">Queue</div>
+          </div>
+
+          {/* Table rows */}
+          {matrix.rows.map((r, ri) => {
+            const anyEligible = r.stages.some((s) => s.eligible);
+            const stageMap = new Map(r.stages.map((s) => [s.stage_name, s]));
+            return (
+              <div
+                key={`${r.wallet_id}-${ri}`}
+                className={`grid items-center border-b border-line/60 px-4 py-2 text-[13px] last:border-0 hover:bg-line/30 ${
+                  manualSel.includes(ri) ? "bg-accent/5" : ""
+                }`}
+                style={{
+                  gridTemplateColumns: `28px minmax(100px,1fr) minmax(140px,1.4fr) ${stageCols
+                    .map(() => "68px")
+                    .join(" ")} 70px`,
+                }}
+              >
+                <div className="text-muted text-[12px]">{ri + 1}</div>
+                <div className="truncate font-mono text-[12px] text-muted" title={r.slug}>
+                  {r.slug}
+                </div>
+                <div className="truncate font-mono text-[12px]" title={r.address}>
+                  {shortAddress(r.address, 4)}
+                </div>
+                {stageCols.map((sc) => {
+                  const cell = stageMap.get(sc);
+                  if (!cell) {
+                    return (
+                      <div key={sc} className="text-center text-muted" title="Not checked for this stage">
+                        <span className="text-[14px] opacity-30">—</span>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div key={sc} className="flex justify-center" title={cell.eligible ? "Eligible" : "Not eligible"}>
+                      {cell.eligible ? (
+                        <CheckCircle2 className="h-4.5 w-4.5 text-ok" />
+                      ) : (
+                        <XCircle className="h-4.5 w-4.5 text-danger/70" />
+                      )}
+                    </div>
+                  );
+                })}
+                <div className="flex justify-center">
+                  {anyEligible ? (
+                    <input
+                      type="checkbox"
+                      checked={manualSel.includes(ri)}
+                      onChange={() => toggleManual(ri)}
+                      className="h-4 w-4 cursor-pointer accent-accent"
+                    />
+                  ) : (
+                    <span className="text-[12px] text-muted">—</span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {matrix.rows.some((r) => r.error) && (
+            <div className="border-t border-line px-4 py-2 text-[12px] text-danger">
+              {matrix.rows
+                .filter((r) => r.error)
+                .map((r) => `${shortAddress(r.address, 4)}: ${r.error}`)
+                .join(" · ")}
+            </div>
+          )}
         </div>
       ) : null}
 
+      {/* ── Cards view ─────────────────────────────────────────── */}
+      {matrix && viewMode === "cards" ? (
+        <div className="mb-4 rounded-[14px] border border-line bg-card p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <div className="text-[14px] font-semibold">{matrix.slug}</div>
+              <div className="truncate font-mono text-[12px] text-muted" title={matrix.collection}>
+                {matrix.collection}
+              </div>
+            </div>
+            <span className="rounded-full bg-accent/10 px-2.5 py-1 text-[12px] text-accent">
+              {eligibleRows.length}/{matrix.rows.length} eligible
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            {matrix.rows.map((r, ri) => {
+              const anyEligible = r.stages.some((s) => s.eligible);
+              const stageMap = new Map(r.stages.map((s) => [s.stage_name, s]));
+              return (
+                <div
+                  key={`${r.wallet_id}-${ri}`}
+                  className={`rounded-lg border px-3 py-2.5 ${
+                    anyEligible ? "border-ok/30 bg-ok/5" : "border-line"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={manualSel.includes(ri)}
+                        onChange={() => toggleManual(ri)}
+                        disabled={!anyEligible}
+                        className="h-3.5 w-3.5 accent-accent"
+                      />
+                      <span className="font-mono text-[12px]" title={r.address}>
+                        {shortAddress(r.address, 6)}
+                      </span>
+                      {r.wallet_id != null && (
+                        <span className="text-[11px] text-muted">#{r.wallet_id}</span>
+                      )}
+                    </div>
+                    <div className="flex gap-3">
+                      {stageCols.map((sc) => {
+                        const cell = stageMap.get(sc);
+                        if (!cell) return null;
+                        return (
+                          <div
+                            key={sc}
+                            className="flex items-center gap-1 text-[11px]"
+                            title={`${stageLabel(sc)}: ${cell.eligible ? "Eligible" : "Not eligible"}${cell.max_quantity ? ` (max ${cell.max_quantity})` : ""}`}
+                          >
+                            {cell.eligible ? (
+                              <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
+                            ) : (
+                              <XCircle className="h-3.5 w-3.5 text-danger/60" />
+                            )}
+                            <span className="text-muted">{stageLabel(sc)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {r.error && (
+                    <div className="mt-1 pl-6 text-[11px] text-danger">{r.error}</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── Empty state ────────────────────────────────────────── */}
+      {!matrix && !running ? (
+        <div className="mb-4">
+          <EmptyState
+            title="No check yet"
+            description="Select wallets, pick a chain and collection, then Run to see the stage matrix."
+          />
+        </div>
+      ) : null}
+
+      {running ? (
+        <div className="mb-4 flex items-center gap-2 rounded-[14px] border border-line bg-card px-4 py-3 text-[13px] text-muted">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Checking eligibility across {selected.length} wallet(s)...
+        </div>
+      ) : null}
+
+      {/* ── History ────────────────────────────────────────────── */}
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
         <div className="border-b border-line px-4 py-2.5 text-[12px] font-semibold">History</div>
         {history.length === 0 ? (

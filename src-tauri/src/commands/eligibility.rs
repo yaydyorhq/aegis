@@ -170,6 +170,205 @@ pub struct EligibilityHistoryRow {
     pub checked_at: i64,
 }
 
+// ─── Stage matrix ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct StageMatrixCell {
+    pub stage_name: String,
+    pub eligible: bool,
+    pub max_quantity: Option<u64>,
+    pub price_usd: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct StageMatrixRow {
+    pub wallet_id: Option<i64>,
+    pub address: String,
+    pub collection: String,
+    pub slug: String,
+    pub stages: Vec<StageMatrixCell>,
+    pub error: Option<String>,
+    pub checked_at: i64,
+}
+
+#[derive(Serialize)]
+pub struct StageMatrixResult {
+    pub slug: String,
+    pub collection: String,
+    /// Union of all stage names seen across wallets, in order of first appearance.
+    pub stage_names: Vec<String>,
+    pub rows: Vec<StageMatrixRow>,
+    pub checked_at: i64,
+}
+
+/// Hybrid eligibility matrix: OpenSea stages per wallet, SeaDrop fallback.
+/// Returns a matrix keyed by collection slug for the table view.
+#[tauri::command]
+pub async fn eligibility_matrix_run(
+    wallet_ids: Vec<i64>,
+    chain_id: i64,
+    collection: String,
+) -> AppResult<StageMatrixResult> {
+    let now = crate::db::now_ms();
+    let chains = crate::chain::list_chains()?;
+    let chain = chains
+        .into_iter()
+        .find(|c| c.chain_id == chain_id)
+        .ok_or_else(|| crate::error::AppError::NotFound(format!("chain {chain_id}")))?;
+
+    let expected_network = u64::try_from(chain.chain_id).unwrap_or(0);
+    let drop = crate::chain::eligibility::fetch_drop_or_none(&chain.rpc_url, &collection).await;
+    let drop_ref = drop.as_ref();
+    let vault_ok = crate::vault::is_unlocked().unwrap_or(false);
+
+    // Resolve slug once (OpenSea) — fall back to the collection address.
+    let mut slug = collection.clone();
+    let mut stage_names: Vec<String> = Vec::new();
+    let mut rows: Vec<StageMatrixRow> = Vec::new();
+
+    for id in &wallet_ids {
+        let w = match wallet_store::get_wallet(*id) {
+            Ok(w) => w,
+            Err(e) => {
+                rows.push(StageMatrixRow {
+                    wallet_id: Some(*id),
+                    address: format!("wallet #{id} not found"),
+                    collection: collection.clone(),
+                    slug: slug.clone(),
+                    stages: Vec::new(),
+                    error: Some(format!("{e}")),
+                    checked_at: now,
+                });
+                continue;
+            }
+        };
+
+        // ── Path A: OpenSea per-stage check ──────────────────────────
+        let mut stage_cells: Option<Vec<StageMatrixCell>> = None;
+        let mut err_msg: Option<String> = None;
+        if vault_ok {
+            match opensea::check_wallet_stages(*id, &w.address, &collection, expected_network)
+                .await
+            {
+                Ok(Some((os_slug, results))) => {
+                    slug = os_slug;
+                    let cells: Vec<StageMatrixCell> = results
+                        .iter()
+                        .map(|r| StageMatrixCell {
+                            stage_name: r.stage_type.clone(),
+                            eligible: r.eligible,
+                            max_quantity: r.max_quantity,
+                            price_usd: r.price_usd,
+                        })
+                        .collect();
+                    for c in &cells {
+                        if !stage_names.contains(&c.stage_name) {
+                            stage_names.push(c.stage_name.clone());
+                        }
+                    }
+                    stage_cells = Some(cells);
+                }
+                Ok(None) => {} // not on OpenSea → fall through to SeaDrop
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("vault locked") {
+                        err_msg = Some(msg);
+                    }
+                }
+            }
+        }
+
+        // ── Path B: SeaDrop / on-chain fallback ─────────────────────
+        if stage_cells.is_none() {
+            match crate::chain::eligibility::check_eligibility(
+                &chain.rpc_url,
+                &w.address,
+                &collection,
+                drop_ref,
+            )
+            .await
+            {
+                Ok((eligible, detail)) => {
+                    let cell = StageMatrixCell {
+                        stage_name: "ONCHAIN".into(),
+                        eligible,
+                        max_quantity: None,
+                        price_usd: None,
+                    };
+                    if !stage_names.contains(&cell.stage_name) {
+                        stage_names.push(cell.stage_name.clone());
+                    }
+                    stage_cells = Some(vec![cell]);
+                    // Persist to legacy table for backward compat.
+                    let _ = crate::db::with_conn(|conn| {
+                        conn.execute(
+                            "INSERT INTO eligibility_checks(wallet_id, collection, result, detail, checked_at)
+                             VALUES (?1,?2,?3,?4,?5)",
+                            rusqlite::params![id, collection, eligible as i64, detail, now],
+                        )?;
+                        Ok(())
+                    });
+                }
+                Err(e) => {
+                    err_msg = Some(format!("onchain: {e}"));
+                }
+            }
+        }
+
+        let stages = stage_cells.unwrap_or_default();
+
+        // Persist matrix cells.
+        let _ = crate::db::with_conn(|conn| {
+            for s in &stages {
+                conn.execute(
+                    "INSERT INTO eligibility_matrix(wallet_id, collection, stage_name, eligible, max_quantity, detail, checked_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        id,
+                        collection,
+                        s.stage_name,
+                        s.eligible as i64,
+                        s.max_quantity,
+                        err_msg,
+                        now
+                    ],
+                )?;
+            }
+            Ok(())
+        });
+
+        rows.push(StageMatrixRow {
+            wallet_id: Some(*id),
+            address: w.address.clone(),
+            collection: collection.clone(),
+            slug: slug.clone(),
+            stages,
+            error: err_msg,
+            checked_at: now,
+        });
+    }
+
+    let total_wallets = rows.len();
+    let any_eligible = rows.iter().filter(|r| r.stages.iter().any(|s| s.eligible)).count();
+    wallet_store::log_activity(
+        "eligibility.matrix",
+        &format!(
+            "Matrix check: {any_eligible}/{total_wallets} eligible for {slug} (stages: {})",
+            stage_names.join(", ")
+        ),
+        None,
+        true,
+    );
+
+    Ok(StageMatrixResult {
+        slug,
+        collection,
+        stage_names,
+        rows,
+        checked_at: now,
+    })
+}
+
 #[tauri::command]
 pub fn eligibility_history(limit: Option<u32>) -> AppResult<Vec<EligibilityHistoryRow>> {
     let lim = limit.unwrap_or(50);
