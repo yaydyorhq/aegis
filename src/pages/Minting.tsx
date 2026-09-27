@@ -65,6 +65,7 @@ export function MintingPage() {
   const [selectedWalletIds, setSelectedWalletIds] = useState<number[]>([]);
   const [selectedRpcUrls, setSelectedRpcUrls] = useState<string[]>([]);
   const [form, setForm] = useState(emptyForm);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [seaDrop, setSeaDrop] = useState<SeaDropPlan | null>(null);
   const [fetchingDrop, setFetchingDrop] = useState(false);
   const [dropErr, setDropErr] = useState<string | null>(null);
@@ -494,7 +495,7 @@ export function MintingPage() {
     } catch (e) {
       const msg = String(e);
       setOpenSeaErr(msg);
-      pushToast("OpenSea stage fetch failed", "error", msg.slice(0, 160));
+      pushToast("OpenSea fetch failed", "error", msg.slice(0, 160));
     } finally {
       setFetchingOpenSea(false);
     }
@@ -559,7 +560,7 @@ export function MintingPage() {
         return;
       }
       pushToast(
-        "OpenSea stage mint queued",
+        "OpenSea mint queued",
         "ok",
         skipped > 0
           ? `${queued} queued · ${skipped} skipped · qty ${qty}`
@@ -860,8 +861,15 @@ export function MintingPage() {
           <div className="mb-3 rounded-lg border border-line bg-bg p-3">
             <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
               <div className="min-w-0 flex-1">
-                <label className="mb-1 block text-[11px] text-muted">
-                  NFT Contract (SeaDrop public / OpenSea stage)
+                <label className="mb-1 flex items-center gap-2 text-[11px] text-muted">
+                  NFT Collection
+                  {(seaDrop || openSeaPlan) ? (
+                    <button
+                      type="button"
+                      onClick={() => { setSeaDrop(null); setOpenSeaPlan(null); setDropErr(null); setOpenSeaErr(null); }}
+                      className="rounded border border-line px-1.5 py-0.5 text-[10px] hover:bg-line"
+                    >clear plan</button>
+                  ) : null}
                 </label>
                 <input
                   placeholder="0x… collection address"
@@ -882,7 +890,7 @@ export function MintingPage() {
                   ) : (
                     <Link2 className="h-4 w-4" />
                   )}
-                  Fetch public drop
+                  SeaDrop
                 </button>
                 <button
                   type="button"
@@ -979,7 +987,7 @@ export function MintingPage() {
           {/* Row: Contract + Chain */}
           <div className="mb-3 grid grid-cols-2 gap-2">
             <div>
-              <label className="mb-1 block text-[11px] text-muted">Contract Address</label>
+              <label className="mb-1 block text-[11px] text-muted">Contract Target</label>
               <input
                 placeholder="0x…"
                 value={form.contract}
@@ -1222,7 +1230,9 @@ export function MintingPage() {
             </div>
             <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
               {formWallets.length === 0 ? (
-                <div className="text-[12px] text-muted">No wallets in this filter.</div>
+                <div className="text-[12px] text-muted">
+                  No wallets in this filter — create one on the Wallets page first.
+                </div>
               ) : (
                 formWallets.map((w) => {
                   const selected = selectedWalletIds.includes(w.id);
@@ -1308,65 +1318,27 @@ export function MintingPage() {
             </div>
           </div>
 
-          {/* Gas + nonce + schedule */}
-          <div className="mb-3 grid grid-cols-3 gap-2">
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Gas Limit</label>
-              <input
-                placeholder="auto"
-                value={form.gasLimit}
-                onChange={(e) => setForm({ ...form, gasLimit: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              />
+          {/* Advanced settings (collapsible) */}
+          <button type="button" onClick={() => setShowAdvanced(a => !a)}
+            className="mb-2 flex items-center gap-1 text-[11px] text-muted hover:text-fg">
+            <span className="text-[10px]">{showAdvanced ? "\u25bc" : "\u25b6"}</span> Advanced — Gas · Nonce · Schedule
+          </button>
+          {showAdvanced && (
+            <div className="mb-3 rounded-lg border border-line bg-bg p-3">
+              <div className="grid grid-cols-3 gap-2">
+                <div><label className="mb-1 block text-[11px] text-muted">Gas Limit</label><input placeholder="auto" value={form.gasLimit} onChange={(e) => setForm({...form, gasLimit: e.target.value})} className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent" /></div>
+                <div><label className="mb-1 block text-[11px] text-muted">Max Fee (gwei)</label><input placeholder="auto" value={form.maxFee} onChange={(e) => setForm({...form, maxFee: e.target.value})} className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent" /></div>
+                <div><label className="mb-1 block text-[11px] text-muted">Priority Fee (gwei)</label><input placeholder="auto" value={form.priorityFee} onChange={(e) => setForm({...form, priorityFee: e.target.value})} className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent" /></div>
+              </div>
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                <div><label className="mb-1 block text-[11px] text-muted">Nonce</label><input placeholder="auto" value={form.nonce} onChange={(e) => setForm({...form, nonce: e.target.value})} className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent" /></div>
+                <div><label className="mb-1 block text-[11px] text-muted">Timestamp</label><input type="datetime-local" value={form.timestamp} onChange={(e) => setForm({...form, timestamp: e.target.value})} className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent" /></div>
+                <div><label className="mb-1 block text-[11px] text-muted">Delay (ms)</label><input placeholder="0" value={form.delayMs} onChange={(e) => setForm({...form, delayMs: e.target.value})} className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent" /></div>
+              </div>
             </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Max Fee (gwei)</label>
-              <input
-                placeholder="auto"
-                value={form.maxFee}
-                onChange={(e) => setForm({ ...form, maxFee: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Priority Fee (gwei)</label>
-              <input
-                placeholder="auto"
-                value={form.priorityFee}
-                onChange={(e) => setForm({ ...form, priorityFee: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Nonce</label>
-              <input
-                placeholder="auto"
-                value={form.nonce}
-                onChange={(e) => setForm({ ...form, nonce: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Timestamp</label>
-              <input
-                type="datetime-local"
-                value={form.timestamp}
-                onChange={(e) => setForm({ ...form, timestamp: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Delay (ms)</label>
-              <input
-                placeholder="0"
-                value={form.delayMs}
-                onChange={(e) => setForm({ ...form, delayMs: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              />
-            </div>
-          </div>
+          )}
 
-          {/* Quantity + mode toggles + submit */}
+{/* Quantity + mode toggles + submit */}
           <div className="flex flex-wrap items-end gap-3">
             <div className="w-24">
               <label className="mb-1 block text-[11px] text-muted">Qty</label>
@@ -1428,6 +1400,17 @@ export function MintingPage() {
               <button
                 type="submit"
                 disabled={!canSubmit}
+                title={
+                  !form.chainId
+                    ? "Select a chain first"
+                    : !form.contract.trim()
+                      ? "Contract target required (or fetch a SeaDrop/OpenSea plan)"
+                      : !/^0x[0-9a-fA-F]{40}$/.test(form.contract.trim())
+                        ? "Contract must be 0x + 40 hex"
+                        : selectedWalletIds.length === 0
+                          ? "Select at least one wallet"
+                          : "Enqueue mint task(s)"
+                }
                 className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
               >
                 Enqueue ({form.allowlist.trim() ? matchedAllowlist : selectedWalletIds.length})
