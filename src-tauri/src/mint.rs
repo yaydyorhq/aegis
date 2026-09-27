@@ -590,6 +590,58 @@ pub fn promote_task(id: i64) -> AppResult<MintTaskRow> {
     get_task(id)
 }
 
+/// Reset a failed task back to `pending` so it can be retried.
+/// Clears the error, tx hash, and poll/retry counters.
+pub fn retry_task(id: i64) -> AppResult<MintTaskRow> {
+    let now = crate::db::now_ms();
+    let n = crate::db::with_conn(|conn| {
+        Ok(conn.execute(
+            "UPDATE mint_tasks
+                SET status='pending', error=NULL, tx_hash=NULL,
+                    poll_attempts=0, auto_retries=0, updated_at=?1
+              WHERE id=?2 AND status IN ('failed','canceled','cancelled')",
+            rusqlite::params![now, id],
+        )?)
+    })?;
+    if n == 0 {
+        let t = get_task(id)?;
+        return Err(AppError::Invalid(format!(
+            "task {id} is '{}' — only failed/cancelled tasks can be retried",
+            t.status
+        )));
+    }
+    wallet_store::log_activity(
+        "mint.retry",
+        &format!("Retried task #{id} → pending"),
+        None,
+        true,
+    );
+    get_task(id)
+}
+
+/// Retry every failed/cancelled task in one call.
+pub fn retry_all_failed() -> AppResult<i64> {
+    let now = crate::db::now_ms();
+    let n = crate::db::with_conn(|conn| {
+        Ok(conn.execute(
+            "UPDATE mint_tasks
+                SET status='pending', error=NULL, tx_hash=NULL,
+                    poll_attempts=0, auto_retries=0, updated_at=?1
+              WHERE status IN ('failed','canceled','cancelled')",
+            rusqlite::params![now],
+        )?)
+    })?;
+    if n > 0 {
+        wallet_store::log_activity(
+            "mint.retry",
+            &format!("Retried {n} failed task(s) → pending"),
+            None,
+            true,
+        );
+    }
+    Ok(n as i64)
+}
+
 /// Promote every draft task in one call (bulk "queue all drafts").
 pub fn promote_all_drafts() -> AppResult<i64> {
     let now = crate::db::now_ms();

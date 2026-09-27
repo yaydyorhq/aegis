@@ -78,6 +78,7 @@ export function MintingPage() {
   const [encoding, setEncoding] = useState(false);
   const [encodeErr, setEncodeErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [statusFilter, setStatusFilter] = useState<"all" | "draft" | "pending" | "done" | "failed">("all");
   const seenTaskIds = useRef<Set<number>>(new Set());
   const seenStatuses = useRef<Map<number, string>>(new Map());
   const primedTasks = useRef(false);
@@ -606,7 +607,35 @@ export function MintingPage() {
     }
   }
 
-  async function onPromoteDrafts() {
+  async function onRetry(id: number) {
+    setErr(null);
+    try {
+      await ipc("mint_retry", { id });
+      pushToast("Task retried", "ok", `#${id} → pending`);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+      pushToast("Retry failed", "error", String(e).slice(0, 160));
+    }
+  }
+
+  async function onRetryAll() {
+    setRunning(true);
+    setErr(null);
+    try {
+      const n = await ipc<number>("mint_retry_all");
+      pushToast("All failed retried", "ok", `${n} task(s) → pending`);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  const hasFailed = tasks.some((t) => t.status === "failed" || t.status === "canceled" || t.status === "cancelled");
+
+    async function onPromoteDrafts() {
     setPromoting(true);
     setErr(null);
     try {
@@ -707,6 +736,28 @@ export function MintingPage() {
       setErr(String(e));
     }
   }
+
+  const statusCounts = useMemo(() => {
+    const c = { all: tasks.length, draft: 0, pending: 0, done: 0, failed: 0 };
+    for (const t of tasks) {
+      if (t.status === "draft") c.draft++;
+      else if (t.status === "confirmed" || t.status === "simulated") c.done++;
+      else if (t.status === "failed" || t.status === "canceled" || t.status === "cancelled") c.failed++;
+      else c.pending++;
+    }
+    return c;
+  }, [tasks]);
+
+  const filteredTasks = useMemo(
+    () => statusFilter === "all" ? tasks : tasks.filter((t) => {
+      if (statusFilter === "draft") return t.status === "draft";
+      if (statusFilter === "pending") return t.status === "pending" || t.status === "signing" || t.status === "broadcasting";
+      if (statusFilter === "done") return t.status === "confirmed" || t.status === "simulated";
+      if (statusFilter === "failed") return t.status === "failed" || t.status === "canceled" || t.status === "cancelled";
+      return true;
+    }),
+    [tasks, statusFilter],
+  );
 
   const hasPending = tasks.some((t) => t.status === "pending");
   const hasDrafts = tasks.some((t) => t.status === "draft");
@@ -1390,14 +1441,44 @@ export function MintingPage() {
 
       {err ? <div className="mb-3 text-[12px] text-danger">{err}</div> : null}
 
+      {/* Status filter + retry failed */}
+      <div className="mb-3 flex flex-wrap items-center gap-1.5">
+        {(["all", "draft", "pending", "done", "failed"] as const).map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => setStatusFilter(s)}
+            className={`rounded-full border px-2.5 py-1 text-[11px] transition ${
+              statusFilter === s
+                ? "border-accent bg-accent/10 text-accent"
+                : "border-line text-muted hover:text-fg"
+            }`}
+          >
+            {s === "all" ? "All" : s === "done" ? "Done" : s.charAt(0).toUpperCase() + s.slice(1)}
+            <span className="ml-1 opacity-60">{statusCounts[s]}</span>
+          </button>
+        ))}
+        <div className="flex-1" />
+        {hasFailed ? (
+          <button
+            type="button"
+            onClick={() => void onRetryAll()}
+            disabled={running}
+            className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-1.5 text-[12px] text-warn hover:bg-warn/20 disabled:opacity-40"
+          >
+            Retry all failed ({statusCounts.failed})
+          </button>
+        ) : null}
+      </div>
+
       <div className="overflow-x-auto rounded-[14px] border border-line bg-card">
-        <div className="grid min-w-[900px] grid-cols-[50px_1fr_100px_90px_90px_110px_180px_60px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_200px_60px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
           <div>ID</div>
           <div>Contract</div>
-          <div>Gas Fee</div>
+          <div>Gas</div>
           <div>Value</div>
+          <div>Schedule</div>
           <div>Mode</div>
-          <div>Chain</div>
           <div>Status</div>
           <div />
         </div>
@@ -1406,11 +1487,13 @@ export function MintingPage() {
             title="No mint tasks"
             description="Enqueue a task targeting any contract you control or a public mint."
           />
+        ) : filteredTasks.length === 0 ? (
+          <div className="px-4 py-6 text-center text-[13px] text-muted">No {statusFilter} tasks.</div>
         ) : (
-          tasks.map((t) => (
+          filteredTasks.map((t) => (
             <div
               key={t.id}
-              className="grid min-w-[900px] grid-cols-[50px_1fr_100px_90px_90px_110px_180px_60px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
+              className="grid min-w-[1060px] grid-cols-[46px_1fr_100px_80px_110px_90px_110px_200px_60px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
             >
               <div className="text-muted">#{t.id}</div>
               <div className="truncate font-mono text-[12px]" title={t.contract}>
@@ -1435,18 +1518,42 @@ export function MintingPage() {
               <div>
                 <ModeBadge mode={t.mode || "execute"} />
               </div>
-              <div className="text-muted">{t.chain_id}</div>
-              <div className="flex items-center gap-1.5 text-[12px] capitalize">
+              <div className="truncate text-[12px] text-muted" title={t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : ""}>
+                {t.scheduled_at ? (t.scheduled_at > Date.now() ? (
+                  <span className="text-warn">{
+                    t.scheduled_at - Date.now() < 60000
+                      ? `in ${Math.max(1, Math.ceil((t.scheduled_at - Date.now()) / 1000))}s`
+                      : t.scheduled_at - Date.now() < 3600000
+                        ? `in ${Math.ceil((t.scheduled_at - Date.now()) / 60000)}m`
+                        : `in ${Math.ceil((t.scheduled_at - Date.now()) / 3600000)}h`
+                  }</span>
+                ) : <span className="opacity-50">now</span> ) : ((t.delay_ms ?? 0) > 0 ? (
+                  <span className="opacity-50">+{t.delay_ms}ms</span>
+                ) : null)}
+              </div>
+              <div className="flex min-w-0 items-center gap-1.5 text-[12px] capitalize">
                 <StatusDot
                   ok={t.status === "confirmed" || t.status === "simulated"}
                 />
+                <span className="truncate">
                 {t.status === "confirmed" && t.tx_hash
                   ? `minted · ${shortAddress(t.tx_hash, 4)}`
                   : t.status}
+                </span>
                 {t.error && t.status !== "confirmed" ? (
                   <span className="ml-1 truncate text-[10px] text-danger/80" title={t.error}>
-                    ·
+                    ·{t.error.slice(0, 40)}{t.error.length > 40 ? "…" : ""}
                   </span>
+                ) : null}
+                {(t.status === "failed" || t.status === "canceled" || t.status === "cancelled") && !t.tx_hash ? (
+                  <button
+                    type="button"
+                    onClick={() => void onRetry(t.id)}
+                    className="ml-1 rounded border border-warn/40 px-1.5 py-0.5 text-[10px] text-warn hover:bg-warn/20"
+                    title="Retry this task"
+                  >
+                    retry
+                  </button>
                 ) : null}
                 {t.tx_hash ? (
                   <button

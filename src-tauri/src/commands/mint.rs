@@ -464,3 +464,15 @@ pub fn mint_promote(id: i64) -> AppResult<MintTaskRow> {
 pub fn mint_promote_all() -> AppResult<i64> {
     mint::promote_all_drafts()
 }
+
+/// Reset a failed/cancelled task back to pending so it runs again.
+#[tauri::command]
+pub fn mint_retry(id: i64) -> AppResult<MintTaskRow> {
+    mint::retry_task(id)
+}
+
+/// Retry ALL failed/cancelled tasks.
+#[tauri::command]
+pub fn mint_retry_all() -> AppResult<i64> {
+    mint::retry_all_failed()
+}

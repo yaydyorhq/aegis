@@ -98,6 +98,8 @@ pub fn run() {
             commands::mint::mint_run,
             commands::mint::mint_promote,
             commands::mint::mint_promote_all,
+            commands::mint::mint_retry,
+            commands::mint::mint_retry_all,
             commands::mint::mint_seadrop_plan,
             commands::mint::mint_opensea_plan,
             commands::mint::mint_opensea_enqueue,
