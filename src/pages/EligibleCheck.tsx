@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   BadgeCheck,
   CheckCircle2,
+  Clock,
   CheckSquare,
   LayoutGrid,
   Loader2,
@@ -113,11 +114,23 @@ export function EligibleCheckPage() {
     setSelected((s) => s.filter((id) => !ids.has(id)));
   }
 
-  /** Rows where at least one stage is eligible. */
+  /** Rows with at least one LIVE+eligible stage — only these can be queued. */
   const eligibleRows = useMemo(
     () =>
       (matrix?.rows ?? []).filter(
-        (r) => r.wallet_id != null && r.stages.some((s) => s.eligible),
+        (r) => r.wallet_id != null && r.stages.some((s) => s.actionable),
+      ),
+    [matrix],
+  );
+
+  /** Rows that are eligible but every stage is scheduled for later. */
+  const pendingRows = useMemo(
+    () =>
+      (matrix?.rows ?? []).filter(
+        (r) =>
+          r.wallet_id != null &&
+          r.stages.some((s) => s.eligible) &&
+          !r.stages.some((s) => s.actionable),
       ),
     [matrix],
   );
@@ -387,7 +400,8 @@ export function EligibleCheckPage() {
         <div className="mb-4 overflow-x-auto rounded-[14px] border border-line bg-card">
           <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
             <span className="text-[12px] font-semibold">
-              {matrix.slug} — {eligibleRows.length}/{matrix.rows.length} eligible
+              {matrix.slug} — {eligibleRows.length}/{matrix.rows.length} ready
+              {pendingRows.length > 0 ? ` · ${pendingRows.length} scheduled` : ""}
             </span>
             <div className="flex gap-1.5">
               <button
@@ -405,6 +419,18 @@ export function EligibleCheckPage() {
               </button>
             </div>
           </div>
+
+          {pendingRows.length > 0 ? (
+            <div className="flex items-center gap-2 border-b border-warn/30 bg-warn/5 px-4 py-2 text-[12px] text-warn">
+              <Clock className="h-3.5 w-3.5 shrink-0" />
+              <span>
+                {pendingRows.length} wallet(s) eligible but stage not live yet —
+                {" "}
+                {pendingRows[0]?.stages.find((s) => s.eligible && !s.actionable)?.schedule_hint ?? "check schedule"}
+                . Queue disabled until the stage opens.
+              </span>
+            </div>
+          ) : null}
 
           {/* Table header */}
           <div className="grid border-b border-line bg-line/30 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted"
@@ -457,10 +483,21 @@ export function EligibleCheckPage() {
                       </div>
                     );
                   }
+                  const title = !cell.eligible
+                    ? `${sc}: not eligible`
+                    : cell.actionable
+                      ? `${sc}: eligible — live now, ready to queue`
+                      : `${sc}: eligible but ${cell.schedule_hint}`;
                   return (
-                    <div key={sc} className="flex justify-center" title={cell.eligible ? "Eligible" : "Not eligible"}>
+                    <div key={sc} className="flex justify-center" title={title}>
                       {cell.eligible ? (
-                        <CheckCircle2 className="h-4.5 w-4.5 text-ok" />
+                        cell.actionable ? (
+                          <CheckCircle2 className="h-4.5 w-4.5 text-ok" />
+                        ) : (
+                          <span className="flex items-center gap-0.5 text-warn">
+                            <Clock className="h-4 w-4" />
+                          </span>
+                        )
                       ) : (
                         <XCircle className="h-4.5 w-4.5 text-danger/70" />
                       )}
@@ -544,10 +581,20 @@ export function EligibleCheckPage() {
                           <div
                             key={sc}
                             className="flex items-center gap-1 text-[11px]"
-                            title={`${stageLabel(sc)}: ${cell.eligible ? "Eligible" : "Not eligible"}${cell.max_quantity ? ` (max ${cell.max_quantity})` : ""}`}
+                            title={`${stageLabel(sc)}: ${
+                              !cell.eligible
+                                ? "Not eligible"
+                                : cell.actionable
+                                  ? "Eligible — live"
+                                  : `Eligible — ${cell.schedule_hint}`
+                            }${cell.max_quantity ? ` (max ${cell.max_quantity})` : ""}`}
                           >
                             {cell.eligible ? (
-                              <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
+                              cell.actionable ? (
+                                <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
+                              ) : (
+                                <Clock className="h-3.5 w-3.5 text-warn" />
+                              )
                             ) : (
                               <XCircle className="h-3.5 w-3.5 text-danger/60" />
                             )}

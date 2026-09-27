@@ -176,6 +176,13 @@ fn parse_url(s: &str) -> AppResult<Url> {
     Url::parse(s).map_err(|_| os_err("invalid url"))
 }
 
+/// Format a future unix-ms timestamp as "Opens Sep 28 12:00 UTC" for schedule hints.
+fn format_hint_future(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|d| format!("Opens {}", d.format("%b %d %H:%M UTC")))
+        .unwrap_or_else(|| "Scheduled".into())
+}
+
 fn deserialize_stage_index<'de, D>(d: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -767,6 +774,36 @@ impl OpenSeaClient {
         self.authenticate(wallet_id, wallet, network, &resolved.slug)
             .await?;
         let stages = self.fetch_stages(&resolved.slug, wallet).await?;
+
+        // Schedule guard: never ask OpenSea for calldata while no eligible
+        // stage is actually open. DropNotMintingError comes from that exact
+        // case, so detect it here and return an actionable message instead.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let eligible_stages: Vec<&StageAssessment> =
+            stages.iter().filter(|s| s.is_eligible.unwrap_or(false)).collect();
+        let live_stage = eligible_stages
+            .iter()
+            .find(|s| s.starts_at_ms.map(|t| t <= now_ms).unwrap_or(true));
+        if live_stage.is_none() {
+            // Everything eligible is scheduled for later (or unknown).
+            let next = eligible_stages
+                .iter()
+                .filter_map(|s| s.starts_at_ms)
+                .min();
+            let hint = match next {
+                Some(ts) => {
+                    chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|d| format!("drop not live yet — opens {}", d.format("%Y-%m-%d %H:%M UTC")))
+                        .unwrap_or_else(|| "drop not live yet".into())
+                }
+                None => "drop not live yet (no schedule reported)".into(),
+            };
+            return Err(os_err(hint));
+        }
+
         let stage = pick_eligible_stage(&stages)
             .ok_or_else(|| os_err("no eligible OpenSea stage for this wallet"))?
             .clone();
@@ -1198,6 +1235,12 @@ pub struct WalletStageResult {
     pub eligible: bool,
     pub max_quantity: Option<u64>,
     pub price_usd: Option<f64>,
+    /// Stage open time (unix ms). None = unknown / not reported.
+    pub starts_at_ms: Option<i64>,
+    /// Computed from starts_at_ms vs current time: "live", "not_started", or "unknown".
+    pub live_status: String,
+    /// Human-readable schedule hint: "Opens Sep 28 12:00 UTC" / "Live now" / "—".
+    pub schedule_hint: String,
 }
 
 /// Check one wallet against all stages of a collection.
@@ -1234,15 +1277,32 @@ pub async fn check_wallet_stages(
         .authenticate(wallet_id, &wallet, network, &resolved.slug)
         .await?;
     let stages = client.fetch_stages(&resolved.slug, &wallet).await?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     let results: Vec<WalletStageResult> = stages
         .into_iter()
-        .map(|s| WalletStageResult {
-            stage_type: s.stage_type,
-            eligible: s.is_eligible.unwrap_or(false),
-            max_quantity: s
-                .eligible_max_total_mintable_by_wallet
-                .or(s.max_total_mintable_by_wallet),
-            price_usd: s.price_usd,
+        .map(|s| {
+            let starts_at = s.starts_at_ms;
+            let (live_status, schedule_hint) = match starts_at {
+                Some(ts) if ts > now_ms => {
+                    ("not_started".to_string(), format_hint_future(ts))
+                }
+                Some(_) => ("live".to_string(), "Live now".to_string()),
+                None => ("unknown".to_string(), "—".to_string()),
+            };
+            WalletStageResult {
+                stage_type: s.stage_type,
+                eligible: s.is_eligible.unwrap_or(false),
+                max_quantity: s
+                    .eligible_max_total_mintable_by_wallet
+                    .or(s.max_total_mintable_by_wallet),
+                price_usd: s.price_usd,
+                starts_at_ms: starts_at,
+                live_status,
+                schedule_hint,
+            }
         })
         .collect();
     Ok(Some((resolved.slug, results)))

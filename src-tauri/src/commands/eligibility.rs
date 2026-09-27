@@ -178,6 +178,15 @@ pub struct StageMatrixCell {
     pub eligible: bool,
     pub max_quantity: Option<u64>,
     pub price_usd: Option<f64>,
+    /// Stage open time (unix ms) when OpenSea reports it.
+    pub starts_at_ms: Option<i64>,
+    /// "live" | "not_started" | "unknown" — derived from starts_at_ms.
+    pub live_status: String,
+    /// Human hint: "Live now" / "Opens Sep 28 12:00 UTC" / "—".
+    pub schedule_hint: String,
+    /// True only when eligible AND live (or schedule unknown but eligible).
+    /// The enqueue guard refuses anything that is not actionable.
+    pub actionable: bool,
 }
 
 #[derive(Serialize)]
@@ -254,11 +263,20 @@ pub async fn eligibility_matrix_run(
                     slug = os_slug;
                     let cells: Vec<StageMatrixCell> = results
                         .iter()
-                        .map(|r| StageMatrixCell {
-                            stage_name: r.stage_type.clone(),
-                            eligible: r.eligible,
-                            max_quantity: r.max_quantity,
-                            price_usd: r.price_usd,
+                        .map(|r| {
+                            // Actionable = eligible AND stage is open (live) or the
+                            // schedule is unknown (can't prove it's closed → allow).
+                            let actionable = r.eligible && r.live_status != "not_started";
+                            StageMatrixCell {
+                                stage_name: r.stage_type.clone(),
+                                eligible: r.eligible,
+                                max_quantity: r.max_quantity,
+                                price_usd: r.price_usd,
+                                starts_at_ms: r.starts_at_ms,
+                                live_status: r.live_status.clone(),
+                                schedule_hint: r.schedule_hint.clone(),
+                                actionable,
+                            }
                         })
                         .collect();
                     for c in &cells {
@@ -294,6 +312,10 @@ pub async fn eligibility_matrix_run(
                         eligible,
                         max_quantity: None,
                         price_usd: None,
+                        starts_at_ms: None,
+                        live_status: "unknown".into(),
+                        schedule_hint: "—".into(),
+                        actionable: eligible,
                     };
                     if !stage_names.contains(&cell.stage_name) {
                         stage_names.push(cell.stage_name.clone());
