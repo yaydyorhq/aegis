@@ -63,6 +63,9 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         "auto_retries",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // Fire-time OpenSea mint data: JSON {collection, token_id} — the task
+    // resolves SIWE + stage + MintAction when it fires instead of at enqueue.
+    ensure_column(conn, "mint_tasks", "opensea_ref", "TEXT")?;
     Ok(())
 }
 

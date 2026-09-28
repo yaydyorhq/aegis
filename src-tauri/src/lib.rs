@@ -26,8 +26,11 @@ pub fn run() {
             mint::recover_stale_tasks();
             fund::recover_stale();
             // Auto-run scheduler: fire due scheduled tasks without a manual "Run queue".
+            // 60ms keeps worst-case fire lateness under ~60ms; a scheduled phase
+            // opener loses FCFS races to coarser ticks (was 250ms). count_runnable
+            // is a single indexed COUNT, so the extra wakeups are negligible.
             tauri::async_runtime::spawn(async {
-                let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(60));
                 loop {
                     tick.tick().await;
                     match mint::count_runnable() {

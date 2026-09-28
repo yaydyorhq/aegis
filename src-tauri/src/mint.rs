@@ -40,6 +40,8 @@ pub struct MintTaskRow {
     pub mode: String,
     pub poll_attempts: i64,
     pub auto_retries: i64,
+    /// JSON `{collection, token_id}`: resolve SeaDrop mint data at fire time.
+    pub opensea_ref: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -62,6 +64,8 @@ pub struct EnqueueArgs {
     pub scheduled_at: Option<i64>,
     pub delay_ms: Option<i64>,
     pub mode: Option<String>,
+    /// Deferred OpenSea mint: JSON `{collection, token_id}` resolved at fire time.
+    pub opensea_ref: Option<String>,
 }
 
 static MINT_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -131,7 +135,7 @@ pub fn count_runnable() -> AppResult<i64> {
     })
 }
 
-const SELECT_COLS: &str = "id, chain_id, contract, quantity, value_wei, calldata, status, tx_hash, error, wallet_id, created_at, updated_at, function_name, is_hex, parameters, rpc_endpoints, flashbots, gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override, scheduled_at, delay_ms, mode, poll_attempts, auto_retries";
+const SELECT_COLS: &str = "id, chain_id, contract, quantity, value_wei, calldata, status, tx_hash, error, wallet_id, created_at, updated_at, function_name, is_hex, parameters, rpc_endpoints, flashbots, gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override, scheduled_at, delay_ms, mode, poll_attempts, auto_retries, opensea_ref";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
     Ok(MintTaskRow {
@@ -161,6 +165,7 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
         mode: r.get(23)?,
         poll_attempts: r.get(24)?,
         auto_retries: r.get(25)?,
+        opensea_ref: r.get(26)?,
     })
 }
 
@@ -616,9 +621,9 @@ fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
                 chain_id, contract, quantity, value_wei, calldata, status, wallet_id, created_at, updated_at,
                 function_name, is_hex, parameters, rpc_endpoints, flashbots,
                 gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override,
-                scheduled_at, delay_ms, mode
+                scheduled_at, delay_ms, mode, opensea_ref
              )
-             VALUES (?1,?2,?3,?4,?5,?20,?6,?7,?7, ?8,?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19)",
+             VALUES (?1,?2,?3,?4,?5,?20,?6,?7,?7, ?8,?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19,?21)",
             rusqlite::params![
                 a.chain_id,
                 c,
@@ -640,6 +645,7 @@ fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
                 delay,
                 mode,
                 status,
+                a.opensea_ref,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1091,6 +1097,15 @@ fn build_calldata_inner(
 
 /// Build calldata from function signature + semicolon params.
 /// `{address}` is replaced with the wallet address.
+/// Auto-fee uplift over the observed gas price, in percent.
+/// A phase-opening launch is a race: OSNM-Z rides 1.25x for an immediate mint
+/// and 2.5x when the broadcast waits for a scheduled phase, so the tx is not
+/// starved by the burst of competing transactions at T-0. Manual fee fields
+/// always bypass this.
+pub fn auto_fee_multiplier_pct(scheduled: bool) -> u128 {
+    if scheduled { 250 } else { 125 }
+}
+
 pub fn build_calldata_from_fn(
     function_name: &str,
     parameters: Option<&str>,
@@ -1167,6 +1182,115 @@ fn parse_rpc_list(task: &MintTaskRow, chain_default: &str) -> Vec<String> {
         out.push(FLASHBOTS_RPC.to_string());
     }
     out
+}
+
+/// Fire-time attempts for a task's OpenSea mint data, and the pause between them.
+/// A scheduled task fires up to 60s before the stage opens (`start - lead`), so
+/// the poll must outlive that lead: fast for the first few attempts, then slow
+/// until the stage is live (≈100s total budget).
+const OPENSEA_CALLDATA_ATTEMPTS: u32 = 40;
+const OPENSEA_CALLDATA_FAST_ATTEMPT: u32 = 8;
+const OPENSEA_CALLDATA_FAST_MS: u64 = 500;
+const OPENSEA_CALLDATA_SLOW_MS: u64 = 3_000;
+
+/// Retry only "stage not open yet" and transport-class failures. Eligibility
+/// and collection errors are terminal however often we ask — retrying them
+/// would just burn the launch window.
+fn opensea_mint_data_retryable(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const PATTERN: [&str; 14] = [
+        "not live yet",
+        "not minting",
+        "dropnotminting",
+        "transport",
+        "timeout",
+        "timed out",
+        "connection",
+        "429",
+        "rate limit",
+        "too many requests",
+        "500",
+        "502",
+        "503",
+        "504",
+    ];
+    PATTERN.iter().any(|p| m.contains(p))
+}
+
+/// `opensea_ref` payload stored on a deferred task.
+#[derive(serde::Deserialize)]
+struct OpenseaRef {
+    collection: String,
+    #[serde(default = "default_token_id")]
+    token_id: String,
+}
+
+fn default_token_id() -> String {
+    "0".into()
+}
+
+/// Resolve SIWE → eligible stage → MintAction for a task that deferred its
+/// calldata. Retries while the stage is still closed or the API is flaky.
+async fn fetch_opensea_mint_data(
+    chain_id: i64,
+    wallet_id: i64,
+    address: &str,
+    quantity: i64,
+    r: &str,
+) -> AppResult<crate::opensea::OpenSeaMintPlan> {
+    let parsed: OpenseaRef = serde_json::from_str(r)
+        .map_err(|_| AppError::Invalid("task opensea_ref is not valid JSON".into()))?;
+    if parsed.collection.len() != 42 || !parsed.collection.starts_with("0x") {
+        return Err(AppError::Invalid(
+            "opensea_ref.collection must be 0x + 40 hex".into(),
+        ));
+    }
+    let addr: alloy::primitives::Address = address
+        .parse()
+        .map_err(|_| AppError::Invalid("bad wallet address".into()))?;
+    let network = u64::try_from(chain_id).unwrap_or(0);
+    let qty = u64::try_from(quantity).unwrap_or(1).max(1);
+
+    let client = crate::opensea::OpenSeaClient::new()?;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let plan = match client
+            .resolve_collection(&parsed.collection, Some(network))
+            .await
+        {
+            Ok(Some(resolved)) => {
+                client
+                    .plan_wallet_mint(wallet_id, &addr, &resolved, network, qty, &parsed.token_id)
+                    .await
+            }
+            Ok(None) => Err(AppError::NotFound("collection not on OpenSea".into())),
+            Err(e) => Err(e),
+        };
+        match plan {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                let msg = e.to_string();
+                if attempt >= OPENSEA_CALLDATA_ATTEMPTS || !opensea_mint_data_retryable(&msg) {
+                    return Err(e);
+                }
+                wallet_store::log_activity(
+                    "mint.opensea",
+                    &format!(
+                        "Mint data attempt {attempt}/{OPENSEA_CALLDATA_ATTEMPTS} not ready: {msg}"
+                    ),
+                    None,
+                    true,
+                );
+                let delay_ms = if attempt <= OPENSEA_CALLDATA_FAST_ATTEMPT {
+                    OPENSEA_CALLDATA_FAST_MS
+                } else {
+                    OPENSEA_CALLDATA_SLOW_MS
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
 }
 
 /// Process one pending/broadcasting task: sign + broadcast or re-poll receipt.
@@ -1274,14 +1398,45 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         None => return fail(format!("chain {} not found", task.chain_id)),
     };
 
-    let calldata = match resolve_calldata(&task, &wallet.address) {
-        Ok(c) => c,
-        Err(e) => return fail(format!("calldata: {e}")),
+    // A task carrying `opensea_ref` resolves its mint data here, when it fires:
+    // signed/allowlist calldata only exists once the stage opens, so it cannot
+    // be built at enqueue time (OSNM-Z fetches it at T-2s, retried while the
+    // stage is still PREOPEN). Everything else keeps its baked-in calldata.
+    let opensea_plan = match task.opensea_ref.as_deref() {
+        None => None,
+        Some(r) => {
+            match fetch_opensea_mint_data(
+                task.chain_id,
+                wallet_id,
+                &wallet.address,
+                task.quantity,
+                r,
+            )
+            .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => return fail(format!("opensea mint data: {e}")),
+            }
+        }
     };
-    let value_wei = task.value_wei.clone().unwrap_or_else(|| "0x0".into());
-    let value_u = match parse_u128_hex_or_dec(&value_wei) {
-        Ok(v) => v,
-        Err(e) => return fail(format!("{e}")),
+
+    let (tx_target, calldata, value_u) = if let Some(p) = &opensea_plan {
+        let v = match parse_u128_hex_or_dec(&p.value_wei) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("{e}")),
+        };
+        (p.to.clone(), p.calldata.clone(), v)
+    } else {
+        let cd = match resolve_calldata(&task, &wallet.address) {
+            Ok(c) => c,
+            Err(e) => return fail(format!("calldata: {e}")),
+        };
+        let value_wei = task.value_wei.clone().unwrap_or_else(|| "0x0".into());
+        let v = match parse_u128_hex_or_dec(&value_wei) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("{e}")),
+        };
+        (task.contract.clone(), cd, v)
     };
 
     let endpoints_raw = parse_rpc_list(&task, &chain_row.rpc_url);
@@ -1290,7 +1445,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
 
     let tx = serde_json::json!({
         "from": wallet.address,
-        "to": task.contract,
+        "to": tx_target,
         "data": calldata,
         "value": format!("0x{:x}", value_u),
     });
@@ -1347,7 +1502,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                     // whether the selector even exists on the target first.
                     if msg.contains("without a readable reason") {
                         if let Some(hint) =
-                            diagnose_empty_revert(&endpoints, &task.contract, &calldata).await
+                            diagnose_empty_revert(&endpoints, &tx_target, &calldata).await
                         {
                             msg.push_str(&format!(" — {hint}"));
                         }
@@ -1372,27 +1527,48 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         ));
     }
 
-    // Verify the primary endpoint's chain_id concurrently with the nonce fetch —
-    // a mismatched RPC would otherwise sign a valid tx for the wrong network.
-    // When nonce fetch fails with a transient error, try the next endpoint.
+    // One round instead of three: chain-id verification, the nonce fetch and the
+    // fee snapshot run concurrently on each endpoint, so a scheduled launch does
+    // not burn serial RTTs at T-0 (OSNM-Z prefetches the same reads before the
+    // phase opens). A mismatched RPC would otherwise sign a valid tx for the
+    // wrong network; a failed nonce falls through to the next endpoint.
+    let need_gas_price = task.max_fee_gwei.is_none() || task.priority_fee_gwei.is_none();
     let mut last_err: Option<String> = None;
     let mut nonce: Option<u64> = None;
+    let mut gas_price_prefetch: Option<u128> = None;
     for url in &endpoints {
         let rpc = url.clone();
         let addr = wallet.address.clone();
-        let cid = chain::eth_chain_id(url).await;
+        let override_nonce = task.nonce_override.clone();
+        let (cid, res, gp) = tokio::join!(
+            chain::eth_chain_id(url),
+            async move {
+                match override_nonce.as_deref() {
+                    Some(n) => n
+                        .parse::<u64>()
+                        .map_err(|_| AppError::Invalid(format!("bad nonce override: {n}"))),
+                    None => chain::get_transaction_count(&rpc, &addr).await,
+                }
+            },
+            async {
+                if need_gas_price {
+                    chain::gas_price(url).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+        );
         if let Ok(cid) = cid {
             if cid != task.chain_id {
                 last_err = Some(format!("{url} is chain {cid}, expected {}", task.chain_id));
                 continue;
             }
         }
-        let res = match &task.nonce_override {
-            Some(n) => n
-                .parse::<u64>()
-                .map_err(|_| AppError::Invalid(format!("bad nonce override: {n}"))),
-            None => chain::get_transaction_count(&rpc, &addr).await,
-        };
+        if gas_price_prefetch.is_none() {
+            if let Ok(Some(p)) = gp {
+                gas_price_prefetch = Some(p);
+            }
+        }
         match res {
             Ok(n) => {
                 nonce = Some(n);
@@ -1438,7 +1614,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                     let mut msg = format!("{url}: {}", decode_rpc_error(&e));
                     if msg.contains("without a readable reason") {
                         if let Some(hint) =
-                            diagnose_empty_revert(&endpoints, &task.contract, &calldata).await
+                            diagnose_empty_revert(&endpoints, &tx_target, &calldata).await
                         {
                             msg.push_str(&format!(" — {hint}"));
                         }
@@ -1474,16 +1650,26 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         }
     };
 
+    let auto_mult = auto_fee_multiplier_pct(task.scheduled_at.is_some() && task.mode == "execute");
+    // Snapshot taken in the same round as the nonce; re-query only if it failed.
+    let observed_gas_price: u128 = if need_gas_price {
+        match gas_price_prefetch {
+            Some(p) => p,
+            None => match chain::gas_price(&primary).await {
+                Ok(p) => p,
+                Err(e) => return fail(format!("gasPrice: {e}")),
+            },
+        }
+    } else {
+        0 // unreachable: both fee fields are manual
+    };
     let (max_fee, tip) = if task.max_fee_gwei.is_some() || task.priority_fee_gwei.is_some() {
         let max_fee = match &task.max_fee_gwei {
             Some(s) => match s.parse::<f64>() {
                 Ok(g) => (g * 1e9) as u128,
                 Err(_) => return fail(format!("bad max_fee_gwei: {s}")),
             },
-            None => match chain::gas_price(&primary).await {
-                Ok(p) => p.saturating_mul(110) / 100,
-                Err(e) => return fail(format!("gasPrice: {e}")),
-            },
+            None => observed_gas_price.saturating_mul(auto_mult) / 100,
         };
         let tip = match &task.priority_fee_gwei {
             Some(s) => match s.parse::<f64>() {
@@ -1501,10 +1687,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         };
         (max_fee, tip.min(max_fee))
     } else {
-        let gas_price = match chain::gas_price(&primary).await {
-            Ok(p) => p.saturating_mul(110) / 100,
-            Err(e) => return fail(format!("gasPrice: {e}")),
-        };
+        let gas_price = observed_gas_price.saturating_mul(auto_mult) / 100;
         let t = gas_price / 10;
         let tip = if t == 0 {
             gas_price.min(1)
@@ -1529,7 +1712,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     let signed = match sign_eip1559(
         &signer,
         SignParams {
-            to: &task.contract,
+            to: &tx_target,
             data_hex: &calldata,
             value: value_u,
             gas_limit: gas,
@@ -1952,6 +2135,18 @@ mod tests {
     }
 
     #[test]
+    fn auto_fee_multiplier_matches_seadrop_launch_policy() {
+        assert_eq!(auto_fee_multiplier_pct(false), 125);
+        assert_eq!(auto_fee_multiplier_pct(true), 250);
+        let observed = 1_000_000_000u128;
+        assert_eq!(
+            observed * auto_fee_multiplier_pct(true) / 100,
+            2_500_000_000,
+            "scheduled launch must ride 2.5x the observed gas price"
+        );
+    }
+
+    #[test]
     fn count_runnable_filters_future_schedules() {
         let _serial = serial_guard();
         fresh_db("runnable");
@@ -1986,6 +2181,61 @@ mod tests {
         .unwrap();
         assert_eq!(count_runnable().unwrap(), 1);
         assert!(!is_running());
+    }
+
+    #[test]
+    fn scheduled_opensea_task_stores_fire_time_ref() {
+        let _serial = serial_guard();
+        fresh_db("opensearef");
+        ensure_unlocked();
+        let w = crate::wallet_store::create_wallet("opensearef-w", None).unwrap();
+        let chains = crate::chain::list_chains().unwrap();
+        let base = chains.iter().find(|c| c.chain_id == 8453).unwrap().clone();
+        let future = crate::db::now_ms() + 60_000;
+        let task = enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: base.chain_id,
+            contract: "0x0000000000000000000000000000000000000001".into(),
+            quantity: 2,
+            scheduled_at: Some(future),
+            mode: Some("execute".into()),
+            opensea_ref: Some(
+                r#"{"collection":"0x0000000000000000000000000000000000000001","token_id":"0"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        })
+        .unwrap();
+        let roundtrip = get_task(task.id).unwrap();
+        let r = roundtrip
+            .opensea_ref
+            .as_deref()
+            .expect("fire-time ref must survive the roundtrip");
+        let parsed: OpenseaRef = serde_json::from_str(r).unwrap();
+        assert_eq!(
+            parsed.collection,
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert_eq!(parsed.token_id, "0");
+        // Scheduled tasks stay "pending" — the runner gates on scheduled_at.
+        assert_eq!(roundtrip.status, "pending");
+        assert_eq!(roundtrip.scheduled_at, Some(future));
+        assert_eq!(roundtrip.quantity, 2);
+    }
+
+    #[test]
+    fn opensea_mint_data_retry_classification() {
+        assert!(opensea_mint_data_retryable("mint public is not live yet"));
+        assert!(opensea_mint_data_retryable("dropNotMinting(0x1234)"));
+        assert!(opensea_mint_data_retryable(
+            "transport error: 429 Too Many Requests"
+        ));
+        assert!(opensea_mint_data_retryable("http 503 service unavailable"));
+        assert!(!opensea_mint_data_retryable(
+            "no eligible OpenSea stage for this wallet"
+        ));
+        assert!(!opensea_mint_data_retryable("collection not on OpenSea"));
+        assert!(!opensea_mint_data_retryable("session wallet mismatch"));
     }
 
     #[test]
@@ -2321,6 +2571,7 @@ mod tests {
             scheduled_at: None,
             delay_ms: Some(0),
             mode: Some("simulate".into()),
+            opensea_ref: None,
         })
         .expect("enqueue live simulate");
 

@@ -10,6 +10,10 @@ pub const OPENSEA_FEE_RECIPIENT: &str = "0x0000a26b00c1F0DF003000390027140000fAa
 // getPublicDrop(address) / getAllowedFeeRecipients(address)
 const SEL_GET_PUBLIC_DROP: &str = "0xbc6a629c";
 const SEL_GET_ALLOWED_FEE: &str = "0x68632274";
+// totalSupply() / maxSupply() — must be read on the proxy: implementation
+// storage is empty, so a minimal-proxy clone reports 0 there.
+const SEL_TOTAL_SUPPLY: &str = "0x18160ddd";
+const SEL_MAX_SUPPLY: &str = "0xd5abeb01";
 
 #[derive(Serialize, Clone)]
 pub struct PublicDrop {
@@ -36,6 +40,12 @@ pub struct SeaDropPlan {
     pub quantity: i64,
     pub drop: PublicDrop,
     pub live: bool,
+    /// Minted count read from the proxy, when readable.
+    pub total_supply: Option<u64>,
+    /// Collection cap when one is enforced; `None` when unset (unlimited).
+    pub max_supply: Option<u64>,
+    /// `max_supply - total_supply` when both are known.
+    pub remaining: Option<u64>,
 }
 
 fn word_addr(addr: &str) -> AppResult<String> {
@@ -83,6 +93,25 @@ async fn eth_call(rpc: &str, to: &str, data: &str) -> AppResult<String> {
         .and_then(|r| r.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::Rpc("eth_call missing result".into()))
+}
+
+/// Read a uint64-returning view on `to`. `None` on any decode/transport error
+/// so supply discovery never blocks a plan the caller can still use.
+async fn read_u64(rpc: &str, to: &str, selector: &str) -> Option<u64> {
+    let ret = eth_call(rpc, to, selector).await.ok()?;
+    let w = decode_words(&ret).ok()?;
+    u64::try_from(w.first().copied()?).ok()
+}
+
+/// Remaining supply when the collection enforces a cap. An unset cap decodes to
+/// `max == 0`, which means unlimited — report `None`, never "zero left".
+/// Exhausted clamps to `Some(0)` (not `None`) so the caller's fast-fail fires.
+pub fn remaining_supply(total: Option<u64>, max: Option<u64>) -> Option<u64> {
+    let m = max?;
+    if m == 0 {
+        return None;
+    }
+    Some(m.saturating_sub(total.unwrap_or(0)))
 }
 
 /// Read the public drop config for `nft_contract` from the SeaDrop singleton.
@@ -203,6 +232,19 @@ pub async fn build_public_mint_plan(
         .unwrap_or(0);
     let live = now >= drop.start_time && now < drop.end_time;
 
+    // Preflight: minted/cap live in the proxy's storage, never the impl's.
+    let total_supply = read_u64(rpc, nft, SEL_TOTAL_SUPPLY).await;
+    let max_supply = read_u64(rpc, nft, SEL_MAX_SUPPLY).await.filter(|m| *m > 0);
+    let remaining = remaining_supply(total_supply, max_supply);
+    if let Some(left) = remaining {
+        if (left as i64) < quantity {
+            return Err(AppError::Invalid(format!(
+                "supply exhausted: {left} left of {} minted — quantity {quantity} would revert",
+                total_supply.unwrap_or(0)
+            )));
+        }
+    }
+
     let calldata = encode_mint_public(nft, &fee_recipient, quantity)?;
     Ok(SeaDropPlan {
         to: SEADROP_ADDRESS.to_string(),
@@ -215,6 +257,9 @@ pub async fn build_public_mint_plan(
         quantity,
         drop,
         live,
+        total_supply,
+        max_supply,
+        remaining,
     })
 }
 
@@ -258,6 +303,17 @@ mod tests {
     fn format_eth_small() {
         let v = alloy::primitives::U256::from(5_000_000_000_000_000u64);
         assert_eq!(format_eth(v), "0.005");
+    }
+
+    #[test]
+    fn remaining_supply_respects_unset_and_exhausted_caps() {
+        assert_eq!(remaining_supply(Some(10), Some(3333)), Some(3323));
+        // max == 0 decodes from an unset cap: unlimited, not "zero left".
+        assert_eq!(remaining_supply(Some(10), Some(0)), None);
+        assert_eq!(remaining_supply(Some(10), None), None);
+        assert_eq!(remaining_supply(None, Some(100)), Some(100));
+        // Exhausted stays non-negative so the fast-fail fires instead of wrapping.
+        assert_eq!(remaining_supply(Some(100), Some(50)), Some(0));
     }
 
     #[test]

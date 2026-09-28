@@ -130,6 +130,12 @@ export interface SeaDropPlan {
   quantity: number;
   drop: PublicDrop;
   live: boolean;
+  /** Minted count read from the proxy (null when unreadable). */
+  total_supply?: number | null;
+  /** Collection cap (null when unset / unlimited). */
+  max_supply?: number | null;
+  /** max_supply - total_supply when both are known. */
+  remaining?: number | null;
 }
 
 export interface OpenSeaMintPlan {

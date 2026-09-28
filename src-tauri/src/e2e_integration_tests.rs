@@ -617,6 +617,7 @@ mod e2e_integration {
             scheduled_at: None,
             delay_ms: None,
             mode: Some("simulate".into()),
+            opensea_ref: None,
         })
         .unwrap();
         assert_eq!(t.status, "pending");
@@ -879,6 +880,7 @@ mod e2e_integration {
             gas_limit: None, max_fee_gwei: None, priority_fee_gwei: None,
             nonce_override: None, scheduled_at: None, delay_ms: None,
             mode: Some("simulate".into()),
+            opensea_ref: None,
         }).unwrap();
 
         assert_eq!(task.status, "pending");
@@ -915,6 +917,7 @@ mod e2e_integration {
             gas_limit: None, max_fee_gwei: None, priority_fee_gwei: None,
             nonce_override: None, scheduled_at: None, delay_ms: None,
             mode: Some("simulate".into()),
+            opensea_ref: None,
         }).unwrap();
 
         assert_eq!(task.status, "pending");
@@ -952,6 +955,7 @@ mod e2e_integration {
             gas_limit: None, max_fee_gwei: None, priority_fee_gwei: None,
             nonce_override: None, scheduled_at: None, delay_ms: None,
             mode: Some("simulate".into()),
+            opensea_ref: None,
         }).unwrap();
 
         // Debug: verify what calldata will be sent

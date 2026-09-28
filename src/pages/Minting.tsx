@@ -36,6 +36,25 @@ const FUNCTION_PRESETS = [
   "custom",
 ] as const;
 
+/** Unix seconds → compact local stamp for the drop window readout. */
+function fmtTsLocal(sec: number): string {
+  return new Date(sec * 1000).toLocaleString(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+/** Value for <input type="datetime-local">; the browser parses it as local time. */
+function toDatetimeLocal(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 const emptyForm = {
   chainId: "",
   contract: "",
@@ -82,6 +101,8 @@ export function MintingPage() {
   const [seaDrop, setSeaDrop] = useState<SeaDropPlan | null>(null);
   const [fetchingDrop, setFetchingDrop] = useState(false);
   const [dropErr, setDropErr] = useState<string | null>(null);
+  /** Broadcast lead: fire the tx this many ms before the phase opens. */
+  const [bcLead, setBcLead] = useState("3000");
   const [allowlistMatch, setAllowlistMatch] = useState<AllowlistMatchRow[] | null>(null);
   const [allowlistErr, setAllowlistErr] = useState<string | null>(null);
   const [openSeaPlan, setOpenSeaPlan] = useState<OpenSeaMintPlan | null>(null);
@@ -555,6 +576,25 @@ export function MintingPage() {
     }
   }
 
+  /**
+   * Schedule the broadcast `bcLead` ms before the phase opens so the tx waits
+   * in the mempool and lands at/after T-0 (OSNM-Z PUBLIC_MINT_BROADCAST_OFFSET_MS).
+   * Mining it early reverts with SeaDrop's NotActive, so the lead is clamped to 60s.
+   */
+  function applyDropSchedule() {
+    if (!seaDrop) return;
+    const lead = Math.min(60_000, Math.max(0, Math.floor(Number(bcLead) || 0)));
+    setForm((f) => ({
+      ...f,
+      timestamp: toDatetimeLocal(seaDrop.drop.start_time * 1000 - lead),
+    }));
+    pushToast(
+      "Schedule set",
+      "ok",
+      `broadcast ${lead}ms before start (${fmtTsLocal(seaDrop.drop.start_time)})`,
+    );
+  }
+
   async function onFetchDrop() {
     setDropErr(null);
     if (!form.chainId) {
@@ -713,12 +753,16 @@ export function MintingPage() {
         pushToast("OpenSea mint failed", "error", `${skipped} skipped`);
         return;
       }
+      // A future schedule defers the SIWE/stage call: mint data only exists
+      // once the stage opens, so the runner resolves it when the task fires.
+      const deferred = scheduledAt !== null && scheduledAt > Date.now();
       pushToast(
-        "OpenSea mint queued",
+        deferred ? "OpenSea mint scheduled" : "OpenSea mint queued",
         "ok",
-        skipped > 0
+        (skipped > 0
           ? `${queued} queued · ${skipped} skipped · qty ${qty}`
-          : `${queued} wallet(s) · qty ${qty}`,
+          : `${queued} wallet(s) · qty ${qty}`) +
+          (deferred ? " · calldata at fire time" : ""),
       );
       if (skipped > 0) {
         setOpenSeaErr(
@@ -1172,9 +1216,18 @@ export function MintingPage() {
                 <span>
                   window=
                   <span className="text-fg">
-                    {seaDrop.drop.start_time} → {seaDrop.drop.end_time}
+                    {fmtTsLocal(seaDrop.drop.start_time)} → {fmtTsLocal(seaDrop.drop.end_time)}
                   </span>
                 </span>
+                {seaDrop.remaining != null ? (
+                  <span>
+                    left=<span className="text-fg">{seaDrop.remaining}</span>
+                    <span className="opacity-60">
+                      {" "}
+                      ({seaDrop.total_supply}/{seaDrop.max_supply} minted)
+                    </span>
+                  </span>
+                ) : null}
                 <span>
                   fee=
                   <span className="text-fg">{shortAddress(seaDrop.fee_recipient, 4)}</span>
@@ -1182,6 +1235,22 @@ export function MintingPage() {
                 </span>
                 <span className={seaDrop.live ? "text-ok" : "text-warn"}>
                   {seaDrop.live ? "live" : "not live"}
+                </span>
+                <span className="flex items-center gap-1 text-muted">
+                  lead(ms)
+                  <input
+                    value={bcLead}
+                    onChange={(e) => setBcLead(e.target.value)}
+                    className="w-16 rounded border border-line bg-bg px-1 py-0.5 text-[11px] text-fg outline-none focus:border-accent"
+                  />
+                  <button
+                    type="button"
+                    onClick={applyDropSchedule}
+                    className="rounded border border-line bg-bg px-2 py-0.5 text-[11px] text-fg hover:border-accent"
+                    title="Set the schedule field to phase start minus the lead"
+                  >
+                    schedule = start − lead
+                  </button>
                 </span>
               </div>
             ) : null}

@@ -214,6 +214,7 @@ pub fn mint_enqueue(args: MintEnqueueArgs) -> AppResult<EnqueueBatchResult> {
             scheduled_at: args.scheduled_at,
             delay_ms: args.delay_ms,
             mode: args.mode.clone(),
+            opensea_ref: None,
         };
         if let Some(entry) = &entry {
             a = apply_entry_to_enqueue(a, &wallet.address, entry)?;
@@ -332,14 +333,87 @@ pub async fn mint_opensea_enqueue(args: MintOpenSeaEnqueueArgs) -> AppResult<Enq
     let qty = u64::try_from(args.quantity).unwrap_or(1);
     let token_id = args.token_id.clone().unwrap_or_else(|| "0".into());
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let defer = args.scheduled_at.map(|t| t > now_ms).unwrap_or(false);
+    let enqueue_fn = if args.draft.unwrap_or(false) { mint::enqueue_draft } else { mint::enqueue };
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+
+    // Scheduled launch: signed mint data does not exist until the stage opens,
+    // so store a reference and resolve SIWE + stage + MintAction in the runner
+    // when the task fires (the window-start revert is permanent otherwise).
+    if defer {
+        let ref_json = serde_json::json!({
+            "collection": args.collection,
+            "token_id": token_id,
+        })
+        .to_string();
+        for wallet_id in args.wallet_ids.clone() {
+            let address = match wallet_store::get_wallet(wallet_id) {
+                Ok(w) => w.address,
+                Err(e) => {
+                    skipped.push(SkippedWallet {
+                        wallet_id,
+                        address: String::new(),
+                        reason: format!("wallet not found: {e}"),
+                    });
+                    continue;
+                }
+            };
+            let enqueue = EnqueueArgs {
+                wallet_id,
+                chain_id: args.chain_id,
+                contract: args.collection.clone(),
+                quantity: args.quantity,
+                value_wei: None,
+                function_name: None,
+                is_hex: false,
+                parameters: None,
+                calldata: None,
+                rpc_endpoints: args.rpc_endpoints.clone(),
+                flashbots: args.flashbots.unwrap_or(false),
+                gas_limit: args.gas_limit.clone(),
+                max_fee_gwei: args.max_fee_gwei.clone(),
+                priority_fee_gwei: args.priority_fee_gwei.clone(),
+                nonce_override: None,
+                scheduled_at: args.scheduled_at,
+                delay_ms: args.delay_ms,
+                mode: args.mode.clone(),
+                opensea_ref: Some(ref_json.clone()),
+            };
+            match enqueue_fn(enqueue) {
+                Ok(task) => out.push(task),
+                Err(e) => skipped.push(SkippedWallet {
+                    wallet_id,
+                    address,
+                    reason: format!("enqueue failed: {e}"),
+                }),
+            }
+        }
+        wallet_store::log_activity(
+            "mint.opensea",
+            &format!(
+                "OpenSea stage mint scheduled: {} queued for fire-time calldata, {} skipped",
+                out.len(),
+                skipped.len()
+            ),
+            None,
+            !out.is_empty(),
+        );
+        return Ok(EnqueueBatchResult {
+            tasks: out,
+            skipped,
+        });
+    }
+
     let client = OpenSeaClient::new()?;
     let resolved = client
         .resolve_collection(&args.collection, Some(expected))
         .await?
         .ok_or_else(|| AppError::NotFound("collection not on OpenSea".into()))?;
-
-    let mut out = Vec::new();
-    let mut skipped = Vec::new();
     for wallet_id in args.wallet_ids.clone() {
         let wallet = match wallet_store::get_wallet(wallet_id) {
             Ok(w) => w,
@@ -396,8 +470,8 @@ pub async fn mint_opensea_enqueue(args: MintOpenSeaEnqueueArgs) -> AppResult<Enq
             scheduled_at: args.scheduled_at,
             delay_ms: args.delay_ms,
             mode: args.mode.clone(),
+            opensea_ref: None,
         };
-        let enqueue_fn = if args.draft.unwrap_or(false) { mint::enqueue_draft } else { mint::enqueue };
         match enqueue_fn(enqueue) {
             Ok(task) => out.push(task),
             Err(e) => skipped.push(SkippedWallet {

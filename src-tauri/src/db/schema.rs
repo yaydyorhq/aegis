@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS mint_tasks(
   delay_ms INTEGER NOT NULL DEFAULT 0,
   mode TEXT NOT NULL DEFAULT 'execute',
   poll_attempts INTEGER NOT NULL DEFAULT 0,
-  auto_retries INTEGER NOT NULL DEFAULT 0
+  auto_retries INTEGER NOT NULL DEFAULT 0,
+  opensea_ref TEXT
 );
 
 CREATE TABLE IF NOT EXISTS eligibility_checks(
