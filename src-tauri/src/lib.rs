@@ -33,6 +33,26 @@ pub fn run() {
                 let mut tick = tokio::time::interval(std::time::Duration::from_millis(60));
                 loop {
                     tick.tick().await;
+                    // Prep lead (T-10s): warm RPC sockets, nonce/gas and OpenSea
+                    // metadata for tasks that are about to fire. Fire and forget —
+                    // it must never delay the actual run.
+                    match mint::due_for_prep(db::now_ms()) {
+                        Ok(ids) => {
+                            for id in ids {
+                                tauri::async_runtime::spawn(async move {
+                                    mint::prep_task(id).await;
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            wallet_store::log_activity(
+                                "mint.prep",
+                                &format!("Prep scan error: {e}"),
+                                None,
+                                false,
+                            );
+                        }
+                    }
                     match mint::count_runnable() {
                         Ok(n) if n > 0 && !mint::is_running() => {
                             if let Err(e) = mint::run_pending().await {

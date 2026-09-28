@@ -314,3 +314,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+pub mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Process-global lock for tests that touch the vault/DB singletons.
+    ///
+    /// The connection is a `OnceLock` (first init wins), so every test module
+    /// shares one database even though each builds its own temp path. Two
+    /// per-module locks still let a mint test and an e2e test run together and
+    /// wipe each other's rows (`DELETE FROM mint_tasks` / `wallets`) — that was
+    /// the `e2e_aegis_ui_hex_mode_raw_calldata` flake. One lock serializes all.
+    pub fn serial_guard() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}

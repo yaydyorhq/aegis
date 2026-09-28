@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::wallet_store;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use std::sync::OnceLock;
 
 pub mod eligibility;
 pub mod erc20;
@@ -127,12 +128,27 @@ pub fn delete_chain(id: i64) -> AppResult<()> {
     Ok(())
 }
 
+/// One shared client for every JSON-RPC call: a client per call meant a fresh
+/// TCP+TLS handshake on each request, which is the dominant cost inside a
+/// launch second. Keep-alive keeps the pool warm between the prep pass and the
+/// fire path (OSNM-Z's `warm_submission_endpoint` relies on the same reuse).
+static RPC_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn rpc_client() -> &'static reqwest::Client {
+    RPC_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .user_agent(concat!("aegis/", env!("CARGO_PKG_VERSION")))
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("rpc client")
+    })
+}
+
 pub async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> AppResult<serde_json::Value> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .user_agent(concat!("aegis/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| AppError::Rpc(e.to_string()))?;
+    let client = rpc_client();
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,

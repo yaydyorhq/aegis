@@ -1146,9 +1146,9 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Shared with `mint::tests`/e2e — one lock for the process-global DB/vault.
     fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::db::test_support::serial_guard()
     }
 
     fn fresh_db(tag: &str) {

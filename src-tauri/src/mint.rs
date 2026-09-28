@@ -73,6 +73,24 @@ static MINT_RUNNING: AtomicBool = AtomicBool::new(false);
 /// pollers across scheduler ticks and lets polls outlive the run guard.
 static POLL_IN_FLIGHT: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<i64>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// Task ids already prepped inside their lead window, so the 60ms scheduler
+/// tick reports each one once. A prep failure clears its mark and retries.
+static PREPPED: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<i64>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+/// OpenSea collection metadata warmed before fire time — slug/network lookup is
+/// a network roundtrip we do not want inside the T-2 window. Purely additive:
+/// a miss just falls back to the normal resolve path.
+static COLLECTION_CACHE: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<String, crate::opensea::ResolvedCollection>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Prep lead: warm endpoints, nonce/gas and OpenSea metadata this long before a
+/// task's `scheduled_at` (OSNM-Z warms the submission endpoint at T-10s).
+pub const PREP_LEAD_MS: i64 = 10_000;
+
+fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct MintRunGuard;
 impl Drop for MintRunGuard {
@@ -83,7 +101,7 @@ impl Drop for MintRunGuard {
 
 /// Kick off a background receipt poll for `id` unless one is already running.
 /// Detaching keeps the 30s poll window from holding `MINT_RUNNING` hostage —
-/// fresh scheduled mints must be able to fire on the next 250ms tick.
+/// fresh scheduled mints must be able to fire on the next 60ms tick.
 fn spawn_receipt_poll(id: i64) {
     {
         let mut g = POLL_IN_FLIGHT
@@ -1252,21 +1270,30 @@ async fn fetch_opensea_mint_data(
     let qty = u64::try_from(quantity).unwrap_or(1).max(1);
 
     let client = crate::opensea::OpenSeaClient::new()?;
+    let key = collection_cache_key(&parsed.collection, chain_id);
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let plan = match client
-            .resolve_collection(&parsed.collection, Some(network))
-            .await
-        {
-            Ok(Some(resolved)) => {
-                client
-                    .plan_wallet_mint(wallet_id, &addr, &resolved, network, qty, &parsed.token_id)
-                    .await
-            }
-            Ok(None) => Err(AppError::NotFound("collection not on OpenSea".into())),
-            Err(e) => Err(e),
-        };
+        // Collection metadata is warmed by the prep pass when it is available;
+        // only the stage/plan read is retried while the drop is still closed.
+        let plan: AppResult<crate::opensea::OpenSeaMintPlan> = async {
+            let warmed = { lock_unpoisoned(&COLLECTION_CACHE).get(&key).cloned() };
+            let resolved = match warmed {
+                Some(r) => r,
+                None => {
+                    let r = client
+                        .resolve_collection(&parsed.collection, Some(network))
+                        .await?
+                        .ok_or_else(|| AppError::NotFound("collection not on OpenSea".into()))?;
+                    lock_unpoisoned(&COLLECTION_CACHE).insert(key.clone(), r.clone());
+                    r
+                }
+            };
+            client
+                .plan_wallet_mint(wallet_id, &addr, &resolved, network, qty, &parsed.token_id)
+                .await
+        }
+        .await;
         match plan {
             Ok(p) => return Ok(p),
             Err(e) => {
@@ -1291,6 +1318,144 @@ async fn fetch_opensea_mint_data(
             }
         }
     }
+}
+
+/// Pending tasks whose `scheduled_at` now falls inside the prep lead and which
+/// have not been prepped yet. Marks each id, so the 60ms tick yields it once.
+pub fn due_for_prep(now_ms: i64) -> AppResult<Vec<i64>> {
+    let ids: Vec<i64> = crate::db::with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM mint_tasks
+             WHERE status = 'pending'
+               AND scheduled_at IS NOT NULL
+               AND scheduled_at > ?1
+               AND scheduled_at <= ?2
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([now_ms, now_ms + PREP_LEAD_MS], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })?;
+    let mut prepped = lock_unpoisoned(&PREPPED);
+    if prepped.len() > 10_000 {
+        prepped.clear();
+    }
+    Ok(ids.into_iter().filter(|id| prepped.insert(*id)).collect())
+}
+
+/// Warm-up for a scheduled task. Best effort: every network failure is logged
+/// and swallowed, because the fire path re-reads everything it signs.
+pub async fn prep_task(id: i64) {
+    if let Err(e) = prep_inner(id).await {
+        if let Ok(mut g) = PREPPED.lock() {
+            g.remove(&id);
+        }
+        wallet_store::log_activity(
+            "mint.prep",
+            &format!("Prep for task {id} failed: {e}"),
+            None,
+            false,
+        );
+    }
+}
+
+async fn prep_inner(id: i64) -> AppResult<()> {
+    let task = get_task(id)?;
+    if task.status != "pending" {
+        return Ok(());
+    }
+    let chains = crate::chain::list_chains()?;
+    let chain_row = chains
+        .into_iter()
+        .find(|c| c.chain_id == task.chain_id)
+        .ok_or_else(|| AppError::NotFound(format!("chain {}", task.chain_id)))?;
+    let endpoints = parse_rpc_list(&task, &chain_row.rpc_url);
+
+    // Reach every endpoint in parallel. The shared reqwest pool keeps these
+    // sockets alive, so the fire path inherits a warm connection instead of
+    // paying a TCP+TLS handshake in the launch second.
+    let expected = task.chain_id;
+    let mut handles = Vec::with_capacity(endpoints.len());
+    for url in endpoints {
+        handles.push(tokio::spawn(async move {
+            let cid = crate::chain::eth_chain_id(&url).await;
+            (url, cid)
+        }));
+    }
+    let mut healthy: Option<String> = None;
+    for h in handles {
+        if let Ok((url, Ok(cid))) = h.await {
+            if cid == expected && healthy.is_none() {
+                healthy = Some(url);
+            }
+        }
+    }
+    let Some(url) = healthy else {
+        wallet_store::log_activity(
+            "mint.prep",
+            &format!("Task {id}: no reachable endpoint during prep"),
+            None,
+            false,
+        );
+        return Ok(());
+    };
+
+    // Prime nonce + gas caches on that endpoint. The values are discarded —
+    // they must be re-read at fire time — this only warms connection and node
+    // state (OSNM-Z's nonce refresh at T-10..T-2).
+    if let Some(wid) = task.wallet_id {
+        if let Ok(w) = wallet_store::get_wallet(wid) {
+            let _ = crate::chain::rpc_call(
+                &url,
+                "eth_getTransactionCount",
+                serde_json::json!([w.address, "pending"]),
+            )
+            .await;
+            let _ = crate::chain::rpc_call(&url, "eth_gasPrice", serde_json::json!([])).await;
+        }
+    }
+
+    // Warm OpenSea collection metadata for a deferred task: fire time then
+    // only has to wait for the stage to open, not for two roundtrips.
+    if let Some(r) = task.opensea_ref.as_deref() {
+        let Ok(parsed) = serde_json::from_str::<OpenseaRef>(r) else {
+            return Ok(());
+        };
+        let network = u64::try_from(task.chain_id).unwrap_or(0);
+        let key = collection_cache_key(&parsed.collection, task.chain_id);
+        if lock_unpoisoned(&COLLECTION_CACHE).contains_key(&key) {
+            return Ok(());
+        }
+        match crate::opensea::OpenSeaClient::new() {
+            Ok(client) => match client.resolve_collection(&parsed.collection, Some(network)).await
+            {
+                Ok(Some(resolved)) => {
+                    lock_unpoisoned(&COLLECTION_CACHE).insert(key, resolved);
+                }
+                Ok(None) => {}
+                Err(e) => wallet_store::log_activity(
+                    "mint.prep",
+                    &format!("Task {id}: collection warm-up failed: {e}"),
+                    None,
+                    false,
+                ),
+            },
+            Err(e) => wallet_store::log_activity(
+                "mint.prep",
+                &format!("Task {id}: OpenSea client unavailable: {e}"),
+                None,
+                false,
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn collection_cache_key(collection: &str, chain_id: i64) -> String {
+    format!("{}|{}", collection.trim().to_lowercase(), chain_id)
 }
 
 /// Process one pending/broadcasting task: sign + broadcast or re-poll receipt.
@@ -2184,6 +2349,53 @@ mod tests {
     }
 
     #[test]
+    fn due_for_prep_marks_each_task_once_inside_lead() {
+        let _serial = serial_guard();
+        fresh_db("prep");
+        ensure_unlocked();
+        let w = crate::wallet_store::create_wallet("prep-w", None).unwrap();
+        let base = crate::chain::list_chains()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.chain_id == 8453)
+            .unwrap();
+        let now = crate::db::now_ms();
+        let id = enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: base.chain_id,
+            contract: "0x0000000000000000000000000000000000000001".into(),
+            quantity: 1,
+            scheduled_at: Some(now + 5_000),
+            mode: Some("execute".into()),
+            function_name: Some("mint()".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+        let draft = enqueue_draft(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: base.chain_id,
+            contract: "0x0000000000000000000000000000000000000002".into(),
+            quantity: 1,
+            scheduled_at: Some(now + 5_000),
+            mode: Some("execute".into()),
+            function_name: Some("mint()".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+        // Outside the 10s lead there is nothing to warm yet.
+        assert!(due_for_prep(now - 30_000).unwrap().is_empty());
+        // Inside the lead: reported once, then deduped for later ticks.
+        assert_eq!(due_for_prep(now).unwrap(), vec![id]);
+        assert!(due_for_prep(now).unwrap().is_empty());
+        // Drafts never fire, so they are never prepped.
+        assert!(!due_for_prep(now).unwrap().contains(&draft));
+        // Past fire time the scan moves on.
+        assert!(due_for_prep(now + 60_000).unwrap().is_empty());
+    }
+
+    #[test]
     fn scheduled_opensea_task_stores_fire_time_ref() {
         let _serial = serial_guard();
         fresh_db("opensearef");
@@ -2321,9 +2533,9 @@ mod tests {
 
     /// Mint tests share the process-global DB + vault — serialize them so
     /// parallel `cargo test` runs don't race (the old VaultLocked flake).
+    /// Delegates to the shared lock: mint and e2e tests must not overlap either.
     fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::db::test_support::serial_guard()
     }
 
     fn ensure_unlocked() {

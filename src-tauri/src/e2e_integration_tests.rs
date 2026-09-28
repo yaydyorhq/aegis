@@ -49,9 +49,9 @@ mod e2e_integration {
         });
     }
 
+    /// Shared with `mint::tests` — one lock for the process-global DB/vault.
     fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::db::test_support::serial_guard()
     }
 
     /// Ensure the vault is unlocked.  Tries known passphrases.  Panics if
