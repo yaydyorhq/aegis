@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import { cn } from "../lib/utils";
 
 export type ToastTone = "ok" | "warn" | "info" | "error";
@@ -205,5 +205,145 @@ export function StatusDot({ ok }: { ok: boolean }) {
         ok ? "bg-ok" : "bg-muted/60",
       )}
     />
+  );
+}
+
+export interface DropdownItem {
+  key: string;
+  label: string;
+  sub?: string;
+  checked: boolean;
+  onToggle: () => void;
+}
+
+export interface DropdownGroup {
+  key: string;
+  title: string;
+  selected: number;
+  total: number;
+  onToggleAll?: () => void;
+  items: DropdownItem[];
+}
+
+/** Collapsed multi-select with grouped, select-all-per-group rows. */
+export function MultiSelectDropdown({
+  summary,
+  groups,
+  emptyText,
+  footer,
+  className,
+}: {
+  summary: string;
+  groups: DropdownGroup[];
+  emptyText?: string;
+  footer?: ReactNode;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [dropUp, setDropUp] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Flip the panel upward when the trigger sits near the viewport bottom —
+  // the form scrolls inside a clipped container, so downward-only clips options.
+  function toggleOpen() {
+    if (!open) {
+      const el = boxRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        setDropUp(window.innerHeight - rect.bottom < 260 && rect.top > 260);
+      }
+    }
+    setOpen((o) => !o);
+  }
+
+  return (
+    <div ref={boxRef} className={cn("relative", className)}>
+      <button
+        type="button"
+        onClick={toggleOpen}
+        className="flex w-full items-center justify-between gap-2 rounded-lg border border-line bg-card px-3 py-2 text-left text-[13px] hover:border-muted/40"
+      >
+        <span className="truncate text-fg">{summary}</span>
+        {open ? (
+          <ChevronUp className="h-4 w-4 shrink-0 text-muted" />
+        ) : (
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted" />
+        )}
+      </button>
+      {open ? (
+        <div
+          className={cn(
+            "absolute left-0 right-0 z-30 max-h-64 overflow-y-auto rounded-lg border border-line bg-card shadow-xl",
+            dropUp ? "bottom-full mb-1" : "top-full mt-1",
+          )}
+        >
+          {groups.length === 0 ? (
+            <div className="px-3 py-3 text-[12px] text-muted">
+              {emptyText ?? "Nothing to select"}
+            </div>
+          ) : (
+            groups.map((g) => {
+              const all = g.total > 0 && g.selected === g.total;
+              return (
+                <div key={g.key} className="border-b border-line/60 last:border-0">
+                  <div className="flex items-center gap-2 bg-bg/70 px-3 py-1.5">
+                    <input
+                      type="checkbox"
+                      checked={all}
+                      onChange={g.onToggleAll}
+                      disabled={!g.onToggleAll}
+                      aria-label={`Toggle ${g.title}`}
+                      className="h-3.5 w-3.5 accent-[var(--accent,#6d5efc)] disabled:opacity-40"
+                    />
+                    <span className="min-w-0 flex-1 truncate text-[11px] font-medium uppercase tracking-wide text-muted">
+                      {g.title}
+                    </span>
+                    <span className="shrink-0 font-mono text-[10px] text-muted">
+                      {g.selected}/{g.total}
+                    </span>
+                  </div>
+                  {g.items.map((it) => (
+                    <label
+                      key={it.key}
+                      className="flex cursor-pointer items-center gap-2 px-3 py-1.5 hover:bg-bg"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={it.checked}
+                        onChange={it.onToggle}
+                        className="h-3.5 w-3.5 shrink-0 accent-[var(--accent,#6d5efc)]"
+                      />
+                      <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg">
+                        {it.label}
+                      </span>
+                      {it.sub ? (
+                        <span
+                          className="max-w-[48%] shrink-0 truncate font-mono text-[11px] text-muted"
+                          title={it.sub}
+                        >
+                          {it.sub}
+                        </span>
+                      ) : null}
+                    </label>
+                  ))}
+                </div>
+              );
+            })
+          )}
+          {footer ? (
+            <div className="border-t border-line px-3 py-2">{footer}</div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }

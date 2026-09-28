@@ -2,6 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import { ExternalLink, Link2, Loader2, Play, Plus, X, Zap } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ipc } from "../lib/ipc";
+import {
+  fnDefaults,
+  fnHint,
+  fnSignature,
+  isAddress,
+  loadAbi,
+  type AbiFn,
+  type AbiInfo,
+} from "../lib/abi";
 import type {
   AllowlistMatchRow,
   ChainRow,
@@ -10,15 +19,12 @@ import type {
   OpenSeaMintPlan,
   SeaDropPlan,
 } from "../lib/types";
-import { EmptyState, PageHeader, StatusDot, pushToast } from "../components/ui";
+import { EmptyState, MultiSelectDropdown, PageHeader, StatusDot, pushToast, type DropdownGroup } from "../components/ui";
 import { shortAddress } from "../lib/utils";
 import {
-  filterWalletsByGroup,
-  groupNameMap,
   useWalletStore,
 } from "../store/app";
 
-type GroupFilter = number | "all" | "ungrouped";
 type Mode = "execute" | "simulate" | "spam" | "sweep";
 
 const FUNCTION_PRESETS = [
@@ -61,9 +67,16 @@ export function MintingPage() {
   const [showForm, setShowForm] = useState(false);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [walletGroupFilter, setWalletGroupFilter] = useState<GroupFilter>("all");
   const [selectedWalletIds, setSelectedWalletIds] = useState<number[]>([]);
   const [selectedRpcUrls, setSelectedRpcUrls] = useState<string[]>([]);
+  /** Extra endpoints pasted in for the current chain (probed before adding). */
+  const [customRpcUrls, setCustomRpcUrls] = useState<string[]>([]);
+  const [newRpcUrl, setNewRpcUrl] = useState("");
+  const [probingRpc, setProbingRpc] = useState(false);
+  const [rpcAddErr, setRpcAddErr] = useState<string | null>(null);
+  const [abiInfo, setAbiInfo] = useState<AbiInfo | null>(null);
+  const [abiLoading, setAbiLoading] = useState(false);
+  const [abiErr, setAbiErr] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [seaDrop, setSeaDrop] = useState<SeaDropPlan | null>(null);
@@ -85,11 +98,36 @@ export function MintingPage() {
   const primedTasks = useRef(false);
   /** After local enqueue we already toast — suppress the "new task" duplicate. */
   const suppressNewTaskToast = useRef(false);
+  /** RPC selection is initialised exactly once per selected chain. */
+  const rpcInitKey = useRef<string | null>(null);
 
-  const groupNames = useMemo(() => groupNameMap(groups), [groups]);
-  const formWallets = useMemo(
-    () => filterWalletsByGroup(wallets, walletGroupFilter),
-    [wallets, walletGroupFilter],
+  type Wallet = (typeof wallets)[number];
+  // Wallet picker groups: every store group with wallets + an "Ungrouped" bucket.
+  const walletGroups = useMemo(() => {
+    const out: { key: string; title: string; items: Wallet[] }[] = [];
+    for (const g of groups) {
+      const items = wallets.filter((w) => w.group_id === g.id);
+      if (items.length) out.push({ key: `g${g.id}`, title: g.name, items });
+    }
+    const loose = wallets.filter((w) => w.group_id == null);
+    if (loose.length) out.push({ key: "ungrouped", title: "Ungrouped", items: loose });
+    return out;
+  }, [wallets, groups]);
+
+  // Function currently selected in the ABI-derived list (null for presets/custom).
+  const selectedFn = useMemo<AbiFn | null>(() => {
+    if (!abiInfo || form.functionPreset === "custom") return null;
+    return abiInfo.fns.find((f) => fnSignature(f) === form.functionPreset) ?? null;
+  }, [abiInfo, form.functionPreset]);
+
+  const abiSigSet = useMemo(
+    () => new Set((abiInfo?.fns ?? []).map(fnSignature)),
+    [abiInfo],
+  );
+  // Values the <option> list can show — anything else gets an escape-hatch option.
+  const knownFnValues = useMemo(
+    () => new Set<string>([...abiSigSet, ...FUNCTION_PRESETS]),
+    [abiSigSet],
   );
 
   const enabledChains = useMemo(
@@ -108,28 +146,75 @@ export function MintingPage() {
 
   // RPC list is restricted to the SELECTED chain — mixing endpoints from
   // other chains would sign/estimate/nonce against the wrong network.
+  // Extra endpoints pasted for this chain are appended as a "custom" group.
   const rpcOptions = useMemo(() => {
     const list: { url: string; label: string }[] = [];
     const seen = new Set<string>();
+    const push = (raw: string, label: string) => {
+      const url = raw.trim();
+      if (!url || seen.has(url)) return;
+      seen.add(url);
+      list.push({ url, label });
+    };
     for (const c of enabledChains) {
       if (!form.chainId || String(c.chain_id) !== form.chainId) continue;
-      const url = c.rpc_url.trim();
-      if (!url || seen.has(url)) continue;
-      seen.add(url);
-      list.push({ url, label: `${c.name} · ${shortAddress(url.replace(/^https?:\/\//, ""), 14)}` });
+      push(c.rpc_url, c.name);
     }
+    for (const url of customRpcUrls) push(url, "custom");
     return list;
-  }, [enabledChains, form.chainId]);
+  }, [enabledChains, form.chainId, customRpcUrls]);
 
-  // Drop stale RPC selections when they no longer belong to the chosen chain.
+  // Drop RPC selections that no longer belong to the chosen chain.
   useEffect(() => {
     setSelectedRpcUrls((prev) => {
       const kept = prev.filter((u) => rpcOptions.some((r) => r.url === u));
-      if (kept.length > 0) return kept;
-      const c = enabledChains.find((x) => String(x.chain_id) === form.chainId);
-      return c?.rpc_url ? [c.rpc_url] : [];
+      return kept.length === prev.length ? prev : kept;
     });
-  }, [rpcOptions, form.chainId, enabledChains]);
+  }, [rpcOptions]);
+
+  // New chain selected → start with EVERY endpoint selected, so the runner
+  // races them instead of depending on a single (possibly dead) RPC.
+  useEffect(() => {
+    const key = form.chainId || "";
+    if (rpcInitKey.current === key) return;
+    rpcInitKey.current = key;
+    setSelectedRpcUrls(rpcOptions.map((r) => r.url));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.chainId, rpcOptions]);
+
+  // ABI lookup (Sourcify) for the contract target — debounced, cached per
+  // contract+chain so typing an address doesn't refetch.
+  useEffect(() => {
+    const addr = form.contract.trim();
+    if (!form.chainId || !isAddress(addr)) {
+      setAbiInfo(null);
+      setAbiErr(null);
+      setAbiLoading(false);
+      return;
+    }
+    let stale = false;
+    setAbiLoading(true);
+    const timer = window.setTimeout(() => {
+      const chain = enabledChains.find((c) => String(c.chain_id) === form.chainId);
+      loadAbi(Number(form.chainId), addr, chain?.rpc_url || null)
+        .then((info) => {
+          if (stale) return;
+          setAbiInfo(info);
+          setAbiErr(info ? null : "No verified ABI on Sourcify — presets only");
+          setAbiLoading(false);
+        })
+        .catch((e: unknown) => {
+          if (stale) return;
+          setAbiInfo(null);
+          setAbiErr(String(e).slice(0, 140));
+          setAbiLoading(false);
+        });
+    }, 350);
+    return () => {
+      stale = true;
+      window.clearTimeout(timer);
+    };
+  }, [form.contract, form.chainId, enabledChains]);
 
   function applyTaskNotifications(next: MintTaskRow[]) {
     const newIds: number[] = [];
@@ -217,7 +302,7 @@ export function MintingPage() {
   }
 
   function selectVisibleWallets() {
-    setSelectedWalletIds(formWallets.map((w) => w.id));
+    setSelectedWalletIds(wallets.map((w) => w.id));
   }
 
   function deselectAllWallets() {
@@ -232,6 +317,75 @@ export function MintingPage() {
 
   function selectAllRpcs() {
     setSelectedRpcUrls(rpcOptions.map((r) => r.url));
+  }
+
+  /** Pick a function — prefills Parameters from the ABI signature. */
+  function pickFunction(sig: string) {
+    const fn: AbiFn | null =
+      sig === "custom"
+        ? null
+        : abiInfo?.fns.find((f) => fnSignature(f) === sig) ?? null;
+    setForm((prev) => ({
+      ...prev,
+      functionPreset: sig,
+      parameters: fn ? fnDefaults(fn) : prev.parameters,
+    }));
+    setEncodedPreview(null);
+    setEncodeErr(null);
+  }
+
+  const rpcGroups: DropdownGroup[] = useMemo(() => {
+    const chain = enabledChains.find((c) => String(c.chain_id) === form.chainId);
+    const picked = rpcOptions.filter((r) => selectedRpcUrls.includes(r.url)).length;
+    return [
+      {
+        key: "rpc",
+        title: chain ? `${chain.name} · chain ${chain.chain_id}` : "No chain selected",
+        selected: picked,
+        total: rpcOptions.length,
+        onToggleAll: selectAllRpcs,
+        items: rpcOptions.map((r) => ({
+          key: r.url,
+          label: r.label,
+          sub: r.url,
+          checked: selectedRpcUrls.includes(r.url),
+          onToggle: () => toggleRpc(r.url),
+        })),
+      },
+    ];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rpcOptions, selectedRpcUrls, enabledChains, form.chainId]);
+
+  /** Probe + append an extra endpoint for the current chain. */
+  async function onAddRpc() {
+    const url = newRpcUrl.trim();
+    if (!/^https?:\/\/\S+$/.test(url)) {
+      setRpcAddErr("Enter an http(s) RPC URL");
+      return;
+    }
+    if (rpcOptions.some((r) => r.url === url)) {
+      setRpcAddErr("Endpoint already listed");
+      return;
+    }
+    setProbingRpc(true);
+    setRpcAddErr(null);
+    try {
+      const probe = await ipc<{ chain_id: number | null; error: string | null }>(
+        "chain_probe",
+        { rpcUrl: url },
+      );
+      if (probe.error || probe.chain_id == null) throw new Error(probe.error ?? "probe failed");
+      if (String(probe.chain_id) !== form.chainId) {
+        throw new Error(`Endpoint is chain ${probe.chain_id}, expected ${form.chainId}`);
+      }
+      setCustomRpcUrls((prev) => [...prev, url]);
+      setSelectedRpcUrls((prev) => [...prev, url]);
+      setNewRpcUrl("");
+    } catch (e) {
+      setRpcAddErr(String(e).slice(0, 140));
+    } finally {
+      setProbingRpc(false);
+    }
   }
 
   // Preview allowlist × selected wallets (debounced).
@@ -857,6 +1011,55 @@ export function MintingPage() {
               </div>
             ) : null}
             <div className="min-h-0 flex-1 overflow-y-auto p-5">
+          {/* Row: Contract Target + Chain — first, everything below depends on it */}
+          <div className="mb-3 grid grid-cols-2 gap-2">
+            <div>
+              <label className="mb-1 block text-[11px] text-muted">Contract Target</label>
+              <input
+                placeholder="0x…"
+                value={form.contract}
+                onChange={(e) => setForm({ ...form, contract: e.target.value })}
+                className="w-full rounded-lg border border-line bg-bg px-3 py-2 font-mono text-[13px] outline-none focus:border-accent"
+              />
+              <div className="mt-1 min-h-[14px] text-[11px]">
+                {abiLoading ? (
+                  <span className="text-muted">fetching ABI…</span>
+                ) : abiErr ? (
+                  <span className="text-warn">{abiErr}</span>
+                ) : abiInfo && abiInfo.fns.length === 0 ? (
+                  <span className="text-warn">{abiInfo.source}</span>
+                ) : abiInfo ? (
+                  <span className="text-ok">
+                    {abiInfo.fns.length} callable · {abiInfo.source}
+                    {abiInfo.viaProxy ? " · via implementation" : ""}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+            <div>
+              <label className="mb-1 block text-[11px] text-muted">Chain</label>
+              <select
+                value={form.chainId}
+                onChange={(e) => {
+                  const cid = e.target.value;
+                  const c = enabledChains.find((x) => String(x.chain_id) === cid);
+                  setForm({ ...form, chainId: cid });
+                  setCustomRpcUrls([]);
+                  setAbiInfo(null);
+                  if (c?.rpc_url) setSelectedRpcUrls([c.rpc_url]);
+                }}
+                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
+              >
+                <option value="">Select chain…</option>
+                {enabledChains.map((c) => (
+                  <option key={c.id} value={c.chain_id}>
+                    {c.name} ({c.chain_id})
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
           {/* SeaDrop public mint: fetch plan from NFT collection address */}
           <div className="mb-3 rounded-lg border border-line bg-bg p-3">
             <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
@@ -984,39 +1187,6 @@ export function MintingPage() {
             ) : null}
           </div>
 
-          {/* Row: Contract + Chain */}
-          <div className="mb-3 grid grid-cols-2 gap-2">
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Contract Target</label>
-              <input
-                placeholder="0x…"
-                value={form.contract}
-                onChange={(e) => setForm({ ...form, contract: e.target.value })}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 font-mono text-[13px] outline-none focus:border-accent"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Chain</label>
-              <select
-                value={form.chainId}
-                onChange={(e) => {
-                  const cid = e.target.value;
-                  const c = enabledChains.find((x) => String(x.chain_id) === cid);
-                  setForm({ ...form, chainId: cid });
-                  if (c?.rpc_url) setSelectedRpcUrls([c.rpc_url]);
-                }}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              >
-                <option value="">Select chain…</option>
-                {enabledChains.map((c) => (
-                  <option key={c.id} value={c.chain_id}>
-                    {c.name} ({c.chain_id})
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-
           {/* Function + HEX checkbox */}
           <div className="mb-3 grid grid-cols-[1fr_auto] gap-2">
             <div>
@@ -1024,7 +1194,12 @@ export function MintingPage() {
                 {form.isHex ? (
                   <>Raw calldata <span className="opacity-60">— {"{address}"} auto-padded to 32 bytes</span></>
                 ) : (
-                  <>Function</>
+                  <>
+                    Function{" "}
+                    <span className="opacity-60">
+                      — {selectedFn ? fnHint(selectedFn) : "from contract ABI"}
+                    </span>
+                  </>
                 )}
               </label>
               {form.isHex ? (
@@ -1044,14 +1219,33 @@ export function MintingPage() {
               ) : (
                 <select
                   value={form.functionPreset}
-                  onChange={(e) => setForm({ ...form, functionPreset: e.target.value })}
+                  onChange={(e) => pickFunction(e.target.value)}
                   className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
                 >
-                  {FUNCTION_PRESETS.map((p) => (
-                    <option key={p} value={p}>
-                      {p}
-                    </option>
-                  ))}
+                  {abiInfo ? (
+                    <optgroup label={`Contract ABI · ${abiInfo.fns.length} callable`}>
+                      {abiInfo.fns.map((f) => {
+                        const sig = fnSignature(f);
+                        return (
+                          <option key={sig} value={sig}>
+                            {sig}
+                          </option>
+                        );
+                      })}
+                    </optgroup>
+                  ) : null}
+                  <optgroup label="Presets">
+                    {FUNCTION_PRESETS.map((p) =>
+                      abiSigSet.has(p) ? null : (
+                        <option key={p} value={p}>
+                          {p === "custom" ? "custom…" : p}
+                        </option>
+                      ),
+                    )}
+                  </optgroup>
+                  {knownFnValues.has(form.functionPreset) ? null : (
+                    <option value={form.functionPreset}>{form.functionPreset}</option>
+                  )}
                 </select>
               )}
             </div>
@@ -1068,8 +1262,9 @@ export function MintingPage() {
             </div>
           </div>
 
-          {/* Encode preview — only in Function mode */}
-          {!form.isHex && form.functionPreset === "custom" && form.customFn.trim() && (
+          {/* Encode preview — Function mode, any selected signature */}
+          {!form.isHex &&
+            (form.functionPreset === "custom" ? form.customFn.trim() : Boolean(form.functionPreset)) && (
             <div className="mb-3 rounded-lg border border-accent/30 bg-accent/5 p-3">
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <span className="text-[11px] text-accent">Calldata Preview</span>
@@ -1123,7 +1318,9 @@ export function MintingPage() {
               <label className="mb-1 block text-[11px] text-muted">
                 Parameters{" "}
                 <span className="opacity-60">
-                  — to {"{address}"}; qty; {"{proof}"} / {"{signature}"}
+                  {selectedFn
+                    ? `— ${fnHint(selectedFn)} · ${"{address}"} / ${"{quantity}"} / ${"{proof}"}`
+                    : `— to {"{address}"}; qty; {"{proof}"} / {"{signature}"}`}
                 </span>
               </label>
               <input
@@ -1187,37 +1384,19 @@ export function MintingPage() {
             ) : null}
           </div>
 
-          {/* Wallets multi-select with group filter */}
+          {/* Wallets — grouped dropdown ("N of M wallets") */}
           <div className="mb-3 rounded-lg border border-line bg-bg p-3">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <div className="text-[11px] text-muted">
                 Wallets <span className="text-fg">({selectedWalletIds.length} selected)</span>
               </div>
               <div className="flex flex-wrap gap-2">
-                <select
-                  value={walletGroupFilter}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setWalletGroupFilter(v === "all" || v === "ungrouped" ? v : Number(v));
-                  }}
-                  className="rounded-lg border border-line bg-card px-2 py-1 text-[12px] outline-none focus:border-accent"
-                >
-                  <option value="all">All groups ({wallets.length})</option>
-                  <option value="ungrouped">
-                    Ungrouped ({wallets.filter((w) => w.group_id == null).length})
-                  </option>
-                  {groups.map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name} ({g.wallet_count})
-                    </option>
-                  ))}
-                </select>
                 <button
                   type="button"
                   onClick={selectVisibleWallets}
                   className="rounded border border-line px-2 py-1 text-[12px] text-fg hover:bg-line"
                 >
-                  Select visible
+                  Select all
                 </button>
                 <button
                   type="button"
@@ -1228,39 +1407,37 @@ export function MintingPage() {
                 </button>
               </div>
             </div>
-            <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
-              {formWallets.length === 0 ? (
-                <div className="text-[12px] text-muted">
-                  No wallets in this filter — create one on the Wallets page first.
-                </div>
-              ) : (
-                formWallets.map((w) => {
-                  const selected = selectedWalletIds.includes(w.id);
-                  const g = w.group_id != null ? groupNames.get(w.group_id) : null;
-                  return (
-                    <button
-                      key={w.id}
-                      type="button"
-                      onClick={() => toggleWallet(w.id)}
-                      title={w.address}
-                      className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[12px] transition ${
-                        selected
-                          ? "border-accent bg-accent/15 text-fg"
-                          : "border-line bg-card text-muted hover:border-muted/40"
-                      }`}
-                    >
-                      <span className="font-medium">{w.label}</span>
-                      {g ? (
-                        <span className="rounded bg-line px-1 text-[10px] text-muted">{g}</span>
-                      ) : null}
-                      <span className="font-mono text-[10px] opacity-70">
-                        {shortAddress(w.address, 4)}
-                      </span>
-                    </button>
-                  );
-                })
-              )}
-            </div>
+            <MultiSelectDropdown
+              summary={
+                wallets.length === 0
+                  ? "No wallets yet"
+                  : `${selectedWalletIds.length} of ${wallets.length} wallets`
+              }
+              emptyText="No wallets — create one on the Wallets page first."
+              groups={walletGroups.map((g) => {
+                const ids = g.items.map((w) => w.id);
+                const all = ids.length > 0 && ids.every((id) => selectedWalletIds.includes(id));
+                return {
+                  key: g.key,
+                  title: g.title,
+                  selected: ids.filter((id) => selectedWalletIds.includes(id)).length,
+                  total: ids.length,
+                  onToggleAll: () =>
+                    setSelectedWalletIds((prev) =>
+                      all
+                        ? prev.filter((id) => !ids.includes(id))
+                        : [...prev, ...ids.filter((id) => !prev.includes(id))],
+                    ),
+                  items: g.items.map((w) => ({
+                    key: String(w.id),
+                    label: w.label,
+                    sub: shortAddress(w.address, 4),
+                    checked: selectedWalletIds.includes(w.id),
+                    onToggle: () => toggleWallet(w.id),
+                  })),
+                };
+              })}
+            />
           </div>
 
           {/* RPC endpoints + Flashbots */}
@@ -1273,49 +1450,59 @@ export function MintingPage() {
                   <span className="ml-1 opacity-70">— select a chain first</span>
                 ) : null}
               </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={selectAllRpcs}
-                  className="rounded border border-line px-2 py-1 text-[12px] text-fg hover:bg-line"
-                >
-                  All ({rpcOptions.length})
-                </button>
-                <label className="flex cursor-pointer select-none items-center gap-1.5 rounded border border-line px-2 py-1 text-[12px] text-fg">
-                  <input
-                    type="checkbox"
-                    checked={form.flashbots}
-                    onChange={(e) => setForm({ ...form, flashbots: e.target.checked })}
-                    className="h-3.5 w-3.5 accent-[var(--accent,#6d5efc)]"
-                  />
-                  Flashbots
-                </label>
-              </div>
+              <label className="flex cursor-pointer select-none items-center gap-1.5 rounded border border-line px-2 py-1 text-[12px] text-fg">
+                <input
+                  type="checkbox"
+                  checked={form.flashbots}
+                  onChange={(e) => setForm({ ...form, flashbots: e.target.checked })}
+                  className="h-3.5 w-3.5 accent-[var(--accent,#6d5efc)]"
+                />
+                Flashbots
+              </label>
             </div>
-            <div className="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
-              {rpcOptions.length === 0 ? (
-                <div className="text-[12px] text-muted">No RPC endpoints configured.</div>
-              ) : (
-                rpcOptions.map((r) => {
-                  const selected = selectedRpcUrls.includes(r.url);
-                  return (
+            <MultiSelectDropdown
+              summary={
+                rpcOptions.length === 0
+                  ? "No RPC endpoints"
+                  : selectedRpcUrls.length === rpcOptions.length
+                    ? `All ${rpcOptions.length} endpoints`
+                    : `${selectedRpcUrls.length} of ${rpcOptions.length} endpoints`
+              }
+              emptyText={
+                form.chainId ? "No RPC endpoints configured." : "Select a chain first."
+              }
+              groups={rpcGroups}
+              footer={
+                <>
+                  <div className="flex items-center gap-2">
+                    <input
+                      placeholder="https://… add endpoint for this chain"
+                      value={newRpcUrl}
+                      onChange={(e) => setNewRpcUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void onAddRpc();
+                        }
+                      }}
+                      spellCheck={false}
+                      className="min-w-0 flex-1 rounded border border-line bg-bg px-2 py-1 font-mono text-[11.5px] outline-none focus:border-accent"
+                    />
                     <button
-                      key={r.url}
                       type="button"
-                      onClick={() => toggleRpc(r.url)}
-                      title={r.url}
-                      className={`rounded-lg border px-2.5 py-1.5 text-[12px] transition ${
-                        selected
-                          ? "border-accent bg-accent/15 text-fg"
-                          : "border-line bg-card text-muted hover:border-muted/40"
-                      }`}
+                      onClick={() => void onAddRpc()}
+                      disabled={probingRpc}
+                      className="shrink-0 rounded border border-line px-2 py-1 text-[12px] text-fg hover:bg-line disabled:opacity-40"
                     >
-                      {r.label}
+                      {probingRpc ? "Probing…" : "Add"}
                     </button>
-                  );
-                })
-              )}
-            </div>
+                  </div>
+                  {rpcAddErr ? (
+                    <div className="mt-1 text-[11px] text-danger">{rpcAddErr}</div>
+                  ) : null}
+                </>
+              }
+            />
           </div>
 
           {/* Advanced settings (collapsible) */}
