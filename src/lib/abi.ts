@@ -161,7 +161,42 @@ async function firstOk(candidates: string[], call: (rpc: string) => Promise<stri
   throw lastErr ?? new Error("no RPC available");
 }
 
+/** EIP-1167 minimal-clone stubs: prefix + impl address + delegatecall tail. */
+const EIP1167_TAIL = "5af43d82803e903d91602b57fd5bf3";
+const EIP1167_PREFIXES = ["363d3d373d3d3d363d73", "3d3d3d3d363d73"];
+
+/** Runtime code → implementation address when it is a 45-byte clone stub. */
+export function stubTarget(code: string): string | null {
+  const body = code.trim().toLowerCase().replace(/^0x/, "");
+  for (const prefix of EIP1167_PREFIXES) {
+    if (!body.startsWith(prefix)) continue;
+    if (body.length !== prefix.length + 40 + EIP1167_TAIL.length) continue;
+    if (!body.endsWith(EIP1167_TAIL)) continue;
+    const impl = body.slice(prefix.length, prefix.length + 40);
+    if (/^[0-9a-f]{40}$/.test(impl)) return "0x" + impl;
+  }
+  return null;
+}
+
+async function cloneTarget(candidates: string[], address: string): Promise<string | null> {
+  const code = await firstOk(candidates, (rpc) =>
+    rpcCall(rpc, "eth_getCode", [address, "latest"]),
+  ).catch(() => null);
+  return code ? stubTarget(code) : null;
+}
+
+function rpcCandidates(chainId: number, rpcUrl: string | null): string[] {
+  return [...new Set<string>(
+    [rpcUrl, ...(RPC_FALLBACKS[chainId] ?? [])].filter((u): u is string => Boolean(u)),
+  )];
+}
+
 async function resolveImplementation(candidates: string[], address: string): Promise<string | null> {
+  // Minimal clone first: its runtime code names the implementation directly,
+  // so no storage slot or `implementation()` call is needed.
+  const clone = await cloneTarget(candidates, address).catch(() => null);
+  if (clone) return clone;
+
   for (const slot of [EIP1967_IMPL_SLOT, LEGACY_IMPL_SLOT]) {
     const word = await firstOk(candidates, (rpc) =>
       rpcCall(rpc, "eth_getStorageAt", [address, slot, "latest"]),
@@ -249,7 +284,22 @@ async function resolve(chainId: number, address: string, rpcUrl: string | null):
   } catch {
     return null;
   }
-  if (!direct) return null;
+  if (!direct) {
+    // Target itself is unverified — a clone/proxy usually keeps its source at
+    // the implementation, so follow it before giving up ("presets only").
+    const candidates = rpcCandidates(chainId, rpcUrl);
+    if (candidates.length > 0) {
+      const impl = await resolveImplementation(candidates, address).catch(() => null);
+      if (impl && impl.toLowerCase() !== address.toLowerCase()) {
+        const via = await fetchSourcify(chainId, impl).catch(() => null);
+        const fns = via ? callableFns(via.abi) : [];
+        if (via && fns.length > 0) {
+          return { address: impl, viaProxy: true, source: via.source, fns };
+        }
+      }
+    }
+    return null;
+  }
 
   const proxied = looksLikeProxy(direct.abi);
   // A proxy's own ABI only describes admin surface — strip it so users can't
@@ -259,9 +309,7 @@ async function resolve(chainId: number, address: string, rpcUrl: string | null):
     : callableFns(direct.abi);
 
   if (proxied || directFns.length === 0) {
-    const candidates = [...new Set<string>(
-      [rpcUrl, ...(RPC_FALLBACKS[chainId] ?? [])].filter((u): u is string => Boolean(u)),
-    )];
+    const candidates = rpcCandidates(chainId, rpcUrl);
     let impl: string | null = null;
     if (candidates.length > 0) {
       impl = await resolveImplementation(candidates, address).catch(() => null);

@@ -355,6 +355,113 @@ fn decode_rpc_error(e: &AppError) -> String {
     raw
 }
 
+/// Runtime bytecode as lowercase hex without `0x`, or `None` when the RPC can't say.
+async fn runtime_code(rpc_url: &str, address: &str) -> Option<String> {
+    let v = chain::rpc_call(
+        rpc_url,
+        "eth_getCode",
+        serde_json::json!([address, "latest"]),
+    )
+    .await
+    .ok()?;
+    let raw = v.get("result")?.as_str()?;
+    Some(raw.trim_start_matches("0x").to_ascii_lowercase())
+}
+
+/// EIP-1167 minimal proxy stub → implementation address. Handles the canonical
+/// variant plus the immutable-clones variant; anything else is not a stub.
+fn minimal_proxy_target(code_hex: &str) -> Option<String> {
+    const TAIL: &str = "5af43d82803e903d91602b57fd5bf3";
+    for prefix in ["363d3d373d3d3d363d73", "3d3d3d3d363d73"] {
+        if !code_hex.starts_with(prefix) {
+            continue;
+        }
+        if code_hex.len() != prefix.len() + 40 + TAIL.len() || !code_hex.ends_with(TAIL) {
+            continue;
+        }
+        let impl_hex = &code_hex[prefix.len()..prefix.len() + 40];
+        if impl_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(format!("0x{impl_hex}"));
+        }
+    }
+    None
+}
+
+/// Implementation address behind a proxy: EIP-1167 stub first, then the
+/// EIP-1967 and legacy Zeppelinos storage slots. `code_hex` is the target's
+/// already-fetched runtime code (non-empty).
+async fn proxy_implementation(rpc_url: &str, contract: &str, code_hex: &str) -> Option<String> {
+    if let Some(impl_addr) = minimal_proxy_target(code_hex) {
+        return Some(impl_addr);
+    }
+    const SLOTS: [&str; 2] = [
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+        "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3",
+    ];
+    for slot in SLOTS {
+        let Ok(v) = chain::rpc_call(
+            rpc_url,
+            "eth_getStorageAt",
+            serde_json::json!([contract, slot, "latest"]),
+        )
+        .await
+        else {
+            continue;
+        };
+        let Some(word) = v.get("result").and_then(|r| r.as_str()) else {
+            continue;
+        };
+        let hex = word.trim_start_matches("0x");
+        if hex.len() == 64 && hex.chars().any(|c| c != '0') {
+            return Some(format!("0x{}", &hex[24..]));
+        }
+    }
+    None
+}
+
+/// Empty revert data (`"data":"0x"`) tells the user nothing, so check whether
+/// the calldata selector is even implemented by the target (following proxies)
+/// and say so explicitly when it isn't. Returns `None` when the selector IS
+/// present (a real state/logic revert) or the probe itself failed.
+async fn diagnose_empty_revert(
+    endpoints: &[String],
+    contract: &str,
+    calldata: &str,
+) -> Option<String> {
+    let sel = calldata.get(2..10)?.to_ascii_lowercase();
+    if !sel.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let url = endpoints.first()?;
+    let code = runtime_code(url, contract).await?;
+    if code.is_empty() {
+        return Some(format!(
+            "{contract} has no runtime code on this chain — wrong address (EOA) or wrong chain"
+        ));
+    }
+    if code.contains(&sel) {
+        return None;
+    }
+    let impl_addr = proxy_implementation(url, contract, &code).await;
+    if let Some(ia) = &impl_addr {
+        if let Some(impl_code) = runtime_code(url, ia).await {
+            if impl_code.contains(&sel) {
+                return None;
+            }
+        }
+    }
+    Some(match impl_addr {
+        Some(ia) => format!(
+            "selector 0x{sel} is not in the runtime code of {contract} (proxy impl {ia}) — \
+             this contract does not implement that function; check the signature/ABI"
+        ),
+        None => format!(
+            "selector 0x{sel} is not in the runtime code of {contract} — \
+             this contract does not implement that function; check the signature/ABI"
+        ),
+    })
+}
+
 /// Core enqueue logic. `status` is `"pending"` (auto-run) or `"draft"` (manual promote).
 fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
     if !crate::vault::is_unlocked()? {
@@ -1235,7 +1342,16 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                 }
                 Err(e) => {
                     // Decode revert selectors into human-readable text.
-                    let msg = format!("eth_call via {url}: {}", decode_rpc_error(&e));
+                    let mut msg = format!("eth_call via {url}: {}", decode_rpc_error(&e));
+                    // Empty revert data ("0x") decodes to nothing useful — probe
+                    // whether the selector even exists on the target first.
+                    if msg.contains("without a readable reason") {
+                        if let Some(hint) =
+                            diagnose_empty_revert(&endpoints, &task.contract, &calldata).await
+                        {
+                            msg.push_str(&format!(" — {hint}"));
+                        }
+                    }
                     // Transient (network/RPC) errors → try next endpoint.
                     // Contract reverts → the call itself is invalid, no point
                     // retrying other nodes with the same payload.
@@ -1319,7 +1435,14 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                     break;
                 }
                 Err(e) => {
-                    let msg = format!("{url}: {}", decode_rpc_error(&e));
+                    let mut msg = format!("{url}: {}", decode_rpc_error(&e));
+                    if msg.contains("without a readable reason") {
+                        if let Some(hint) =
+                            diagnose_empty_revert(&endpoints, &task.contract, &calldata).await
+                        {
+                            msg.push_str(&format!(" — {hint}"));
+                        }
+                    }
                     if msg.to_ascii_lowercase().contains("revert") {
                         // Revert is deterministic — retrying other nodes won't help.
                         return fail(format!(
@@ -1724,6 +1847,32 @@ pub fn recover_stale_tasks() {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // EIP-1167 stub for 0x09a26fc8fcef18192e267d7a6da9dfb4be81dd6a — the
+    // implementation behind Robinhood Chain's 0x05780625… clone.
+    const EIP1167_STUB: &str = "363d3d373d3d3d363d7309a26fc8fcef18192e267d7a6da9dfb4be81dd6a5af43d82803e903d91602b57fd5bf3";
+
+    #[test]
+    fn detects_eip1167_minimal_proxy() {
+        assert_eq!(
+            minimal_proxy_target(EIP1167_STUB),
+            Some("0x09a26fc8fcef18192e267d7a6da9dfb4be81dd6a".into())
+        );
+        let variant = "3d3d3d3d363d7309a26fc8fcef18192e267d7a6da9dfb4be81dd6a5af43d82803e903d91602b57fd5bf3";
+        assert_eq!(
+            minimal_proxy_target(variant),
+            Some("0x09a26fc8fcef18192e267d7a6da9dfb4be81dd6a".into())
+        );
+    }
+
+    #[test]
+    fn ignores_non_stub_bytecode() {
+        assert_eq!(minimal_proxy_target("6080604052348015600f57600080fd5b50"), None);
+        assert_eq!(minimal_proxy_target(""), None);
+        // Right prefix, but not the canonical tail/length.
+        assert_eq!(minimal_proxy_target(&EIP1167_STUB[..80]), None);
+        assert_eq!(minimal_proxy_target(&format!("{EIP1167_STUB}ff")), None);
+    }
 
     #[test]
     fn builds_mint_no_args() {
