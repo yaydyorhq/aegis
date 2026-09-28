@@ -180,7 +180,7 @@ pub struct StageMatrixCell {
     pub price_usd: Option<f64>,
     /// Stage open time (unix ms) when OpenSea reports it.
     pub starts_at_ms: Option<i64>,
-    /// "live" | "not_started" | "unknown" — derived from starts_at_ms.
+    /// "live" | "not_started" | "ended" | "unknown" — derived from start/end times.
     pub live_status: String,
     /// Human hint: "Live now" / "Opens Sep 28 12:00 UTC" / "—".
     pub schedule_hint: String,
@@ -264,9 +264,12 @@ pub async fn eligibility_matrix_run(
                     let cells: Vec<StageMatrixCell> = results
                         .iter()
                         .map(|r| {
-                            // Actionable = eligible AND stage is open (live) or the
-                            // schedule is unknown (can't prove it's closed → allow).
-                            let actionable = r.eligible && r.live_status != "not_started";
+                            // Actionable = eligible AND the stage is open (live) or
+                            // the schedule is unknown (can't prove it's closed →
+                            // allow). Stages that already opened and closed, or
+                            // that have not opened yet, are never actionable.
+                            let actionable = r.eligible
+                                && matches!(r.live_status.as_str(), "live" | "unknown");
                             StageMatrixCell {
                                 stage_name: r.stage_type.clone(),
                                 eligible: r.eligible,

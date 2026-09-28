@@ -411,9 +411,9 @@ export interface StageMatrixCell {
   price_usd: number | null;
   /** Stage open time (unix ms) when OpenSea reports it. */
   starts_at_ms: number | null;
-  /** "live" | "not_started" | "unknown" */
+  /** "live" | "not_started" | "ended" | "unknown" */
   live_status: string;
-  /** Human hint: "Live now" / "Opens Sep 28 12:00 UTC" / "—" */
+  /** Human hint: "Live now" / "Opens Sep 28 12:00 UTC" / "Ended Sep 28 12:00 UTC" / "—" */
   schedule_hint: string;
   /** eligible AND live — only actionable cells can be queued. */
   actionable: boolean;

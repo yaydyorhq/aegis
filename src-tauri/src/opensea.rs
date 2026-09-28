@@ -6,7 +6,8 @@ use reqwest::cookie::Jar;
 use reqwest::header::{ACCEPT, ORIGIN, REFERER};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 const SITE_URL: &str = "https://opensea.io";
@@ -76,7 +77,8 @@ query DropEligibilityQuery($collectionSlug: String!, $address: Address!) {
       eligibleMinterAddress
       maxTotalMintableByWallet
       eligibleMaxTotalMintableByWallet
-      startsAt
+      startTime
+      endTime
       eligiblePrice {
         usd
         token {
@@ -99,6 +101,48 @@ query DropEligibilityQuery($collectionSlug: String!, $address: Address!) {
 
 fn os_err(msg: impl Into<String>) -> AppError {
     AppError::Other(format!("opensea: {}", msg.into()))
+}
+
+/// Stage windows only — no eligibility fields, so it needs no SIWE session.
+/// The persisted `DropEligibilityQuery` used by `fetch_stages` returns no
+/// times at all; this is how `startTime`/`endTime` actually reach the app.
+const STAGE_TIMES_QUERY: &str = r"
+query DropStageTimesQuery($collectionSlug: String!) {
+  dropBySlug(slug: $collectionSlug) {
+    __typename
+    stages {
+      __typename
+      stageType
+      stageIndex
+      startTime
+      endTime
+    }
+  }
+}
+";
+
+/// Cached stage windows per slug. Times are wallet-independent, so one fetch
+/// serves every wallet and every plan call for `STAGE_TIMES_TTL_MS`. `times:
+/// None` means the last fetch failed — still served for the TTL so a broken
+/// endpoint does not add a roundtrip to every stage read.
+static STAGE_TIMES_CACHE: once_cell::sync::Lazy<Mutex<HashMap<String, StageTimesEntry>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+const STAGE_TIMES_TTL_MS: i64 = 60_000;
+
+struct StageTimesEntry {
+    fetched_at_ms: i64,
+    times: Option<HashMap<(String, u32), StageTimes>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct StageTimes {
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+}
+
+fn lock_times<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn validate_slug(slug: &str) -> AppResult<()> {
@@ -153,8 +197,8 @@ fn parse_json_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-/// OpenSea `startsAt` may be unix seconds, unix ms, or an ISO-8601 string.
-fn parse_starts_at_ms(v: &serde_json::Value) -> Option<i64> {
+/// OpenSea stage `startTime`/`endTime` may be unix seconds, unix ms, or an ISO-8601 string.
+fn parse_stage_time_ms(v: &serde_json::Value) -> Option<i64> {
     match v {
         serde_json::Value::Number(n) => {
             let x = n.as_i64()?;
@@ -181,6 +225,13 @@ fn format_hint_future(ts_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ts_ms)
         .map(|d| format!("Opens {}", d.format("%b %d %H:%M UTC")))
         .unwrap_or_else(|| "Scheduled".into())
+}
+
+/// Format a past unix-ms timestamp as "Ended Sep 28 12:00 UTC".
+fn format_hint_past(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|d| format!("Ended {}", d.format("%b %d %H:%M UTC")))
+        .unwrap_or_else(|| "Ended".into())
 }
 
 fn deserialize_stage_index<'de, D>(d: D) -> Result<u32, D::Error>
@@ -292,6 +343,36 @@ struct EligibilityVariables {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StageTimesVariables {
+    collection_slug: String,
+}
+
+#[derive(Deserialize)]
+struct StageTimesQueryData {
+    #[serde(rename = "dropBySlug")]
+    drop_by_slug: Option<StageTimesDrop>,
+}
+
+#[derive(Deserialize)]
+struct StageTimesDrop {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    stages: Vec<StageTimesResp>,
+}
+
+#[derive(Deserialize)]
+struct StageTimesResp {
+    #[serde(rename = "stageType")]
+    stage_type: String,
+    #[serde(rename = "stageIndex", deserialize_with = "deserialize_stage_index")]
+    stage_index: u32,
+    #[serde(rename = "startTime", default)]
+    start_time: Option<serde_json::Value>,
+    #[serde(rename = "endTime", default)]
+    end_time: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct CollectionSearchVariables {
     query: String,
 }
@@ -322,8 +403,10 @@ struct StageEligibilityResp {
     max_total_mintable_by_wallet: Option<serde_json::Value>,
     #[serde(rename = "eligibleMaxTotalMintableByWallet", default)]
     eligible_max_total_mintable_by_wallet: Option<serde_json::Value>,
-    #[serde(rename = "startsAt", default)]
+    #[serde(rename = "startTime", default)]
     starts_at: Option<serde_json::Value>,
+    #[serde(rename = "endTime", default)]
+    ends_at: Option<serde_json::Value>,
     #[serde(rename = "eligiblePrice", default)]
     eligible_price: Option<EligiblePriceResp>,
 }
@@ -346,6 +429,8 @@ pub struct StageAssessment {
     pub price_usd: Option<f64>,
     /// Stage open time in unix ms when reported.
     pub starts_at_ms: Option<i64>,
+    /// Stage close time in unix ms when reported (None = unknown / no end).
+    pub ends_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -655,7 +740,7 @@ impl OpenSeaClient {
                 });
             if !persisted_retry {
                 let data = decode_envelope(env)?;
-                return Ok(map_stages(data));
+                return Ok(self.with_stage_times(slug, map_stages(data)).await);
             }
         }
 
@@ -681,7 +766,79 @@ impl OpenSeaClient {
         let env: GraphQlEnvelope<EligibilityQueryData> =
             serde_json::from_str(&text).map_err(|_| os_err("eligibility decode"))?;
         let data = decode_envelope(env)?;
-        Ok(map_stages(data))
+        Ok(self.with_stage_times(slug, map_stages(data)).await)
+    }
+
+    /// The persisted eligibility query carries no `startTime`/`endTime`, so
+    /// timing comes from a separate per-slug query (cached, wallet-free).
+    async fn with_stage_times(
+        &self,
+        slug: &str,
+        mut stages: Vec<StageAssessment>,
+    ) -> Vec<StageAssessment> {
+        if stages
+            .iter()
+            .any(|s| s.starts_at_ms.is_none() || s.ends_at_ms.is_none())
+        {
+            let times = self.stage_times(slug).await;
+            merge_stage_times(&mut stages, &times);
+        }
+        stages
+    }
+
+    /// Cached stage windows for one slug. A failed fetch is cached too (as
+    /// empty) for the TTL, so a broken endpoint costs one roundtrip per TTL.
+    async fn stage_times(&self, slug: &str) -> HashMap<(String, u32), StageTimes> {
+        let now = crate::db::now_ms();
+        {
+            let cache = lock_times(&STAGE_TIMES_CACHE);
+            if let Some(entry) = cache.get(slug) {
+                if now.saturating_sub(entry.fetched_at_ms) < STAGE_TIMES_TTL_MS {
+                    return entry.times.clone().unwrap_or_default();
+                }
+            }
+        }
+        let times = self.load_stage_times(slug).await;
+        lock_times(&STAGE_TIMES_CACHE).insert(
+            slug.to_string(),
+            StageTimesEntry {
+                fetched_at_ms: crate::db::now_ms(),
+                times: times.clone(),
+            },
+        );
+        times.unwrap_or_default()
+    }
+
+    /// One unauthenticated query for stage windows. `None` = anything went
+    /// wrong; callers treat it as "no times known".
+    async fn load_stage_times(&self, slug: &str) -> Option<HashMap<(String, u32), StageTimes>> {
+        validate_slug(slug).ok()?;
+        let referer = self.collection_referer(slug).ok()?;
+        let variables = StageTimesVariables {
+            collection_slug: slug.to_string(),
+        };
+        let body = GraphQlRequest {
+            operation_name: "DropStageTimesQuery",
+            query: STAGE_TIMES_QUERY,
+            variables: &variables,
+        };
+        let resp = self
+            .client
+            .post(GRAPHQL_URL)
+            .header(ACCEPT, "application/json")
+            .header(ORIGIN, origin())
+            .header(REFERER, referer.as_str())
+            .header("x-app-id", APP_ID)
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = limited_text(resp, GQL_LIMIT).await.ok()?;
+        let env: GraphQlEnvelope<StageTimesQueryData> = serde_json::from_str(&text).ok()?;
+        parse_stage_times(env)
     }
 
     /// Fetch OpenSea `MintActionTimelineQuery` calldata for an authenticated session.
@@ -784,11 +941,33 @@ impl OpenSeaClient {
             .unwrap_or(0);
         let eligible_stages: Vec<&StageAssessment> =
             stages.iter().filter(|s| s.is_eligible.unwrap_or(false)).collect();
-        let live_stage = eligible_stages
-            .iter()
-            .find(|s| s.starts_at_ms.map(|t| t <= now_ms).unwrap_or(true));
+        let is_open = |s: &&StageAssessment| {
+            s.starts_at_ms.map(|t| t <= now_ms).unwrap_or(true)
+                && !s.ends_at_ms.map(|t| t <= now_ms).unwrap_or(false)
+        };
+        let live_stage = eligible_stages.iter().find(|s| is_open(s));
         if live_stage.is_none() {
-            // Everything eligible is scheduled for later (or unknown).
+            if eligible_stages.is_empty() {
+                return Err(os_err("no eligible OpenSea stage for this wallet"));
+            }
+            // Every eligible stage has already closed — say so instead of
+            // implying the drop is still upcoming.
+            let all_ended = eligible_stages.iter().all(|s| {
+                s.ends_at_ms
+                    .map(|t| t <= now_ms)
+                    .unwrap_or(false)
+            });
+            if all_ended {
+                let hint = eligible_stages
+                    .iter()
+                    .filter_map(|s| s.ends_at_ms)
+                    .max()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|d| format!("drop already ended {}", d.format("%Y-%m-%d %H:%M UTC")))
+                    .unwrap_or_else(|| "drop already ended".into());
+                return Err(os_err(hint));
+            }
+            // Everything eligible is scheduled for later.
             let next = eligible_stages
                 .iter()
                 .filter_map(|s| s.starts_at_ms)
@@ -1087,9 +1266,49 @@ fn map_stages(data: EligibilityQueryData) -> Vec<StageAssessment> {
                 .as_ref()
                 .and_then(|p| p.usd.as_ref())
                 .and_then(parse_json_f64),
-            starts_at_ms: s.starts_at.as_ref().and_then(parse_starts_at_ms),
+            starts_at_ms: s.starts_at.as_ref().and_then(parse_stage_time_ms),
+            ends_at_ms: s.ends_at.as_ref().and_then(parse_stage_time_ms),
         })
         .collect()
+}
+
+/// Decode the stage-times response; `None` on any error (bad body, GraphQL errors).
+fn parse_stage_times(
+    env: GraphQlEnvelope<StageTimesQueryData>,
+) -> Option<HashMap<(String, u32), StageTimes>> {
+    let data = decode_envelope(env).ok()?;
+    let drop = data.drop_by_slug?;
+    Some(
+        drop.stages
+            .into_iter()
+            .map(|s| {
+                (
+                    (s.stage_type, s.stage_index),
+                    StageTimes {
+                        start_ms: s.start_time.as_ref().and_then(parse_stage_time_ms),
+                        end_ms: s.end_time.as_ref().and_then(parse_stage_time_ms),
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Fill times the eligibility query did not report, keyed by (type, index).
+fn merge_stage_times(
+    stages: &mut [StageAssessment],
+    times: &HashMap<(String, u32), StageTimes>,
+) {
+    for s in stages.iter_mut() {
+        if let Some(t) = times.get(&(s.stage_type.clone(), s.stage_index)) {
+            if s.starts_at_ms.is_none() {
+                s.starts_at_ms = t.start_ms;
+            }
+            if s.ends_at_ms.is_none() {
+                s.ends_at_ms = t.end_ms;
+            }
+        }
+    }
 }
 
 fn decode_envelope<T>(env: GraphQlEnvelope<T>) -> AppResult<T> {
@@ -1175,17 +1394,19 @@ pub fn assess_stages(stages: &[StageAssessment]) -> (bool, String) {
 /// Best stage to mint: private eligible first (FCFS/presale), else open PUBLIC_SALE.
 /// Among eligible private stages prefer paid (FCFS with price) over free (GTD),
 /// then prefer a stage that has already opened (or whose start is unknown).
+/// Stages whose `endTime` has passed are skipped — minting them reverts.
 pub fn pick_eligible_stage(stages: &[StageAssessment]) -> Option<&StageAssessment> {
+    let now = crate::db::now_ms();
+    let not_ended = |s: &&StageAssessment| !s.ends_at_ms.map(|t| t <= now).unwrap_or(false);
     let private: Vec<&StageAssessment> = stages
         .iter()
-        .filter(|s| s.stage_type != "PUBLIC_SALE" && s.is_eligible == Some(true))
+        .filter(|s| s.stage_type != "PUBLIC_SALE" && s.is_eligible == Some(true) && not_ended(s))
         .collect();
     if !private.is_empty() {
         let is_paid = |s: &&StageAssessment| s.price_usd.map(|p| p > 0.0).unwrap_or(false);
         if let Some(paid) = private.iter().find(|s| is_paid(s)) {
-            return Some(paid);
+            return Some(*paid);
         }
-        let now = crate::db::now_ms();
         let open_or_unknown = private
             .iter()
             .find(|s| s.starts_at_ms.map(|t| t <= now).unwrap_or(true));
@@ -1193,7 +1414,7 @@ pub fn pick_eligible_stage(stages: &[StageAssessment]) -> Option<&StageAssessmen
     }
     stages
         .iter()
-        .find(|s| s.stage_type == "PUBLIC_SALE" && s.is_eligible != Some(false))
+        .find(|s| s.stage_type == "PUBLIC_SALE" && s.is_eligible != Some(false) && not_ended(s))
 }
 
 /// Resolve collection once, then plan a single-wallet OpenSea stage mint.
@@ -1237,7 +1458,10 @@ pub struct WalletStageResult {
     pub price_usd: Option<f64>,
     /// Stage open time (unix ms). None = unknown / not reported.
     pub starts_at_ms: Option<i64>,
-    /// Computed from starts_at_ms vs current time: "live", "not_started", or "unknown".
+    /// Stage close time (unix ms). None = unknown / not reported.
+    pub ends_at_ms: Option<i64>,
+    /// Computed from starts_at_ms/ends_at_ms vs current time: "live",
+    /// "not_started", "ended", or "unknown".
     pub live_status: String,
     /// Human-readable schedule hint: "Opens Sep 28 12:00 UTC" / "Live now" / "—".
     pub schedule_hint: String,
@@ -1285,12 +1509,12 @@ pub async fn check_wallet_stages(
         .into_iter()
         .map(|s| {
             let starts_at = s.starts_at_ms;
-            let (live_status, schedule_hint) = match starts_at {
-                Some(ts) if ts > now_ms => {
-                    ("not_started".to_string(), format_hint_future(ts))
-                }
-                Some(_) => ("live".to_string(), "Live now".to_string()),
-                None => ("unknown".to_string(), "—".to_string()),
+            let ends_at = s.ends_at_ms;
+            let (live_status, schedule_hint) = match (starts_at, ends_at) {
+                (_, Some(e)) if e <= now_ms => ("ended".to_string(), format_hint_past(e)),
+                (Some(t), _) if t > now_ms => ("not_started".to_string(), format_hint_future(t)),
+                (Some(_), _) => ("live".to_string(), "Live now".to_string()),
+                (None, _) => ("unknown".to_string(), "—".to_string()),
             };
             WalletStageResult {
                 stage_type: s.stage_type,
@@ -1300,6 +1524,7 @@ pub async fn check_wallet_stages(
                     .or(s.max_total_mintable_by_wallet),
                 price_usd: s.price_usd,
                 starts_at_ms: starts_at,
+                ends_at_ms: ends_at,
                 live_status,
                 schedule_hint,
             }
@@ -1496,5 +1721,140 @@ mod tests {
         assert!(validate_stage_calldata(&cd, &resolved, &wallet, "SIGNED_PRESALE", 3, 1).is_err());
         assert!(validate_stage_calldata(&cd, &resolved, &wallet, "SIGNED_PRESALE", 2, 2).is_err());
         assert!(validate_stage_calldata(&cd, &resolved, &wallet, "PUBLIC_SALE", 2, 1).is_err());
+    }
+
+    #[test]
+    fn parses_stage_start_and_end_times() {
+        // Real DropEligibilityQuery shape: startTime/endTime are ISO-8601.
+        let body = r#"{
+          "data": {
+            "dropBySlug": {
+              "stages": [
+                {
+                  "stageType": "SIGNED_PRESALE",
+                  "stageIndex": 1,
+                  "isEligible": true,
+                  "eligibleMinterAddress": null,
+                  "maxTotalMintableByWallet": 44,
+                  "eligibleMaxTotalMintableByWallet": null,
+                  "startTime": "2026-09-28T21:25:00.000Z",
+                  "endTime": "2026-09-28T21:55:00.000Z",
+                  "eligiblePrice": null
+                },
+                {
+                  "stageType": "PUBLIC_SALE",
+                  "stageIndex": 0,
+                  "isEligible": null,
+                  "eligibleMinterAddress": null,
+                  "maxTotalMintableByWallet": 111,
+                  "eligibleMaxTotalMintableByWallet": null,
+                  "startTime": "2026-09-28T21:56:00.000Z",
+                  "endTime": null,
+                  "eligiblePrice": null
+                }
+              ]
+            }
+          }
+        }"#;
+        let env: GraphQlEnvelope<EligibilityQueryData> = serde_json::from_str(body).unwrap();
+        let stages = map_stages(decode_envelope(env).unwrap());
+        assert_eq!(stages.len(), 2);
+        // 2026-09-28T21:25:00Z / 21:55:00Z / 21:56:00Z
+        assert_eq!(stages[0].starts_at_ms, Some(1_790_630_700_000));
+        assert_eq!(stages[0].ends_at_ms, Some(1_790_632_500_000));
+        assert_eq!(stages[1].starts_at_ms, Some(1_790_632_560_000));
+        assert_eq!(stages[1].ends_at_ms, None);
+    }
+
+    #[test]
+    fn skips_ended_stages_when_picking() {
+        let now = crate::db::now_ms();
+        let stages = vec![
+            StageAssessment {
+                stage_type: "SIGNED_PRESALE".into(),
+                stage_index: 1,
+                is_eligible: Some(true),
+                starts_at_ms: Some(now - 600_000),
+                ends_at_ms: Some(now - 60_000), // closed a minute ago
+                ..Default::default()
+            },
+            StageAssessment {
+                stage_type: "PUBLIC_SALE".into(),
+                stage_index: 0,
+                is_eligible: Some(true),
+                starts_at_ms: Some(now - 60_000),
+                ..Default::default()
+            },
+        ];
+        let picked = pick_eligible_stage(&stages).expect("public stage is open");
+        assert_eq!(picked.stage_type, "PUBLIC_SALE");
+    }
+
+    #[test]
+    fn stage_times_query_parses_and_merges() {
+        let body = r#"{
+          "data": {
+            "dropBySlug": {
+              "stages": [
+                {
+                  "stageType": "SIGNED_PRESALE",
+                  "stageIndex": 1,
+                  "startTime": "2026-09-28T21:25:00.000Z",
+                  "endTime": "2026-09-28T21:55:00.000Z"
+                },
+                {
+                  "stageType": "PUBLIC_SALE",
+                  "stageIndex": 0,
+                  "startTime": "2026-09-28T21:56:00.000Z",
+                  "endTime": null
+                }
+              ]
+            }
+          }
+        }"#;
+        let env: GraphQlEnvelope<StageTimesQueryData> = serde_json::from_str(body).unwrap();
+        let times = parse_stage_times(env).expect("times decode");
+        assert_eq!(times.len(), 2);
+
+        let mut stages = vec![
+            StageAssessment {
+                stage_type: "SIGNED_PRESALE".into(),
+                stage_index: 1,
+                ..Default::default()
+            },
+            StageAssessment {
+                stage_type: "PUBLIC_SALE".into(),
+                stage_index: 0,
+                ..Default::default()
+            },
+            StageAssessment {
+                // No entry in the times response — stays untouched.
+                stage_type: "SIGNED_PRESALE".into(),
+                stage_index: 2,
+                ..Default::default()
+            },
+        ];
+        merge_stage_times(&mut stages, &times);
+        assert_eq!(stages[0].starts_at_ms, Some(1_790_630_700_000));
+        assert_eq!(stages[0].ends_at_ms, Some(1_790_632_500_000));
+        assert_eq!(stages[1].starts_at_ms, Some(1_790_632_560_000));
+        assert_eq!(stages[1].ends_at_ms, None);
+        assert_eq!(stages[2].starts_at_ms, None);
+        assert_eq!(stages[2].ends_at_ms, None);
+
+        // Times already known from the eligibility query are never overwritten.
+        stages[0].starts_at_ms = Some(1);
+        merge_stage_times(&mut stages, &times);
+        assert_eq!(stages[0].starts_at_ms, Some(1));
+    }
+
+    #[test]
+    fn stage_times_query_rejects_graphql_errors() {
+        let body = r#"{
+          "errors": [{ "message": "Access denied" }],
+          "data": null
+        }"#;
+        let env: GraphQlEnvelope<StageTimesQueryData> = serde_json::from_str(body).unwrap();
+        assert!(parse_stage_times(env).is_none());
     }
 }
