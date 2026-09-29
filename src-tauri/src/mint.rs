@@ -42,6 +42,10 @@ pub struct MintTaskRow {
     pub auto_retries: i64,
     /// JSON `{collection, token_id}`: resolve SeaDrop mint data at fire time.
     pub opensea_ref: Option<String>,
+    /// Hash of the tx this one replaced after a fee bump (also polled).
+    pub prev_tx_hash: Option<String>,
+    /// How many times a stuck broadcast has been re-signed with a higher fee.
+    pub bump_count: i64,
 }
 
 #[derive(Clone, Default)]
@@ -123,6 +127,11 @@ fn spawn_receipt_poll(id: i64) {
         }
         let _release = Release(id);
         if let Err(e) = process_task(id).await {
+            release_task_nonce(id);
+            crate::logging::error(
+                "mint.poll",
+                &format!("Mint #{id} receipt poll error: {e}"),
+            );
             set_status(id, "failed", None, Some(&e.to_string()));
             wallet_store::log_activity(
                 "mint.failed",
@@ -153,7 +162,7 @@ pub fn count_runnable() -> AppResult<i64> {
     })
 }
 
-const SELECT_COLS: &str = "id, chain_id, contract, quantity, value_wei, calldata, status, tx_hash, error, wallet_id, created_at, updated_at, function_name, is_hex, parameters, rpc_endpoints, flashbots, gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override, scheduled_at, delay_ms, mode, poll_attempts, auto_retries, opensea_ref";
+const SELECT_COLS: &str = "id, chain_id, contract, quantity, value_wei, calldata, status, tx_hash, error, wallet_id, created_at, updated_at, function_name, is_hex, parameters, rpc_endpoints, flashbots, gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override, scheduled_at, delay_ms, mode, poll_attempts, auto_retries, opensea_ref, prev_tx_hash, bump_count";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
     Ok(MintTaskRow {
@@ -184,6 +193,8 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
         poll_attempts: r.get(24)?,
         auto_retries: r.get(25)?,
         opensea_ref: r.get(26)?,
+        prev_tx_hash: r.get(27)?,
+        bump_count: r.get(28)?,
     })
 }
 
@@ -282,7 +293,7 @@ fn is_permanent_err(msg: &str) -> bool {
 }
 
 /// Transient errors worth one automatic requeue (never reverts/param errors).
-fn is_transient_err(msg: &str) -> bool {
+pub(crate) fn is_transient_err(msg: &str) -> bool {
     if is_permanent_err(msg) {
         return false;
     }
@@ -860,7 +871,8 @@ pub async fn retry_task(id: i64) -> AppResult<MintTaskRow> {
                     "tx {hash} is still in the mempool — wait for it, re-signing would replace it"
                 )));
             }
-            Ok(TxVerdict::Reverted) | Ok(TxVerdict::Safe) => {}
+            Ok(TxVerdict::Safe) => release_task_nonce(id),
+            Ok(TxVerdict::Reverted) => {}
             Err(e) => {
                 return Err(AppError::Invalid(format!(
                     "cannot verify tx {hash}: {e} — not retrying"
@@ -872,8 +884,9 @@ pub async fn retry_task(id: i64) -> AppResult<MintTaskRow> {
     let n = crate::db::with_conn(|conn| {
         Ok(conn.execute(
             "UPDATE mint_tasks
-                SET status='pending', error=NULL, tx_hash=NULL,
-                    poll_attempts=0, auto_retries=0, updated_at=?1
+                SET status='pending', error=NULL, tx_hash=NULL, prev_tx_hash=NULL,
+                    bump_count=0, tx_nonce=NULL, poll_attempts=0, auto_retries=0,
+                    updated_at=?1
               WHERE id=?2 AND status IN ('failed','canceled','cancelled')",
             rusqlite::params![now, id],
         )?)
@@ -917,14 +930,16 @@ pub async fn retry_all_failed() -> AppResult<i64> {
                     skipped += 1;
                     continue;
                 }
-                Ok(TxVerdict::Safe) | Ok(TxVerdict::Reverted) => {}
+                Ok(TxVerdict::Safe) => release_task_nonce(task.id),
+                Ok(TxVerdict::Reverted) => {}
             }
         }
         let cleared = crate::db::with_conn(|conn| {
             Ok(conn.execute(
                 "UPDATE mint_tasks
-                    SET status='pending', error=NULL, tx_hash=NULL,
-                        poll_attempts=0, auto_retries=0, updated_at=?1
+                    SET status='pending', error=NULL, tx_hash=NULL, prev_tx_hash=NULL,
+                        bump_count=0, tx_nonce=NULL, poll_attempts=0, auto_retries=0,
+                        updated_at=?1
                   WHERE id=?2 AND status IN ('failed','canceled','cancelled')",
                 rusqlite::params![now, task.id],
             )?)
@@ -1006,6 +1021,29 @@ fn set_status(id: i64, status: &str, tx_hash: Option<&str>, error: Option<&str>)
         )?;
         Ok(())
     });
+}
+
+/// Hand this task's reserved nonce back to the shared allocator.
+///
+/// Called from terminal failure paths. Safe even when the tx did land: the
+/// next reserve reads the chain's `pending` count, sees the higher number and
+/// re-adopts it — the rewind is immediately overwritten.
+fn release_task_nonce(id: i64) {
+    let row = crate::db::with_conn(|conn| {
+        let r: rusqlite::Result<(i64, i64, Option<i64>)> = conn.query_row(
+            "SELECT COALESCE(wallet_id, 0), chain_id, tx_nonce FROM mint_tasks WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+        Ok(r.ok())
+    });
+    if let Ok(Some((wallet_id, chain_id, Some(nonce)))) = row {
+        crate::nonce::release(wallet_id, chain_id, nonce as u64);
+        crate::logging::info(
+            "mint.nonce",
+            &format!("Mint #{id}: released unused nonce {nonce}"),
+        );
+    }
 }
 
 fn validate_signature(sig: &str) -> AppResult<()> {
@@ -1657,6 +1695,14 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             Ok(())
         });
         if attempts > MAX_POLL_ATTEMPTS {
+            // Nothing mined after ~20m: the nonce is either free (tx dropped)
+            // or consumed (it landed and we lost the receipt) — releasing is
+            // safe in both cases, the next reserve adopts the chain's count.
+            release_task_nonce(id);
+            crate::logging::warn(
+                "mint.poll",
+                &format!("Mint #{id}: gave up waiting for receipt of {:?}", task.tx_hash),
+            );
             set_status(
                 id,
                 "failed",
@@ -1666,7 +1712,30 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             return get_task(id);
         }
         if let Some(hash) = task.tx_hash.clone() {
-            return poll_receipt(id, &hash).await;
+            let out = poll_receipt(id, &hash).await;
+            // A full window with no verdict means the tx is stuck: replace it
+            // with a higher-fee version (same nonce, so only one can mine).
+            // Windows are ~30s; bumps land on window 1, 3 and 5.
+            let mut bumped = false;
+            if let Ok(t) = &out {
+                if t.status == "broadcasting"
+                    && t.bump_count < MAX_BUMPS
+                    && attempts >= 1 + t.bump_count * 2
+                {
+                    match bump_stuck_tx(id).await {
+                        Ok(Some(_)) => bumped = true,
+                        Ok(None) => {}
+                        Err(e) => crate::logging::warn(
+                            "mint.bump",
+                            &format!("Mint #{id}: bump error: {e}"),
+                        ),
+                    }
+                }
+            }
+            if bumped {
+                return get_task(id);
+            }
+            return out;
         }
         set_status(id, "failed", None, Some("broadcasting without tx_hash"));
         return get_task(id);
@@ -1716,8 +1785,11 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         });
         if let Ok(Some(hash)) = stamped {
             if is_permanent_err(&msg) {
+                // Node rejected it — the nonce never entered a mempool.
+                release_task_nonce(id);
                 // set_status keeps the hash via COALESCE for audit/retry safety.
                 set_status(id, "failed", None, Some(&msg));
+                crate::logging::error("mint", &format!("Mint #{id} rejected: {msg}"));
                 wallet_store::log_activity(
                     "mint.failed",
                     &format!("Mint #{id} rejected: {msg} (tx {hash} was not accepted)"),
@@ -1741,6 +1813,8 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         // Transient transport/RPC errors get one immediate requeue so a single
         // blip doesn't kill a scheduled FCFS task. Reverts/bad params still fail.
         if task.auto_retries < 1 && is_transient_err(&msg) {
+            // Nothing was accepted (no stamp) — the retry re-signs from scratch.
+            release_task_nonce(id);
             let now = crate::db::now_ms();
             let _ = crate::db::with_conn(|conn| {
                 conn.execute(
@@ -1757,7 +1831,9 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             );
             return get_task(id);
         }
+        release_task_nonce(id);
         set_status(id, "failed", None, Some(&msg));
+        crate::logging::error("mint", &format!("Mint #{id} failed: {msg}"));
         wallet_store::log_activity(
             "mint.failed",
             &format!("Mint #{id} failed: {msg}"),
@@ -1927,17 +2003,9 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     for url in &endpoints {
         let rpc = url.clone();
         let addr = wallet.address.clone();
-        let override_nonce = task.nonce_override.clone();
         let (cid, res, gp) = tokio::join!(
             chain::eth_chain_id(url),
-            async move {
-                match override_nonce.as_deref() {
-                    Some(n) => n
-                        .parse::<u64>()
-                        .map_err(|_| AppError::Invalid(format!("bad nonce override: {n}"))),
-                    None => chain::get_transaction_count(&rpc, &addr).await,
-                }
-            },
+            chain::get_transaction_count(&rpc, &addr),
             async {
                 if need_gas_price {
                     chain::gas_price(url).await.map(Some)
@@ -1971,7 +2039,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             }
         }
     }
-    let nonce = match nonce {
+    let chain_nonce = match nonce {
         Some(n) => n,
         None => {
             return fail(format!(
@@ -1981,6 +2049,25 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             ))
         }
     };
+    // Reserve through the shared allocator: the fund runner or another lane
+    // may already have taken this wallet's next nonce after our chain read.
+    let override_nonce = match task.nonce_override.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(_) => return fail(format!("bad nonce override: {s}")),
+        },
+        _ => None,
+    };
+    let nonce = crate::nonce::reserve(wallet_id, task.chain_id, chain_nonce, override_nonce);
+    // Remember it on the row: every terminal path must be able to hand the
+    // reservation back without threading the value through each closure.
+    let _ = crate::db::with_conn(|conn| {
+        conn.execute(
+            "UPDATE mint_tasks SET tx_nonce=?1 WHERE id=?2",
+            rusqlite::params![nonce as i64, id],
+        )?;
+        Ok(())
+    });
 
     let gas = if let Some(gl) = &task.gas_limit {
         match gl.parse::<u64>() {
@@ -2233,58 +2320,86 @@ async fn poll_receipt(id: i64, hash: &str) -> AppResult<MintTaskRow> {
             return get_task(id);
         }
     };
-    let poll_url = parse_rpc_list(&task, &chain_row.rpc_url)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| chain_row.rpc_url.clone());
+    // Rotate across every endpoint, not just the first: one dead provider must
+    // not blind the poll, and a fee-bumped replacement may only be known to the
+    // node that accepted it. Both the current and the replaced hash are checked
+    // — either one can be the one that mines (same nonce, so never both).
+    let endpoints = parse_rpc_list(&task, &chain_row.rpc_url);
+    let prev = task.prev_tx_hash.clone();
+    let mut start = 0usize;
     let mut consecutive_errs = 0u32;
     for _ in 0..15 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match chain::get_receipt(&poll_url, hash).await {
-            Ok(Some(receipt)) => {
-                let status = receipt
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("0x1");
-                if status == "0x1" {
-                    set_status(id, "confirmed", Some(hash), None);
-                    wallet_store::log_activity(
-                        "mint.confirmed",
-                        &format!("Mint #{id} confirmed {hash}"),
-                        None,
-                        true,
-                    );
-                } else {
-                    set_status(id, "failed", Some(hash), Some("reverted on-chain"));
-                    wallet_store::log_activity(
-                        "mint.failed",
-                        &format!("Mint #{id} reverted {hash}"),
-                        None,
-                        false,
-                    );
+        let mut answered = false;
+        for k in 0..endpoints.len().max(1) {
+            let url = &endpoints[(start + k) % endpoints.len().max(1)];
+            let mut endpoint_ok = false;
+            let mut hashes: Vec<&str> = vec![hash];
+            if let Some(p) = prev.as_deref() {
+                if p != hash {
+                    hashes.push(p);
                 }
+            }
+            for h in &hashes {
+                match chain::get_receipt(url, h).await {
+                    Ok(Some(receipt)) => {
+                        let status = receipt
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("0x1");
+                        let which = if *h == hash { "" } else { " (fee-bumped tx)" };
+                        if status == "0x1" {
+                            set_status(id, "confirmed", Some(h), None);
+                            wallet_store::log_activity(
+                                "mint.confirmed",
+                                &format!("Mint #{id} confirmed {h}{which}"),
+                                None,
+                                true,
+                            );
+                            crate::logging::info("mint", &format!("Mint #{id} confirmed {h}"));
+                        } else {
+                            set_status(id, "failed", Some(h), Some("reverted on-chain"));
+                            crate::logging::error("mint", &format!("Mint #{id} reverted {h}"));
+                            wallet_store::log_activity(
+                                "mint.failed",
+                                &format!("Mint #{id} reverted {h}{which}"),
+                                None,
+                                false,
+                            );
+                        }
+                        return get_task(id);
+                    }
+                    Ok(None) => endpoint_ok = true,
+                    Err(_) => {}
+                }
+            }
+            if endpoint_ok {
+                answered = true;
+                break;
+            }
+        }
+        start = start.wrapping_add(1);
+        if answered {
+            consecutive_errs = 0;
+        } else {
+            // Transient RPC hiccups must not abort the whole poll window —
+            // only give up after several cycles where every endpoint failed.
+            consecutive_errs += 1;
+            if consecutive_errs >= 5 {
+                let msg = format!(
+                    "receipt retry: all {} endpoint(s) failing",
+                    endpoints.len()
+                );
+                crate::logging::warn("mint.poll", &format!("Mint #{id}: {msg}"));
+                set_status(id, "broadcasting", Some(hash), Some(&msg));
                 return get_task(id);
-            }
-            Ok(None) => {
-                consecutive_errs = 0;
-                continue;
-            }
-            Err(e) => {
-                // Transient RPC hiccups must not abort the whole poll window —
-                // only give up after several consecutive failures.
-                consecutive_errs += 1;
-                if consecutive_errs >= 5 {
-                    set_status(
-                        id,
-                        "broadcasting",
-                        Some(hash),
-                        Some(&format!("receipt retry: {e}")),
-                    );
-                    return get_task(id);
-                }
             }
         }
     }
+    crate::logging::info(
+        "mint.poll",
+        &format!("Mint #{id}: receipt window elapsed, will re-poll"),
+    );
     set_status(
         id,
         "broadcasting",
@@ -2292,6 +2407,184 @@ async fn poll_receipt(id: i64, hash: &str) -> AppResult<MintTaskRow> {
         Some("timeout waiting for receipt — will re-poll on next run"),
     );
     get_task(id)
+}
+
+/// A stuck broadcast may be re-signed this many times before we just wait.
+const MAX_BUMPS: i64 = 3;
+
+/// Replacement fee: compound +10% per step over the ORIGINAL fee, capped at
+/// 3x, and always strictly above it (nodes reject equal-fee replacements).
+fn bumped_fee(original: u128, steps: i64) -> u128 {
+    let mut fee = original;
+    for _ in 0..steps.max(0) {
+        fee = fee.saturating_mul(11) / 10;
+    }
+    fee.min(original.saturating_mul(3))
+        .max(original.saturating_add(1))
+}
+
+/// The pending tx as some node knows it — enough to re-sign the same payload.
+struct FetchedTx {
+    nonce: u64,
+    max_fee: u128,
+    tip: u128,
+    gas: u64,
+    value: u128,
+    to: String,
+    data: String,
+}
+
+fn hex_field<T: std::str::FromStr>(v: &serde_json::Value, key: &str) -> Option<T> {
+    let s = v.get(key)?.as_str()?;
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    T::from_str(digits).ok().or_else(|| {
+        // Decimal fallback for nodes that don't hex-encode quantity fields.
+        s.parse::<T>().ok()
+    })
+}
+
+async fn fetch_tx_for_bump(endpoints: &[String], hash: &str) -> Option<FetchedTx> {
+    for url in endpoints {
+        let v = match chain::rpc_call(url, "eth_getTransactionByHash", serde_json::json!([hash]))
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(tx) = v.get("result").filter(|r| !r.is_null()) else {
+            continue;
+        };
+        let to = tx.get("to").and_then(|t| t.as_str())?.to_string();
+        let data = tx
+            .get("input")
+            .and_then(|d| d.as_str())
+            .unwrap_or("0x")
+            .to_string();
+        return Some(FetchedTx {
+            nonce: hex_field(tx, "nonce")?,
+            max_fee: hex_field(tx, "maxFeePerGas")?,
+            tip: hex_field(tx, "maxPriorityFeePerGas")?,
+            gas: hex_field(tx, "gas")?,
+            value: hex_field(tx, "value").unwrap_or(0),
+            to,
+            data,
+        });
+    }
+    None
+}
+
+/// Re-sign the SAME transaction (identical nonce and payload) with a higher fee
+/// and rebroadcast. Because both versions share the nonce, at most one can ever
+/// mine — a bump can replace a stuck mint, never double it.
+async fn bump_stuck_tx(id: i64) -> AppResult<Option<String>> {
+    let task = get_task(id)?;
+    if task.status != "broadcasting" || task.bump_count >= MAX_BUMPS {
+        return Ok(None);
+    }
+    let Some(old_hash) = task.tx_hash.clone() else {
+        return Ok(None);
+    };
+    let chains = chain::list_chains()?;
+    let Some(chain_row) = chains.into_iter().find(|c| c.chain_id == task.chain_id) else {
+        return Ok(None);
+    };
+    let endpoints = parse_rpc_list(&task, &chain_row.rpc_url);
+    let Some(orig) = fetch_tx_for_bump(&endpoints, &old_hash).await else {
+        crate::logging::info(
+            "mint.bump",
+            &format!("Mint #{id}: tx {old_hash} unknown to every endpoint — not bumping"),
+        );
+        return Ok(None);
+    };
+    let steps = task.bump_count + 1;
+    let max_fee = bumped_fee(orig.max_fee, steps);
+    let mut tip = bumped_fee(orig.tip, steps);
+    if tip > max_fee {
+        tip = max_fee;
+    }
+
+    let Some(wallet_id) = task.wallet_id else {
+        return Ok(None);
+    };
+    let signer = (|| -> AppResult<_> {
+        let (nb, ct) = wallet_store::key_material(wallet_id)?;
+        crate::wallet::load_signer(&nb, &ct)
+    })()?;
+
+    let signed = sign_eip1559(
+        &signer,
+        SignParams {
+            to: &orig.to,
+            data_hex: &orig.data,
+            value: orig.value,
+            gas_limit: orig.gas,
+            nonce: orig.nonce,
+            chain_id: task.chain_id as u64,
+            max_fee,
+            tip,
+        },
+    )?;
+    let new_hash = {
+        let raw = hex::decode(signed.trim_start_matches("0x"))
+            .map_err(|_| AppError::Rpc("bump: signed tx not hex".into()))?;
+        format!("0x{}", hex::encode(alloy::primitives::keccak256(&raw)))
+    };
+    if new_hash == old_hash {
+        return Ok(None); // identical fees — nothing to replace
+    }
+
+    let mut accepted = false;
+    let mut last_err: Option<String> = None;
+    for url in &endpoints {
+        match chain::send_raw_transaction(url, &signed).await {
+            Ok(_) => {
+                accepted = true;
+                break;
+            }
+            Err(e) => {
+                let s = e.to_string().to_ascii_lowercase();
+                if s.contains("already known")
+                    || s.contains("known transaction")
+                    || s.contains("already exists")
+                {
+                    accepted = true;
+                    break;
+                }
+                last_err = Some(chain::redact_urls_in(&e.to_string()));
+            }
+        }
+    }
+    if !accepted {
+        crate::logging::warn(
+            "mint.bump",
+            &format!(
+                "Mint #{id}: bump rejected — {}",
+                last_err.unwrap_or_else(|| "no endpoint accepted it".into())
+            ),
+        );
+        return Ok(None);
+    }
+
+    // Swap in the new hash and remember the old one: the receipt poll watches
+    // both, because either version (never two) is what will mine.
+    crate::db::with_conn(|conn| {
+        conn.execute(
+            "UPDATE mint_tasks SET tx_hash=?1, prev_tx_hash=?2, bump_count=bump_count+1, error=NULL, updated_at=?3 WHERE id=?4",
+            rusqlite::params![new_hash, old_hash, crate::db::now_ms(), id],
+        )?;
+        Ok(())
+    })?;
+    crate::logging::info(
+        "mint.bump",
+        &format!("Mint #{id}: fee bump #{steps} {old_hash} → {new_hash}"),
+    );
+    wallet_store::log_activity(
+        "mint.bump",
+        &format!("Mint #{id}: fee bumped (attempt {steps}) {old_hash} → {new_hash}"),
+        None,
+        true,
+    );
+    Ok(Some(new_hash))
 }
 
 fn parse_u128_hex_or_dec(s: &str) -> AppResult<u128> {
@@ -2400,6 +2693,8 @@ pub async fn run_pending() -> AppResult<Vec<MintTaskRow>> {
                 match process_task(id).await {
                     Ok(t) => out.push(t),
                     Err(e) => {
+                        release_task_nonce(id);
+                        crate::logging::error("mint", &format!("Mint #{id} error: {e}"));
                         set_status(id, "failed", None, Some(&e.to_string()));
                         wallet_store::log_activity(
                             "mint.failed",
@@ -2452,6 +2747,75 @@ mod tests {
     // EIP-1167 stub for 0x09a26fc8fcef18192e267d7a6da9dfb4be81dd6a — the
     // implementation behind Robinhood Chain's 0x05780625… clone.
     const EIP1167_STUB: &str = "363d3d373d3d3d363d7309a26fc8fcef18192e267d7a6da9dfb4be81dd6a5af43d82803e903d91602b57fd5bf3";
+
+    #[test]
+    fn bump_fee_compounds_and_caps() {
+        // +10% per step over the original, strictly above it, capped at 3x.
+        assert_eq!(bumped_fee(100, 1), 110);
+        assert_eq!(bumped_fee(100, 2), 121);
+        assert_eq!(bumped_fee(100, 3), 133);
+        assert!(bumped_fee(100, 0) > 100); // never equal — nodes reject that
+        assert_eq!(bumped_fee(1_000_000, 20), 3_000_000); // capped at 3x
+        assert_eq!(bumped_fee(1, 1), 2); // rounding cannot hand back the original
+        assert_eq!(bumped_fee(0, 1), 1);
+    }
+
+    /// Terminal failure hands the reserved nonce back, so the next task on the
+    /// same wallet signs the same nonce instead of a gap nobody consumes.
+    #[test]
+    fn terminal_failure_hands_the_nonce_back() {
+        let _serial = serial_guard();
+        fresh_db("nonce-rel");
+        ensure_unlocked();
+
+        let label = format!(
+            "rel-w-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let w = crate::wallet_store::create_wallet(&label, None).expect("wallet");
+        let task = enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: 8453,
+            contract: "0x0000000000000000000000000000000000000009".into(),
+            quantity: 1,
+            value_wei: None,
+            function_name: Some("mint()".into()),
+            is_hex: false,
+            parameters: None,
+            calldata: Some("0x1249c58b".into()),
+            rpc_endpoints: None,
+            flashbots: false,
+            gas_limit: None,
+            max_fee_gwei: None,
+            priority_fee_gwei: None,
+            nonce_override: None,
+            scheduled_at: None,
+            delay_ms: None,
+            mode: Some("execute".into()),
+            opensea_ref: None,
+        })
+        .expect("enqueue");
+
+        crate::nonce::reset_for_tests(w.id, 8453);
+        let n = crate::nonce::reserve(w.id, 8453, 4, None);
+        assert_eq!(n, 4);
+        crate::db::with_conn(|conn| {
+            conn.execute(
+                "UPDATE mint_tasks SET tx_nonce=?1 WHERE id=?2",
+                rusqlite::params![n as i64, task.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        release_task_nonce(task.id);
+        assert_eq!(
+            crate::nonce::reserve(w.id, 8453, 4, None),
+            4,
+            "nonce must come back after a terminal failure"
+        );
+        crate::nonce::reset_for_tests(w.id, 8453);
+    }
 
     #[test]
     fn detects_eip1167_minimal_proxy() {

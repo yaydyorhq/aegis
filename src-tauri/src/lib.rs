@@ -6,7 +6,9 @@ mod db;
 mod e2e_integration_tests;
 mod error;
 mod fund;
+mod logging;
 mod mint;
+mod nonce;
 mod opensea;
 mod pnl;
 mod vault;
@@ -17,6 +19,12 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Release is panic=abort with no console: leave the panic in the log first.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logging::error("panic", &info.to_string());
+        default_hook(info);
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // A second launch must focus the running window, not start a second
@@ -30,6 +38,8 @@ pub fn run() {
         }))
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
+            logging::init(dir.join("aegis.log"));
+            logging::info("app", "aegis starting");
             let db_path = dir.join("aegis.db");
             db::init(&db_path)?;
             mint::recover_stale_tasks();
@@ -54,6 +64,7 @@ pub fn run() {
                             }
                         }
                         Err(e) => {
+                            logging::error("scheduler", &format!("Prep scan error: {e}"));
                             wallet_store::log_activity(
                                 "mint.prep",
                                 &format!("Prep scan error: {e}"),
@@ -66,6 +77,7 @@ pub fn run() {
                         Ok(n) if n > 0 && !mint::is_running() => {
                             if let Err(e) = mint::run_pending().await {
                                 if !e.to_string().contains("already in progress") {
+                                    logging::error("scheduler", &format!("auto-run: {e}"));
                                     wallet_store::log_activity(
                                         "mint.autorun",
                                         &format!("Auto-run error: {e}"),
@@ -77,6 +89,7 @@ pub fn run() {
                         }
                         Ok(_) => {}
                         Err(e) => {
+                            logging::error("scheduler", &format!("Auto-run count error: {e}"));
                             wallet_store::log_activity(
                                 "mint.autorun",
                                 &format!("Auto-run count error: {e}"),

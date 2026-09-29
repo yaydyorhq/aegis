@@ -59,6 +59,8 @@ pub struct FundTxRow {
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Receipt-poll attempts accumulated across runner re-entries.
+    pub poll_attempts: i64,
 }
 
 #[derive(Clone)]
@@ -95,7 +97,7 @@ pub struct FundPreview {
 const JOB_COLS: &str =
     "id, mode, amount_mode, asset, chain_id, amount_wei, anchor_wallet_id, peer_wallet_ids, status, total_count, success_count, failed_count, created_at, updated_at";
 const TX_COLS: &str =
-    "id, job_id, seq, kind, wallet_id, from_address, to_address, amount_wei, status, tx_hash, error, created_at, updated_at";
+    "id, job_id, seq, kind, wallet_id, from_address, to_address, amount_wei, status, tx_hash, error, created_at, updated_at, poll_attempts";
 
 fn validate_mode_args(mode: &str, amount_mode: &str) -> AppResult<()> {
     if mode != "disperse" && mode != "consolidate" {
@@ -228,6 +230,7 @@ fn map_tx(r: &rusqlite::Row) -> rusqlite::Result<FundTxRow> {
         error: r.get(10)?,
         created_at: r.get(11)?,
         updated_at: r.get(12)?,
+        poll_attempts: r.get(13)?,
     })
 }
 
@@ -559,6 +562,10 @@ pub fn recover_stale() {
             {
                 let _guard = RunGuard;
                 if let Err(e) = run_job_loop(id).await {
+                    crate::logging::error(
+                        "fund",
+                        &format!("Fund job #{id} recover runner error: {e}"),
+                    );
                     wallet_store::log_activity(
                         "fund.error",
                         &format!("Fund job #{id} recover runner error: {e}"),
@@ -586,7 +593,9 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
     }
 
     let fail = |msg: String| {
+        let msg = chain::redact_urls_in(&msg);
         set_tx_status(tx.id, "failed", None, Some(&msg), None);
+        crate::logging::error("fund", &format!("Fund tx #{} failed: {msg}", tx.id));
         wallet_store::log_activity(
             "fund.failed",
             &format!("Fund tx #{} failed: {msg}", tx.id),
@@ -796,13 +805,17 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         0
     };
 
-    let nonce = match chain::get_transaction_count(&chain_row.rpc_url, &tx.from_address).await {
+    let chain_nonce = match chain::get_transaction_count(&chain_row.rpc_url, &tx.from_address).await
+    {
         Ok(n) => n,
         Err(e) => {
             fail(format!("nonce: {e}"));
             return Ok(());
         }
     };
+    // Mint lanes sign from the same wallet: one allocator keeps both from
+    // handing out the same nonce after reading the chain at the same moment.
+    let nonce = crate::nonce::reserve(tx.wallet_id, job.chain_id, chain_nonce, None);
 
     let signer = match (|| -> AppResult<_> {
         let (nonce_bytes, ct) = wallet_store::key_material(tx.wallet_id)?;
@@ -810,6 +823,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
     })() {
         Ok(s) => s,
         Err(e) => {
+            crate::nonce::release(tx.wallet_id, job.chain_id, nonce);
             fail(format!("load signer: {e}"));
             return Ok(());
         }
@@ -830,6 +844,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
     ) {
         Ok(s) => s,
         Err(e) => {
+            crate::nonce::release(tx.wallet_id, job.chain_id, nonce);
             fail(format!("sign: {e}"));
             return Ok(());
         }
@@ -839,6 +854,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         let raw = match hex::decode(signed.trim_start_matches("0x")) {
             Ok(r) => r,
             Err(_) => {
+                crate::nonce::release(tx.wallet_id, job.chain_id, nonce);
                 fail("internal: signed tx not hex".into());
                 return Ok(());
             }
@@ -859,6 +875,28 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
             poll_receipt(tx.id, &hash, job.chain_id).await
         }
         Err(e) => {
+            if crate::mint::is_transient_err(&format!("send: {e}")) {
+                // A timeout or 429 does not prove the node dropped it — it may
+                // already hold the tx. Poll the local hash; re-signing here is
+                // what would send the amount twice.
+                set_tx_status(tx.id, "confirming", Some(&local_hash), None, None);
+                crate::logging::warn(
+                    "fund",
+                    &format!("Fund tx #{} send ambiguous, polling local hash: {e}", tx.id),
+                );
+                wallet_store::log_activity(
+                    "fund.retry",
+                    &format!(
+                        "Fund tx #{} send ambiguous ({e}) — polling instead of re-sending",
+                        tx.id
+                    ),
+                    None,
+                    true,
+                );
+                return poll_receipt(tx.id, &local_hash, job.chain_id).await;
+            }
+            // Definite rejection: this nonce never entered a mempool.
+            crate::nonce::release(tx.wallet_id, job.chain_id, nonce);
             // Keep the local hash for audit but mark failed.
             set_tx_status(
                 tx.id,
@@ -867,6 +905,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
                 Some(&format!("send: {e}")),
                 None,
             );
+            crate::logging::error("fund", &format!("Fund tx #{} send failed: {e}", tx.id));
             wallet_store::log_activity(
                 "fund.failed",
                 &format!("Fund tx #{} send failed: {e}", tx.id),
@@ -878,6 +917,10 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
     }
 }
 
+/// Receipt polling budget per tx: 2s apart, so ~5 minutes total. The counter
+/// lives on the row because the runner re-enters the poll after every give-up.
+const FUND_POLL_MAX_ATTEMPTS: i64 = 150;
+
 async fn poll_receipt(tx_id: i64, hash: &str, chain_id: i64) -> AppResult<()> {
     let chains = chain::list_chains()?;
     let chain_row = match chains.into_iter().find(|c| c.chain_id == chain_id) {
@@ -888,60 +931,113 @@ async fn poll_receipt(tx_id: i64, hash: &str, chain_id: i64) -> AppResult<()> {
         }
     };
     set_tx_status(tx_id, "confirming", Some(hash), None, None);
+    // Rotate across every endpoint the chain row lists: one dead provider must
+    // not blind the poll (this used to be the single default URL only).
+    let endpoints = chain::endpoint_list(&chain_row.rpc_url);
+    let mut attempts: i64 = crate::db::with_conn(|conn| {
+        let n: i64 = conn.query_row(
+            "SELECT poll_attempts FROM fund_txs WHERE id=?1",
+            [tx_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    })
+    .unwrap_or(0);
+    let mut cycle = 0usize;
     let mut consecutive_errs = 0u32;
-    for _ in 0..20 {
+    loop {
+        if attempts >= FUND_POLL_MAX_ATTEMPTS {
+            // Nothing verifiable after the budget: say so precisely instead of
+            // pretending the tx failed — the hash is the only proof that
+            // matters before someone re-runs the job.
+            crate::logging::warn(
+                "fund",
+                &format!("Fund tx #{tx_id}: gave up polling {hash} after {attempts} attempts"),
+            );
+            set_tx_status(
+                tx_id,
+                "failed",
+                Some(hash),
+                Some("no receipt after ~5m of polling — verify this hash before re-running"),
+                None,
+            );
+            return Ok(());
+        }
+        attempts += 1;
+        let n = attempts;
+        let _ = crate::db::with_conn(|conn| {
+            conn.execute(
+                "UPDATE fund_txs SET poll_attempts=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params![n, crate::db::now_ms(), tx_id],
+            )?;
+            Ok(())
+        });
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match chain::get_receipt(&chain_row.rpc_url, hash).await {
-            Ok(Some(receipt)) => {
-                let status = receipt
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("0x1");
-                if status == "0x1" {
-                    set_tx_status(tx_id, "confirmed", Some(hash), None, None);
-                    wallet_store::log_activity(
-                        "fund.confirmed",
-                        &format!("Fund tx #{} confirmed {hash}", tx_id),
-                        None,
-                        true,
-                    );
-                } else {
-                    set_tx_status(tx_id, "failed", Some(hash), Some("reverted on-chain"), None);
-                    wallet_store::log_activity(
-                        "fund.failed",
-                        &format!("Fund tx #{} reverted {hash}", tx_id),
-                        None,
-                        false,
-                    );
-                }
-                return Ok(());
-            }
-            Ok(None) => {
-                consecutive_errs = 0;
-            }
-            Err(_) => {
-                consecutive_errs += 1;
-                if consecutive_errs >= 5 {
-                    set_tx_status(
-                        tx_id,
-                        "failed",
-                        Some(hash),
-                        Some("receipt RPC kept failing"),
-                        None,
-                    );
+
+        let mut answered = false;
+        for k in 0..endpoints.len().max(1) {
+            let url = &endpoints[(cycle + k) % endpoints.len().max(1)];
+            match chain::get_receipt(url, hash).await {
+                Ok(Some(receipt)) => {
+                    let status = receipt
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("0x1");
+                    if status == "0x1" {
+                        set_tx_status(tx_id, "confirmed", Some(hash), None, None);
+                        crate::logging::info("fund", &format!("Fund tx #{tx_id} confirmed {hash}"));
+                        wallet_store::log_activity(
+                            "fund.confirmed",
+                            &format!("Fund tx #{} confirmed {hash}", tx_id),
+                            None,
+                            true,
+                        );
+                    } else {
+                        set_tx_status(tx_id, "failed", Some(hash), Some("reverted on-chain"), None);
+                        crate::logging::error(
+                            "fund",
+                            &format!("Fund tx #{tx_id} reverted {hash}"),
+                        );
+                        wallet_store::log_activity(
+                            "fund.failed",
+                            &format!("Fund tx #{} reverted {hash}", tx_id),
+                            None,
+                            false,
+                        );
+                    }
                     return Ok(());
                 }
+                Ok(None) => {
+                    answered = true;
+                    break; // reachable, no receipt yet
+                }
+                Err(_) => {}
+            }
+        }
+        cycle = cycle.wrapping_add(1);
+        if answered {
+            consecutive_errs = 0;
+        } else {
+            consecutive_errs += 1;
+            if consecutive_errs >= 15 {
+                // Every endpoint failed for ~30s. Leave the row `confirming`
+                // (never `failed`) so the runner re-polls — a false `failed`
+                // on a live tx is how a manual re-run sends the funds twice.
+                crate::logging::warn(
+                    "fund",
+                    &format!("Fund tx #{tx_id}: receipt RPCs unreachable, will re-poll"),
+                );
+                set_tx_status(
+                    tx_id,
+                    "confirming",
+                    Some(hash),
+                    Some("receipt RPCs unreachable — will re-poll"),
+                    None,
+                );
+                return Ok(());
             }
         }
     }
-    set_tx_status(
-        tx_id,
-        "failed",
-        Some(hash),
-        Some("no receipt after ~40s"),
-        None,
-    );
-    Ok(())
 }
 
 /// Sequential runner body: finish confirming/pending rows in order.
@@ -979,6 +1075,7 @@ async fn run_job_loop(job_id: i64) -> AppResult<()> {
         // Throttle: public RPCs rate-limit rapid sequential calls.
         tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
         if let Err(e) = process_one_tx(&tx, &job).await {
+            crate::logging::error("fund", &format!("Fund tx #{} error: {e}", tx.id));
             set_tx_status(tx.id, "failed", None, Some(&e.to_string()), None);
         }
     }

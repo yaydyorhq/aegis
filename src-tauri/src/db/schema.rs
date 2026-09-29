@@ -68,7 +68,10 @@ CREATE TABLE IF NOT EXISTS mint_tasks(
   mode TEXT NOT NULL DEFAULT 'execute',
   poll_attempts INTEGER NOT NULL DEFAULT 0,
   auto_retries INTEGER NOT NULL DEFAULT 0,
-  opensea_ref TEXT
+  opensea_ref TEXT,
+  prev_tx_hash TEXT,
+  bump_count INTEGER NOT NULL DEFAULT 0,
+  tx_nonce INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS eligibility_checks(
@@ -163,7 +166,8 @@ CREATE TABLE IF NOT EXISTS fund_txs(
   tx_hash TEXT,
   error TEXT,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  poll_attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at DESC);

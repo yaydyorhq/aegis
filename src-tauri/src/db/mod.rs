@@ -70,6 +70,26 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     // Fire-time OpenSea mint data: JSON {collection, token_id} — the task
     // resolves SIWE + stage + MintAction when it fires instead of at enqueue.
     ensure_column(conn, "mint_tasks", "opensea_ref", "TEXT")?;
+    // Fee-bump trail: when a stuck tx is re-signed with a higher fee the old
+    // hash moves here, and the receipt poll checks both (either may mine).
+    ensure_column(conn, "mint_tasks", "prev_tx_hash", "TEXT")?;
+    ensure_column(
+        conn,
+        "mint_tasks",
+        "bump_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Nonce handed out by the shared allocator for this attempt — lets every
+    // terminal path give it back so the next task does not sign a gap nonce.
+    ensure_column(conn, "mint_tasks", "tx_nonce", "INTEGER")?;
+    // Fund receipt polling: attempts accumulate across runner re-entries so a
+    // dropped tx cannot keep a job's queue alive forever.
+    ensure_column(
+        conn,
+        "fund_txs",
+        "poll_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 

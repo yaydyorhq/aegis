@@ -458,6 +458,23 @@ pub async fn get_logs_adaptive(
     Ok(out)
 }
 
+/// Split a chain row's `rpc_url` into individual endpoints (comma or
+/// whitespace separated) and trim empties. Pollers rotate over the list so a
+/// single dead provider cannot blind a receipt check.
+pub fn endpoint_list(rpc_url: &str) -> Vec<String> {
+    let out: Vec<String> = rpc_url
+        .split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if out.is_empty() {
+        vec![rpc_url.to_string()]
+    } else {
+        out
+    }
+}
+
 pub async fn get_transaction_count(rpc_url: &str, address: &str) -> AppResult<u64> {
     let v = rpc_call(
         rpc_url,
@@ -594,6 +611,19 @@ mod tests {
         assert_eq!(backoff_delay_ms(1), 2_000);
         assert_eq!(backoff_delay_ms(2), 4_000);
         assert_eq!(backoff_delay_ms(3), 8_000);
+    }
+
+    #[test]
+    fn endpoint_list_splits_and_trims() {
+        assert_eq!(
+            endpoint_list("https://a.example, https://b.example"),
+            vec!["https://a.example".to_string(), "https://b.example".to_string()]
+        );
+        assert_eq!(endpoint_list(" https://c.example ,"), vec!["https://c.example".to_string()]);
+        assert_eq!(endpoint_list("https://d.example"), vec!["https://d.example".to_string()]);
+        // Empty input still yields something pollable instead of a panic.
+        assert_eq!(endpoint_list(""), vec!["".to_string()]);
+        assert_eq!(endpoint_list("  ,\n ").len(), 1); // degenerate input
     }
 
     #[test]
