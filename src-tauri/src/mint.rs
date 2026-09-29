@@ -2,7 +2,6 @@ use crate::chain;
 use crate::error::{AppError, AppResult};
 use crate::wallet_store;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod allowlist;
 pub mod seadrop;
@@ -72,7 +71,13 @@ pub struct EnqueueArgs {
     pub opensea_ref: Option<String>,
 }
 
-static MINT_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Wallets with a mint lane currently in flight. One lane per wallet keeps
+/// same-wallet tasks sequential (nonce order) while every other wallet keeps
+/// firing on its own lane — a `delay_ms` sleep inside one wallet's lane must
+/// not stall the whole scheduler. The old process-wide `MINT_RUNNING` flag did
+/// exactly that: while any lane slept, no other wallet's due task could run.
+static LANE_GUARDS: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<Option<i64>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 /// Task ids with a background receipt poll in flight — prevents duplicate
 /// pollers across scheduler ticks and lets polls outlive the run guard.
 static POLL_IN_FLIGHT: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<i64>>> =
@@ -96,16 +101,18 @@ fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-struct MintRunGuard;
-impl Drop for MintRunGuard {
+/// Marks one wallet's lane busy; released when the lane finishes — including
+/// on panic — so the wallet's next tasks are picked up by a later tick.
+struct LaneGuard(Option<i64>);
+impl Drop for LaneGuard {
     fn drop(&mut self) {
-        MINT_RUNNING.store(false, Ordering::SeqCst);
+        lock_unpoisoned(&LANE_GUARDS).remove(&self.0);
     }
 }
 
 /// Kick off a background receipt poll for `id` unless one is already running.
-/// Detaching keeps the 30s poll window from holding `MINT_RUNNING` hostage —
-/// fresh scheduled mints must be able to fire on the next 60ms tick.
+/// Detaching keeps the 30s poll window from ever holding a lane — fresh
+/// scheduled mints must be able to fire on the next 60ms tick.
 fn spawn_receipt_poll(id: i64) {
     {
         let mut g = POLL_IN_FLIGHT
@@ -143,8 +150,21 @@ fn spawn_receipt_poll(id: i64) {
     });
 }
 
+/// True while any wallet lane is executing (test diagnostics).
+#[cfg(test)]
 pub fn is_running() -> bool {
-    MINT_RUNNING.load(Ordering::SeqCst)
+    !lock_unpoisoned(&LANE_GUARDS).is_empty()
+}
+
+/// cfg(test) helpers to simulate a lane that is already in flight.
+#[cfg(test)]
+fn force_lane_busy(wallet_id: Option<i64>) {
+    lock_unpoisoned(&LANE_GUARDS).insert(wallet_id);
+}
+
+#[cfg(test)]
+fn clear_lanes_for_tests() {
+    lock_unpoisoned(&LANE_GUARDS).clear();
 }
 
 /// Pending tasks that are due (or unscheduled) plus any in-flight broadcasts.
@@ -198,9 +218,28 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
     })
 }
 
+/// Statuses the UI must always see (queued / in flight / draft). Everything
+/// else is history and gets capped in [`list_tasks`].
+const ACTIVE_STATUSES: &str = "'pending','draft','signing','broadcasting'";
+/// Cap on finished rows returned to the frontend. The table grows forever;
+/// the IPC payload must not.
+const LIST_HISTORY_CAP: usize = 1000;
+
 pub fn list_tasks() -> AppResult<Vec<MintTaskRow>> {
     crate::db::with_conn(|conn| {
-        let sql = format!("SELECT {SELECT_COLS} FROM mint_tasks ORDER BY created_at DESC");
+        // Active rows are never capped — a queued task must not vanish because
+        // old finished runs filled the budget. History contributes at most
+        // LIST_HISTORY_CAP newest rows.
+        let sql = format!(
+            "SELECT {SELECT_COLS} FROM (
+                 SELECT {SELECT_COLS} FROM mint_tasks WHERE status IN ({ACTIVE_STATUSES})
+                 UNION ALL
+                 SELECT {SELECT_COLS} FROM (
+                     SELECT {SELECT_COLS} FROM mint_tasks WHERE status NOT IN ({ACTIVE_STATUSES})
+                     ORDER BY created_at DESC, id DESC LIMIT {LIST_HISTORY_CAP}
+                 )
+             ) ORDER BY created_at DESC, id DESC"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_row)?;
         let mut out = Vec::new();
@@ -2647,15 +2686,46 @@ pub(crate) fn sign_eip1559(
     Ok(out)
 }
 
-/// Kick worker: process pending tasks under the run guard, then hand receipt
-/// re-polls to background tasks so slow polls never block the next tick.
+/// Kick worker (manual "Run queue"): process pending tasks and wait for this
+/// pass to finish so the caller sees post-run states. Receipt re-polls are
+/// handed to background tasks so they never hold anything up.
 /// Tasks are grouped by wallet: different wallets run in parallel (FCFS race),
 /// same-wallet tasks stay sequential to avoid nonce collisions.
 pub async fn run_pending() -> AppResult<Vec<MintTaskRow>> {
-    if MINT_RUNNING.swap(true, Ordering::SeqCst) {
-        return Err(AppError::Other("mint run already in progress".into()));
+    let (broadcasting, lanes) = launch_lanes()?;
+    let mut results = Vec::new();
+    for lane in lanes {
+        if let Ok(mut batch) = lane.await {
+            results.append(&mut batch);
+        }
     }
-    let _guard = MintRunGuard;
+    for id in broadcasting {
+        if let Ok(t) = get_task(id) {
+            results.push(t);
+        }
+    }
+    Ok(results)
+}
+
+/// Scheduler kick: launch lanes without waiting. The 60ms tick must never
+/// block — wallets whose lane is busy (e.g. sleeping out a `delay_ms`) are
+/// skipped for this tick and picked up again once the lane releases, while
+/// every other wallet keeps firing immediately.
+pub fn spawn_pending() -> AppResult<Vec<MintTaskRow>> {
+    let (broadcasting, _lanes) = launch_lanes()?; // dropping JoinHandles detaches
+    let mut results = Vec::new();
+    for id in broadcasting {
+        if let Ok(t) = get_task(id) {
+            results.push(t);
+        }
+    }
+    Ok(results)
+}
+
+/// Select runnable tasks, spawn one sequential lane per *free* wallet and
+/// resume detached receipt polls. Returns the broadcasting ids and the lanes
+/// the caller may await (or drop to detach).
+fn launch_lanes() -> AppResult<(Vec<i64>, Vec<tokio::task::JoinHandle<Vec<MintTaskRow>>>)> {
     let (pending, broadcasting): (Vec<(i64, Option<i64>)>, Vec<i64>) = crate::db::with_conn(|conn| {
         let mut pending = Vec::new();
         let mut broadcasting = Vec::new();
@@ -2677,7 +2747,6 @@ pub async fn run_pending() -> AppResult<Vec<MintTaskRow>> {
         }
         Ok((pending, broadcasting))
     })?;
-    let mut results = Vec::new();
     // Group pending tasks by wallet (None → single shared bucket).
     let mut by_wallet: std::collections::HashMap<Option<i64>, Vec<i64>> =
         std::collections::HashMap::new();
@@ -2686,8 +2755,14 @@ pub async fn run_pending() -> AppResult<Vec<MintTaskRow>> {
     }
     // Spawn one sequential lane per wallet so distinct wallets fire together.
     let mut lanes = Vec::new();
-    for (_wallet_id, ids) in by_wallet {
+    for (wallet_id, ids) in by_wallet {
+        // Claim the wallet's lane; when one is already in flight the tasks
+        // stay untouched and a later tick retries them.
+        if !lock_unpoisoned(&LANE_GUARDS).insert(wallet_id) {
+            continue;
+        }
         lanes.push(tokio::spawn(async move {
+            let _lane = LaneGuard(wallet_id);
             let mut out = Vec::new();
             for id in ids {
                 match process_task(id).await {
@@ -2711,20 +2786,12 @@ pub async fn run_pending() -> AppResult<Vec<MintTaskRow>> {
             out
         }));
     }
-    for lane in lanes {
-        if let Ok(mut batch) = lane.await {
-            results.append(&mut batch);
-        }
-    }
     // Resume receipt re-polls in the background (skipped when already in
-    // flight) so this run returns immediately and frees the run guard.
-    for id in broadcasting {
-        if let Ok(t) = get_task(id) {
-            results.push(t);
-        }
-        spawn_receipt_poll(id);
+    // flight) so slow polls never block a lane or a tick.
+    for id in &broadcasting {
+        spawn_receipt_poll(*id);
     }
-    Ok(results)
+    Ok((broadcasting, lanes))
 }
 
 /// Reset stuck signing tasks from a previous crash so they can re-run.
@@ -2815,6 +2882,105 @@ mod tests {
             "nonce must come back after a terminal failure"
         );
         crate::nonce::reset_for_tests(w.id, 8453);
+    }
+
+    /// Finished runs are capped for the IPC payload; queued/in-flight work
+    /// never is, no matter how old.
+    #[test]
+    fn list_caps_history_but_always_returns_active_tasks() {
+        let _serial = serial_guard();
+        fresh_db("listcap");
+        clear_lanes_for_tests();
+        let now = crate::db::now_ms();
+        crate::db::with_conn(|conn| {
+            for i in 0..(LIST_HISTORY_CAP + 5) {
+                conn.execute(
+                    "INSERT INTO mint_tasks(chain_id, contract, quantity, status, created_at, updated_at)
+                     VALUES (8453, '0x000000000000000000000000000000000000000a', 1, 'confirmed', ?1, ?1)",
+                    [now - i as i64],
+                )?;
+            }
+            // The oldest rows in the table are still queued — they must survive.
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO mint_tasks(chain_id, contract, quantity, status, created_at, updated_at)
+                     VALUES (8453, '0x000000000000000000000000000000000000000b', 1, 'pending', ?1, ?1)",
+                    [now - 10_000_000 - i as i64],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let list = list_tasks().unwrap();
+        assert_eq!(
+            list.len(),
+            LIST_HISTORY_CAP + 3,
+            "history capped, active kept"
+        );
+        assert_eq!(
+            list.iter().filter(|t| t.status == "pending").count(),
+            3,
+            "active rows must never be capped"
+        );
+        assert!(list
+            .windows(2)
+            .all(|w| w[0].created_at >= w[1].created_at));
+    }
+
+    /// A wallet whose lane is already in flight is skipped — its tasks stay
+    /// untouched for a later tick — and the lane is released when it drains.
+    #[test]
+    fn busy_wallet_lane_is_skipped_then_released() {
+        let _serial = serial_guard();
+        fresh_db("lane");
+        clear_lanes_for_tests();
+        ensure_unlocked();
+
+        let label = format!(
+            "lane-w-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let w = crate::wallet_store::create_wallet(&label, None).unwrap();
+        let base = crate::chain::list_chains()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.chain_id == 8453)
+            .unwrap();
+        let task = enqueue(EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: base.chain_id,
+            contract: "0x000000000000000000000000000000000000000c".into(),
+            quantity: 1,
+            function_name: Some("mint()".into()),
+            mode: Some("simulate".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        force_lane_busy(Some(w.id));
+        assert!(is_running());
+        let out = rt.block_on(run_pending()).unwrap();
+        assert_eq!(
+            get_task(task.id).unwrap().status,
+            "pending",
+            "busy lane must leave the task untouched"
+        );
+        assert!(out.iter().all(|t| t.id != task.id));
+
+        clear_lanes_for_tests();
+        assert!(!is_running());
+
+        let out = rt.block_on(run_pending()).unwrap();
+        let done = get_task(task.id).unwrap();
+        assert_ne!(done.status, "pending", "free lane must process it");
+        assert!(out.iter().any(|t| t.id == task.id));
+        clear_lanes_for_tests();
     }
 
     #[test]

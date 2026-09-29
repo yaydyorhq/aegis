@@ -204,65 +204,133 @@ pub async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) ->
     }
 }
 
+/// One endpoint's outcome as fed to [`evaluate_chain_probes`].
+struct EndpointOutcome {
+    /// `Err` = the `eth_chainId` call itself failed (transport/parse; message
+    /// is display-ready). `Ok` = the id the node returned.
+    chain_id: Result<i64, String>,
+    call_ok: bool,
+    latency_ms: u64,
+}
+
+/// Fold per-endpoint probe results into the command verdict: the first
+/// endpoint that both reports the configured chain id *and* passes the
+/// eth_call capability probe wins; otherwise every failure is joined into one
+/// error with URLs redacted. A dead provider in the list can no longer fail a
+/// chain whose other endpoint is healthy.
+fn evaluate_chain_probes(
+    expected: i64,
+    outcomes: &[(String, EndpointOutcome)],
+) -> RpcTestResult {
+    if let Some((_, pass)) = outcomes
+        .iter()
+        .find(|(_, o)| matches!(&o.chain_id, Ok(cid) if *cid == expected && o.call_ok))
+    {
+        return RpcTestResult {
+            ok: true,
+            chain_id_returned: pass.chain_id.as_ref().ok().copied(),
+            latency_ms: Some(pass.latency_ms),
+            error: None,
+            eth_call_ok: Some(true),
+        };
+    }
+    let mut failures = Vec::new();
+    let mut last_cid = None;
+    for (url, o) in outcomes {
+        let why = match &o.chain_id {
+            Ok(cid) => {
+                last_cid = Some(*cid);
+                if *cid != expected {
+                    format!("expected {expected}, got {cid}")
+                } else {
+                    "eth_call capability missing (this RPC may fail on mint tasks)".to_string()
+                }
+            }
+            Err(e) => e.clone(),
+        };
+        failures.push(format!("{why} @ {url}"));
+    }
+    let any_call_ok = outcomes
+        .iter()
+        .any(|(_, o)| matches!(&o.chain_id, Ok(_)) && o.call_ok);
+    RpcTestResult {
+        ok: false,
+        chain_id_returned: last_cid,
+        latency_ms: Some(
+            outcomes
+                .iter()
+                .map(|(_, o)| o.latency_ms)
+                .max()
+                .unwrap_or(0),
+        ),
+        error: Some(if failures.is_empty() {
+            "no endpoint configured".to_string()
+        } else {
+            redact_urls_in(&failures.join(" | "))
+        }),
+        eth_call_ok: Some(any_call_ok),
+    }
+}
+
 pub async fn test_chain(id: i64) -> AppResult<RpcTestResult> {
     let chain = list_chains()?
         .into_iter()
         .find(|c| c.id == id)
         .ok_or_else(|| AppError::NotFound(format!("chain {id}")))?;
-    let start = std::time::Instant::now();
-    match eth_chain_id(&chain.rpc_url).await {
-        Ok(chain_id) => {
-            let latency = start.elapsed().as_millis() as u64;
-            let ok = chain_id == chain.chain_id;
-            // Probe eth_call capability — catches Cloudflare/gateway nodes that
-            // accept eth_chainId but fail on contract interaction (-32603).
-            let (cid, _blk, call_ok, probe_latency, probe_err) =
-                rpc_health_probe(&chain.rpc_url).await;
-            let latency = probe_latency.max(latency);
-            let eth_call_ok = Some(call_ok);
-            let err_msg = if !ok {
-                Some(format!("expected {}, got {}", chain.chain_id, chain_id))
-            } else if !call_ok {
-                probe_err.or_else(|| Some("eth_call failed".into()))
-            } else {
-                None
-            };
+    // Probe every listed endpoint in order and stop at the first that passes;
+    // a single dead/misconfigured provider must not fail the whole chain.
+    let mut outcomes: Vec<(String, EndpointOutcome)> = Vec::new();
+    for url in endpoint_list(&chain.rpc_url) {
+        let start = std::time::Instant::now();
+        let (chain_id, call_ok, latency_ms) = match eth_chain_id(&url).await {
+            Ok(cid) => {
+                let first = start.elapsed().as_millis() as u64;
+                // Probe eth_call capability — catches Cloudflare/gateway nodes
+                // that accept eth_chainId but fail on contract interaction.
+                let (probe_cid, _blk, call_ok, probe_latency, _probe_err) =
+                    rpc_health_probe(&url).await;
+                let latency = probe_latency.max(first);
+                // Prefer the detailed first answer; the probe re-asks and may
+                // have lost a race with a flapping gateway.
+                (Ok(probe_cid.unwrap_or(cid)), call_ok, latency)
+            }
+            Err(e) => (Err(e.to_string()), false, start.elapsed().as_millis() as u64),
+        };
+        outcomes.push((
+            url,
+            EndpointOutcome {
+                chain_id,
+                call_ok,
+                latency_ms,
+            },
+        ));
+        let early = evaluate_chain_probes(chain.chain_id, &outcomes);
+        if early.ok {
             wallet_store::log_activity(
                 "rpc.test",
                 &format!(
-                    "{} RPC {} ({} ms, eth_call {})",
+                    "{} RPC OK ({} ms, eth_call ok)",
                     chain.name,
-                    if ok { "OK" } else { "chain mismatch" },
-                    latency,
-                    if call_ok { "ok" } else { "FAILED" }
+                    early.latency_ms.unwrap_or(0)
                 ),
                 None,
-                ok && call_ok,
+                true,
             );
-            Ok(RpcTestResult {
-                ok: ok && call_ok,
-                chain_id_returned: cid.or(Some(chain_id)),
-                latency_ms: Some(latency),
-                error: err_msg,
-                eth_call_ok,
-            })
-        }
-        Err(e) => {
-            wallet_store::log_activity(
-                "rpc.test",
-                &format!("{} RPC failed: {e}", chain.name),
-                None,
-                false,
-            );
-            Ok(RpcTestResult {
-                ok: false,
-                chain_id_returned: None,
-                latency_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(e.to_string()),
-                eth_call_ok: Some(false),
-            })
+            return Ok(early);
         }
     }
+    let result = evaluate_chain_probes(chain.chain_id, &outcomes);
+    wallet_store::log_activity(
+        "rpc.test",
+        &format!(
+            "{} RPC failed: {}",
+            chain.name,
+            result.error.as_deref().unwrap_or("unknown")
+        ),
+        None,
+        false,
+    );
+    Ok(result)
 }
 
 pub async fn eth_chain_id(rpc_url: &str) -> AppResult<i64> {
@@ -624,6 +692,96 @@ mod tests {
         // Empty input still yields something pollable instead of a panic.
         assert_eq!(endpoint_list(""), vec!["".to_string()]);
         assert_eq!(endpoint_list("  ,\n ").len(), 1); // degenerate input
+    }
+
+    fn passing(url: &str, latency: u64) -> (String, EndpointOutcome) {
+        (
+            url.to_string(),
+            EndpointOutcome {
+                chain_id: Ok(8453),
+                call_ok: true,
+                latency_ms: latency,
+            },
+        )
+    }
+
+    /// The false-negative the audit flagged: endpoint #1 is down, #2 is fine —
+    /// the chain must test OK with the healthy endpoint's latency.
+    #[test]
+    fn chain_test_survives_a_dead_first_endpoint() {
+        let outcomes = vec![
+            (
+                "https://dead.example/v2/KEY".to_string(),
+                EndpointOutcome {
+                    chain_id: Err("HTTP 502".into()),
+                    call_ok: false,
+                    latency_ms: 300,
+                },
+            ),
+            passing("http://100.79.165.20:8549", 95),
+        ];
+        let r = evaluate_chain_probes(8453, &outcomes);
+        assert!(r.ok);
+        assert_eq!(r.chain_id_returned, Some(8453));
+        assert_eq!(r.latency_ms, Some(95));
+        assert_eq!(r.error, None);
+        assert_eq!(r.eth_call_ok, Some(true));
+    }
+
+    #[test]
+    fn chain_test_reports_chain_id_mismatch_with_redacted_url() {
+        let outcomes = vec![(
+            "https://rpc.example.com/v2/SUPERSECRET".to_string(),
+            EndpointOutcome {
+                chain_id: Ok(1),
+                call_ok: true,
+                latency_ms: 42,
+            },
+        )];
+        let r = evaluate_chain_probes(8453, &outcomes);
+        assert!(!r.ok);
+        let e = r.error.expect("error message");
+        assert!(e.contains("expected 8453, got 1"), "{e}");
+        assert!(!e.contains("SUPERSECRET"), "key leaked: {e}");
+        assert!(
+            e.contains("https://rpc.example.com/..."),
+            "url not redacted: {e}"
+        );
+        assert_eq!(r.chain_id_returned, Some(1));
+        assert_eq!(r.eth_call_ok, Some(true)); // call works — chain is wrong
+    }
+
+    #[test]
+    fn chain_test_all_unreachable_is_reported_with_transport_errors() {
+        let outcomes = vec![(
+            "http://100.79.165.20:8548".to_string(),
+            EndpointOutcome {
+                chain_id: Err("HTTP 429".into()),
+                call_ok: false,
+                latency_ms: 7,
+            },
+        )];
+        let r = evaluate_chain_probes(1, &outcomes);
+        assert!(!r.ok);
+        assert_eq!(r.chain_id_returned, None);
+        assert_eq!(r.eth_call_ok, Some(false));
+        assert!(r.error.unwrap().contains("HTTP 429"));
+    }
+
+    #[test]
+    fn chain_test_eth_call_gap_marks_the_chain_unfit() {
+        let outcomes = vec![(
+            "https://ok.example".to_string(),
+            EndpointOutcome {
+                chain_id: Ok(8453),
+                call_ok: false,
+                latency_ms: 10,
+            },
+        )];
+        let r = evaluate_chain_probes(8453, &outcomes);
+        assert!(!r.ok);
+        assert_eq!(r.eth_call_ok, Some(false));
+        assert!(r.error.unwrap().contains("eth_call"));
     }
 
     #[test]

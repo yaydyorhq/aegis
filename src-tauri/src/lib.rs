@@ -74,17 +74,18 @@ pub fn run() {
                         }
                     }
                     match mint::count_runnable() {
-                        Ok(n) if n > 0 && !mint::is_running() => {
-                            if let Err(e) = mint::run_pending().await {
-                                if !e.to_string().contains("already in progress") {
-                                    logging::error("scheduler", &format!("auto-run: {e}"));
-                                    wallet_store::log_activity(
-                                        "mint.autorun",
-                                        &format!("Auto-run error: {e}"),
-                                        None,
-                                        false,
-                                    );
-                                }
+                        // spawn_pending never blocks the tick: a wallet whose
+                        // lane is already in flight (delay/sleep) is skipped
+                        // for this tick; every other wallet keeps firing.
+                        Ok(n) if n > 0 => {
+                            if let Err(e) = mint::spawn_pending() {
+                                logging::error("scheduler", &format!("auto-run: {e}"));
+                                wallet_store::log_activity(
+                                    "mint.autorun",
+                                    &format!("Auto-run error: {e}"),
+                                    None,
+                                    false,
+                                );
                             }
                         }
                         Ok(_) => {}
