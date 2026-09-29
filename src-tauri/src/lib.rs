@@ -19,6 +19,15 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // A second launch must focus the running window, not start a second
+        // 60ms scheduler + a second SQLite writer against the same aegis.db
+        // (two writers → SQLITE_BUSY at exactly the mint fire moment).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             let db_path = dir.join("aegis.db");

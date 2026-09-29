@@ -12,6 +12,10 @@ pub fn init(db_path: &PathBuf) -> AppResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(db_path)?;
+    // Another process touching the file (backup tool, DB viewer, second app
+    // instance) must wait its turn instead of failing with SQLITE_BUSY —
+    // which would surface as "database is locked" exactly at mint fire time.
+    conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.execute_batch(schema::SCHEMA)?;
     migrate(&conn)?;
     seed_chains(&conn)?;
@@ -132,7 +136,9 @@ where
         .get()
         .ok_or_else(|| AppError::Other("db not initialized".into()))?
         .lock()
-        .map_err(|_| AppError::Other("db lock poisoned".into()))?;
+        // A panic inside one closure must not brick every later DB call: the
+        // mutex stays usable (the poisoned state only poisons the guard).
+        .unwrap_or_else(|e| e.into_inner());
     f(&guard)
 }
 

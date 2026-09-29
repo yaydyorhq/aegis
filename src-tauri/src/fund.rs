@@ -295,6 +295,9 @@ fn set_tx_status(
     amount_wei: Option<&str>,
 ) {
     let now = crate::db::now_ms();
+    // Same rule as mint_tasks.error: transport errors carry the endpoint URL,
+    // and RPC URLs can hold API keys — redact before persisting.
+    let error = error.map(crate::chain::redact_urls_in);
     let mut job_id = 0i64;
     let _ = crate::db::with_conn(|conn| {
         conn.execute(

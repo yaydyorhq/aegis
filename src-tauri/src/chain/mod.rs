@@ -164,7 +164,7 @@ pub async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) ->
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| AppError::Rpc(e.to_string()))?;
+                .map_err(|e| AppError::Rpc(redact_urls_in(&e.to_string())))?;
             let status = resp.status();
             if is_transient_status(status.as_u16()) {
                 return Err(AppError::Rpc(format!("HTTP {status}")));
@@ -175,7 +175,7 @@ pub async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) ->
             let v: serde_json::Value = resp
                 .json()
                 .await
-                .map_err(|e| AppError::Rpc(e.to_string()))?;
+                .map_err(|e| AppError::Rpc(redact_urls_in(&e.to_string())))?;
             if let Some(err) = v.get("error") {
                 return Err(AppError::Rpc(err.to_string()));
             }
@@ -518,6 +518,53 @@ pub async fn get_receipt(rpc_url: &str, tx_hash: &str) -> AppResult<Option<serde
 
 const RPC_MAX_ATTEMPTS: u32 = 3;
 
+/// Replace every http(s) URL in `msg` with `scheme://host/...`.
+///
+/// RPC endpoints routinely carry API keys in the path (Alchemy, Infura) and
+/// reqwest's transport errors append the full URL to their Display output.
+/// Anything logged or persisted must go through this first — the app's own
+/// `api_keys` table encrypts keys at rest, so leaking one via a log row would
+/// defeat that.
+pub fn redact_urls_in(msg: &str) -> String {
+    const MARKERS: [&str; 2] = ["https://", "http://"];
+    const STOP: [char; 8] = [' ', ')', '\'', '"', ',', '\n', '\t', '`'];
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    loop {
+        let mut best: Option<(usize, &'static str)> = None;
+        for m in MARKERS {
+            if let Some(i) = rest.find(m) {
+                if best.map(|(b, _)| i < b).unwrap_or(true) {
+                    best = Some((i, m));
+                }
+            }
+        }
+        let Some((start, scheme)) = best else {
+            out.push_str(rest);
+            break;
+        };
+        let after = &rest[start + scheme.len()..];
+        let end = after
+            .find(|c: char| STOP.contains(&c))
+            .unwrap_or(after.len());
+        let url_end = start + scheme.len() + end;
+        let body = &rest[start + scheme.len()..url_end];
+        let host_end = body.find('/').unwrap_or(body.len());
+        out.push_str(&rest[..start]);
+        out.push_str(scheme);
+        out.push_str(&body[..host_end]);
+        out.push_str("/...");
+        rest = &rest[url_end..];
+    }
+    out
+}
+
+/// Single-URL form: `https://eth-mainnet.g.alchemy.com/v2/SECRET` →
+/// `https://eth-mainnet.g.alchemy.com/...`
+pub fn redact_rpc(url: &str) -> String {
+    redact_urls_in(url)
+}
+
 fn is_transient_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
@@ -547,5 +594,36 @@ mod tests {
         assert_eq!(backoff_delay_ms(1), 2_000);
         assert_eq!(backoff_delay_ms(2), 4_000);
         assert_eq!(backoff_delay_ms(3), 8_000);
+    }
+
+    #[test]
+    fn redact_strips_api_keys_from_rpc_urls() {
+        assert_eq!(
+            redact_rpc("https://eth-mainnet.g.alchemy.com/v2/alch_SUPERSECRET"),
+            "https://eth-mainnet.g.alchemy.com/..."
+        );
+        // Host (and port) survive; only the path is dropped.
+        assert_eq!(redact_rpc("http://100.79.165.20:8547"), "http://100.79.165.20:8547/...");
+    }
+
+    #[test]
+    fn redact_covers_urls_embedded_in_messages() {
+        let msg = "error sending request for url (https://rpc.example.com/v2/KEY123): timed out";
+        let out = redact_urls_in(msg);
+        assert!(!out.contains("KEY123"), "key leaked: {out}");
+        assert!(out.contains("https://rpc.example.com/..."), "lost url: {out}");
+        assert!(out.contains("timed out"), "lost suffix: {out}");
+
+        // Two URLs in one string, mixed with non-url text.
+        let two = "failed over from https://a.io/v1/x to https://b.io/v2/y after 429";
+        let out2 = redact_urls_in(two);
+        assert!(!out2.contains("/v1/x") && !out2.contains("/v2/y"), "{out2}");
+        assert!(out2.contains("https://a.io/...") && out2.contains("https://b.io/..."), "{out2}");
+    }
+
+    #[test]
+    fn redact_is_a_noop_without_urls() {
+        assert_eq!(redact_urls_in("tx 0xabc reverted"), "tx 0xabc reverted");
+        assert_eq!(redact_urls_in(""), "");
     }
 }

@@ -240,7 +240,10 @@ async fn pick_healthy_endpoint(endpoints: &[String], expected_chain: i64) -> (St
                 return (url.clone(), endpoints.to_vec());
             }
             Ok(cid) => {
-                mismatch = Some(format!("{url} is chain {cid}, expected {expected_chain}"));
+                mismatch = Some(format!(
+                    "{} is chain {cid}, expected {expected_chain}",
+                    chain::redact_rpc(url)
+                ));
             }
             Err(_) => continue, // unreachable node → try the next one
         }
@@ -258,8 +261,31 @@ async fn pick_healthy_endpoint(endpoints: &[String], expected_chain: i64) -> (St
     (endpoints[0].clone(), endpoints.to_vec())
 }
 
+/// Deterministic failures: retrying the identical signed tx/calldata cannot
+/// succeed, so these must never be auto-requeued or polled as "maybe landed".
+fn is_permanent_err(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const PERMANENT: [&str; 8] = [
+        "revert",
+        "insufficient funds",
+        "chain mismatch",
+        // Wrong-chain endpoint reports ("… is chain 1, expected 4663").
+        " is chain ",
+        "bad gas",
+        "bad max_fee",
+        "bad value",
+        // The nonce is already consumed by another tx — a retry with the same
+        // nonce is rejected again; needs a fresh nonce read, not a requeue.
+        "nonce too low",
+    ];
+    PERMANENT.iter().any(|p| m.contains(p))
+}
+
 /// Transient errors worth one automatic requeue (never reverts/param errors).
 fn is_transient_err(msg: &str) -> bool {
+    if is_permanent_err(msg) {
+        return false;
+    }
     let m = msg.to_ascii_lowercase();
     const TRANSIENT: [&str; 16] = [
         "transport",
@@ -282,17 +308,6 @@ fn is_transient_err(msg: &str) -> bool {
     ];
     // NOTE: a decoded contract revert is deliberately NOT transient — retrying
     // the same calldata on another node returns the same revert.
-    const PERMANENT: [&str; 6] = [
-        "revert",
-        "insufficient funds",
-        "chain mismatch",
-        "bad gas",
-        "bad max_fee",
-        "bad value",
-    ];
-    if PERMANENT.iter().any(|p| m.contains(p)) {
-        return false;
-    }
     TRANSIENT.iter().any(|t| m.contains(t))
 }
 
@@ -634,6 +649,42 @@ fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
     let value_wei = a.value_wei.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     let id = crate::db::with_conn(|conn| {
+        // Idempotency guard: a double-click/duplicate submit must not insert a
+        // second row that would sign a second tx for the same mint. `IS` is
+        // NULL-safe, so unscheduled tasks and empty opensea_ref still compare.
+        // The key covers the whole payload (mode/function/params/quantity) so
+        // different work on the same contract — simulate, then execute, spam —
+        // still queues, while a literal double-submit is rejected.
+        let dup: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM mint_tasks
+                  WHERE wallet_id=?1 AND chain_id=?2 AND contract=?3
+                    AND calldata IS ?4 AND opensea_ref IS ?5 AND scheduled_at IS ?6
+                    AND mode IS ?7 AND function_name IS ?8 AND parameters IS ?9
+                    AND quantity=?10 AND value_wei IS ?11
+                    AND status IN ('pending','signing','broadcasting')
+                  LIMIT 1",
+                rusqlite::params![
+                    a.wallet_id,
+                    a.chain_id,
+                    c,
+                    stored_cd,
+                    a.opensea_ref,
+                    a.scheduled_at,
+                    mode,
+                    fn_name,
+                    parameters,
+                    a.quantity,
+                    value_wei
+                ],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(dup_id) = dup {
+            return Err(AppError::Invalid(format!(
+                "task #{dup_id} is already queued for this wallet and payload — cancel it first"
+            )));
+        }
         conn.execute(
             "INSERT INTO mint_tasks(
                 chain_id, contract, quantity, value_wei, calldata, status, wallet_id, created_at, updated_at,
@@ -721,9 +772,102 @@ pub fn promote_task(id: i64) -> AppResult<MintTaskRow> {
     get_task(id)
 }
 
+/// On-chain verdict for a hash already stored on a failed task.
+#[derive(Debug, PartialEq, Eq)]
+enum TxVerdict {
+    /// No node has it: receipt absent and mempool empty — safe to re-sign.
+    Safe,
+    /// Confirmed successfully — retrying would mint twice.
+    Confirmed,
+    /// Confirmed but reverted (nonce consumed, nothing minted) — safe to retry.
+    Reverted,
+    /// Still sitting in some node's mempool — retrying would replace it.
+    Mempool,
+}
+
+/// Check a stored tx hash across the task's endpoints (chain default last).
+/// `Err` means no endpoint could be consulted — callers must treat that as
+/// "do not retry" rather than "assume safe".
+async fn verify_stored_tx(task: &MintTaskRow, hash: &str) -> Result<TxVerdict, String> {
+    let chains = chain::list_chains().map_err(|e| e.to_string())?;
+    let chain_row = chains
+        .into_iter()
+        .find(|c| c.chain_id == task.chain_id)
+        .ok_or_else(|| format!("chain {} unavailable", task.chain_id))?;
+    let endpoints: Vec<String> = parse_rpc_list(task, &chain_row.rpc_url);
+    let mut answered = false;
+    for url in &endpoints {
+        // Only an endpoint on the right chain can prove anything here — a
+        // mismatched node answering "no receipt" would fake a Safe verdict.
+        match chain::eth_chain_id(url).await {
+            Ok(cid) if cid == task.chain_id => {}
+            _ => continue,
+        }
+        match chain::get_receipt(url, hash).await {
+            Ok(Some(receipt)) => {
+                let reverted = receipt.get("status").and_then(|s| s.as_str()) == Some("0x0");
+                return Ok(if reverted {
+                    TxVerdict::Reverted
+                } else {
+                    TxVerdict::Confirmed
+                });
+            }
+            Ok(None) => answered = true, // right chain, reachable, no receipt yet
+            Err(_) => {}
+        }
+        if let Ok(v) = chain::rpc_call(
+            url,
+            "eth_getTransactionByHash",
+            serde_json::json!([hash]),
+        )
+        .await
+        {
+            answered = true;
+            let held = v.get("result").map(|r| !r.is_null()).unwrap_or(false);
+            if held {
+                return Ok(TxVerdict::Mempool);
+            }
+        }
+    }
+    if answered {
+        Ok(TxVerdict::Safe)
+    } else {
+        Err("no RPC endpoint reachable".into())
+    }
+}
+
 /// Reset a failed task back to `pending` so it can be retried.
-/// Clears the error, tx hash, and poll/retry counters.
-pub fn retry_task(id: i64) -> AppResult<MintTaskRow> {
+/// Clears the error, tx hash, and poll/retry counters — but only after the
+/// stored tx hash is proven absent on-chain. Re-signing while the original tx
+/// is confirmed or still in the mempool is how double-mints happen.
+pub async fn retry_task(id: i64) -> AppResult<MintTaskRow> {
+    let task = get_task(id)?;
+    if !matches!(task.status.as_str(), "failed" | "canceled" | "cancelled") {
+        return Err(AppError::Invalid(format!(
+            "task {id} is '{}' — only failed/cancelled tasks can be retried",
+            task.status
+        )));
+    }
+    if let Some(hash) = task.tx_hash.clone() {
+        match verify_stored_tx(&task, &hash).await {
+            Ok(TxVerdict::Confirmed) => {
+                return Err(AppError::Invalid(format!(
+                    "tx {hash} already confirmed on-chain — not retrying (would mint twice)"
+                )));
+            }
+            Ok(TxVerdict::Mempool) => {
+                return Err(AppError::Invalid(format!(
+                    "tx {hash} is still in the mempool — wait for it, re-signing would replace it"
+                )));
+            }
+            Ok(TxVerdict::Reverted) | Ok(TxVerdict::Safe) => {}
+            Err(e) => {
+                return Err(AppError::Invalid(format!(
+                    "cannot verify tx {hash}: {e} — not retrying"
+                )));
+            }
+        }
+    }
     let now = crate::db::now_ms();
     let n = crate::db::with_conn(|conn| {
         Ok(conn.execute(
@@ -735,10 +879,8 @@ pub fn retry_task(id: i64) -> AppResult<MintTaskRow> {
         )?)
     })?;
     if n == 0 {
-        let t = get_task(id)?;
         return Err(AppError::Invalid(format!(
-            "task {id} is '{}' — only failed/cancelled tasks can be retried",
-            t.status
+            "task {id} is no longer retryable"
         )));
     }
     wallet_store::log_activity(
@@ -751,17 +893,56 @@ pub fn retry_task(id: i64) -> AppResult<MintTaskRow> {
 }
 
 /// Retry every failed/cancelled task in one call.
-pub fn retry_all_failed() -> AppResult<i64> {
-    let now = crate::db::now_ms();
-    let n = crate::db::with_conn(|conn| {
-        Ok(conn.execute(
-            "UPDATE mint_tasks
-                SET status='pending', error=NULL, tx_hash=NULL,
-                    poll_attempts=0, auto_retries=0, updated_at=?1
-              WHERE status IN ('failed','canceled','cancelled')",
-            rusqlite::params![now],
-        )?)
+/// Tasks whose stored tx hash is confirmed or still pending on-chain are
+/// skipped (see [`verify_stored_tx`]) — they would otherwise double-send.
+pub async fn retry_all_failed() -> AppResult<i64> {
+    let candidates: Vec<MintTaskRow> = crate::db::with_conn(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM mint_tasks WHERE status IN ('failed','canceled','cancelled')"
+        ))?;
+        let rows = stmt.query_map([], map_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     })?;
+    let now = crate::db::now_ms();
+    let mut n = 0i64;
+    let mut skipped = 0u32;
+    for task in &candidates {
+        if let Some(hash) = task.tx_hash.clone() {
+            match verify_stored_tx(task, &hash).await {
+                Ok(TxVerdict::Confirmed) | Ok(TxVerdict::Mempool) | Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+                Ok(TxVerdict::Safe) | Ok(TxVerdict::Reverted) => {}
+            }
+        }
+        let cleared = crate::db::with_conn(|conn| {
+            Ok(conn.execute(
+                "UPDATE mint_tasks
+                    SET status='pending', error=NULL, tx_hash=NULL,
+                        poll_attempts=0, auto_retries=0, updated_at=?1
+                  WHERE id=?2 AND status IN ('failed','canceled','cancelled')",
+                rusqlite::params![now, task.id],
+            )?)
+        })?;
+        if cleared > 0 {
+            n += 1;
+        }
+    }
+    if skipped > 0 {
+        wallet_store::log_activity(
+            "mint.retry",
+            &format!(
+                "Skipped {skipped} task(s) on bulk retry — tx already confirmed or still in mempool"
+            ),
+            None,
+            false,
+        );
+    }
     if n > 0 {
         wallet_store::log_activity(
             "mint.retry",
@@ -770,7 +951,7 @@ pub fn retry_all_failed() -> AppResult<i64> {
             true,
         );
     }
-    Ok(n as i64)
+    Ok(n)
 }
 
 /// Promote every draft task in one call (bulk "queue all drafts").
@@ -815,6 +996,9 @@ pub fn cancel_task(id: i64) -> AppResult<()> {
 
 fn set_status(id: i64, status: &str, tx_hash: Option<&str>, error: Option<&str>) {
     let now = crate::db::now_ms();
+    // Errors reach this column straight from RPC transport failures, whose
+    // Display includes the endpoint URL (API keys live in the path) — redact.
+    let error = error.map(chain::redact_urls_in);
     let _ = crate::db::with_conn(|conn| {
         conn.execute(
             "UPDATE mint_tasks SET status=?1, tx_hash=COALESCE(?2, tx_hash), error=?3, updated_at=?4 WHERE id=?5",
@@ -1517,6 +1701,43 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     }
 
     let fail = |msg: String| -> AppResult<MintTaskRow> {
+        let msg = chain::redact_urls_in(&msg);
+        // A persisted local tx hash means this tx may already sit in the
+        // mempool: requeueing to `pending` would re-sign with a fresh nonce
+        // and mint twice, and the first hash would be overwritten. Adjudicate
+        // the existing hash instead — only a deterministic node rejection
+        // (revert, insufficient funds, nonce too low) fails fast.
+        let stamped = crate::db::with_conn(|conn| {
+            let h: Option<String> =
+                conn.query_row("SELECT tx_hash FROM mint_tasks WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+            Ok(h)
+        });
+        if let Ok(Some(hash)) = stamped {
+            if is_permanent_err(&msg) {
+                // set_status keeps the hash via COALESCE for audit/retry safety.
+                set_status(id, "failed", None, Some(&msg));
+                wallet_store::log_activity(
+                    "mint.failed",
+                    &format!("Mint #{id} rejected: {msg} (tx {hash} was not accepted)"),
+                    None,
+                    false,
+                );
+            } else {
+                set_status(id, "broadcasting", None, Some(&msg));
+                wallet_store::log_activity(
+                    "mint.retry",
+                    &format!(
+                        "Mint #{id} send ambiguous ({msg}) — polling existing tx {hash} instead of re-signing"
+                    ),
+                    None,
+                    true,
+                );
+                spawn_receipt_poll(id);
+            }
+            return get_task(id);
+        }
         // Transient transport/RPC errors get one immediate requeue so a single
         // blip doesn't kill a scheduled FCFS task. Reverts/bad params still fail.
         if task.auto_retries < 1 && is_transient_err(&msg) {
@@ -1631,7 +1852,8 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             if let Ok(cid) = chk {
                 if cid != task.chain_id {
                     sim_err = Some(AppError::Rpc(format!(
-                        "RPC chain mismatch on {url}: endpoint is chain {cid}, task expects {}",
+                        "RPC chain mismatch on {}: endpoint is chain {cid}, task expects {}",
+                        chain::redact_rpc(url),
                         task.chain_id
                     )));
                     continue;
@@ -1654,7 +1876,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                     });
                     wallet_store::log_activity(
                         "mint.simulate",
-                        &format!("Mint #{id} simulated ok via {url}"),
+                        &format!("Mint #{id} simulated ok via {}", chain::redact_rpc(url)),
                         None,
                         true,
                     );
@@ -1662,7 +1884,8 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                 }
                 Err(e) => {
                     // Decode revert selectors into human-readable text.
-                    let mut msg = format!("eth_call via {url}: {}", decode_rpc_error(&e));
+                    let mut msg =
+                        format!("eth_call via {}: {}", chain::redact_rpc(url), decode_rpc_error(&e));
                     // Empty revert data ("0x") decodes to nothing useful — probe
                     // whether the selector even exists on the target first.
                     if msg.contains("without a readable reason") {
@@ -1725,7 +1948,11 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         );
         if let Ok(cid) = cid {
             if cid != task.chain_id {
-                last_err = Some(format!("{url} is chain {cid}, expected {}", task.chain_id));
+                last_err = Some(format!(
+                    "{} is chain {cid}, expected {}",
+                    chain::redact_rpc(url),
+                    task.chain_id
+                ));
                 continue;
             }
         }
@@ -1937,21 +2164,47 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
                     set_status(id, "broadcasting", Some(&hash), None);
                     wallet_store::log_activity(
                         "mint.broadcast",
-                        &format!("Mint #{id} broadcast {hash} via {url}"),
+                        &format!(
+                            "Mint #{id} broadcast {hash} via {}",
+                            chain::redact_rpc(url)
+                        ),
                         None,
                         true,
                     );
                 } else {
                     wallet_store::log_activity(
                         "mint.broadcast",
-                        &format!("Mint #{id} also sent via {url}"),
+                        &format!("Mint #{id} also sent via {}", chain::redact_rpc(url)),
                         None,
                         true,
                     );
                 }
             }
             Err(e) => {
-                last_err = Some(format!("{url}: {e}"));
+                let es = e.to_string().to_ascii_lowercase();
+                // Re-sending an identical signed tx is idempotent: a node that
+                // already has it answers "already known", which is proof of a
+                // successful broadcast (the ack was just lost).
+                if es.contains("already known")
+                    || es.contains("known transaction")
+                    || es.contains("already exists")
+                {
+                    if first_hash.is_none() {
+                        first_hash = Some(local_hash.clone());
+                        set_status(id, "broadcasting", Some(&local_hash), None);
+                        wallet_store::log_activity(
+                            "mint.broadcast",
+                            &format!(
+                                "Mint #{id} accepted {local_hash} (already known via {})",
+                                chain::redact_rpc(url)
+                            ),
+                            None,
+                            true,
+                        );
+                    }
+                } else {
+                    last_err = Some(chain::redact_urls_in(&format!("{url}: {e}")));
+                }
             }
         }
         // Spam: keep blasting remaining endpoints even after success.
@@ -2552,6 +2805,101 @@ mod tests {
             }
         }
         panic!("could not unlock vault for mint e2e");
+    }
+
+    #[test]
+    fn error_taxonomy_separates_permanent_from_transient() {
+        // Deterministic rejections must never be auto-requeued/polled.
+        assert!(is_permanent_err("nonce too low"));
+        assert!(is_permanent_err("execution reverted: NotActive()"));
+        assert!(is_permanent_err("insufficient funds for gas * price + value"));
+        assert!(is_permanent_err("send: endpoint is chain 1, expected 4663"));
+        assert!(!is_transient_err("execution reverted: NotActive()"));
+        assert!(!is_transient_err("nonce too low"));
+        // Transport-class blips still deserve the one-shot requeue.
+        assert!(is_transient_err("error sending request: timed out"));
+        assert!(is_transient_err("HTTP 429 Too Many Requests"));
+        assert!(is_transient_err("send: connection reset by peer"));
+        assert!(is_transient_err("send: 503 Service Unavailable"));
+    }
+
+    /// Backend half of the double-click guard: while an identical task is
+    /// still queued, a second submit must be rejected — two rows would sign
+    /// two transactions for one mint.
+    #[test]
+    fn e2e_duplicate_enqueue_is_rejected() {
+        let _serial = serial_guard();
+        fresh_db("dup");
+        ensure_unlocked();
+
+        let label = format!(
+            "dup-w-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let w = crate::wallet_store::create_wallet(&label, None).expect("wallet");
+        let chains = crate::chain::list_chains().unwrap();
+        let base = chains
+            .iter()
+            .find(|c| c.chain_id == 8453)
+            .cloned()
+            .expect("base chain seeded");
+        let common = EnqueueArgs {
+            wallet_id: w.id,
+            chain_id: base.chain_id,
+            contract: "0x0000000000000000000000000000000000000002".into(),
+            quantity: 1,
+            value_wei: None,
+            function_name: Some("mint()".into()),
+            is_hex: false,
+            parameters: None,
+            calldata: Some("0x1249c58b".into()),
+            rpc_endpoints: None,
+            flashbots: false,
+            gas_limit: None,
+            max_fee_gwei: None,
+            priority_fee_gwei: None,
+            nonce_override: None,
+            scheduled_at: None,
+            delay_ms: Some(0),
+            mode: Some("execute".into()),
+            opensea_ref: None,
+        };
+
+        let first = enqueue(common.clone()).expect("first enqueue");
+        let err = enqueue(common.clone())
+            .err()
+            .expect("duplicate must be rejected");
+        assert!(
+            err.to_string().contains("already queued"),
+            "unexpected error: {err}"
+        );
+        // Exactly one row for this wallet/contract.
+        let n = crate::db::with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM mint_tasks WHERE wallet_id=?1 AND contract=?2",
+                rusqlite::params![w.id, common.contract],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(n, 1, "duplicate insert slipped through");
+
+        // A different calldata is a different mint — still allowed.
+        let other = EnqueueArgs {
+            calldata: Some("0xa9059cbb".into()),
+            ..common.clone()
+        };
+        let _ = enqueue(other).expect("different calldata must enqueue");
+
+        // Draining the queue unblocks an identical re-submit.
+        crate::db::with_conn(|conn| {
+            conn.execute("UPDATE mint_tasks SET status='failed'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let _ = enqueue(common).expect("after the first left the queue");
+        assert_eq!(first.status, "pending");
     }
 
     /// Offline pipeline e2e: wallet → enqueue all modes/fields → list → cancel → schedule gate.

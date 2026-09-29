@@ -233,7 +233,19 @@ pub fn mint_enqueue(args: MintEnqueueArgs) -> AppResult<EnqueueBatchResult> {
                 }
             }
         }
-        out.push(mint::enqueue(a)?);
+        match mint::enqueue(a) {
+            Ok(task) => out.push(task),
+            // Duplicate of an already-queued task: skip this wallet instead of
+            // aborting the batch (and never create a second tx for the same mint).
+            Err(AppError::Invalid(msg)) if msg.contains("already queued") => {
+                skipped.push(SkippedWallet {
+                    wallet_id,
+                    address: wallet.address,
+                    reason: "already queued".into(),
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
     if al.is_some() {
         wallet_store::log_activity(
@@ -540,13 +552,14 @@ pub fn mint_promote_all() -> AppResult<i64> {
 }
 
 /// Reset a failed/cancelled task back to pending so it runs again.
+/// Refuses when the stored tx hash is confirmed or still in the mempool.
 #[tauri::command]
-pub fn mint_retry(id: i64) -> AppResult<MintTaskRow> {
-    mint::retry_task(id)
+pub async fn mint_retry(id: i64) -> AppResult<MintTaskRow> {
+    mint::retry_task(id).await
 }
 
-/// Retry ALL failed/cancelled tasks.
+/// Retry ALL failed/cancelled tasks (skips ones whose tx is confirmed/pending).
 #[tauri::command]
-pub fn mint_retry_all() -> AppResult<i64> {
-    mint::retry_all_failed()
+pub async fn mint_retry_all() -> AppResult<i64> {
+    mint::retry_all_failed().await
 }

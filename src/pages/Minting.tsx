@@ -85,6 +85,8 @@ export function MintingPage() {
   const [chains, setChains] = useState<ChainRow[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [running, setRunning] = useState(false);
+  /** In-flight guard for Queue: a double-click/Enter must not mint twice. */
+  const [enqueueing, setEnqueueing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [selectedWalletIds, setSelectedWalletIds] = useState<number[]>([]);
   const [selectedRpcUrls, setSelectedRpcUrls] = useState<string[]>([]);
@@ -434,7 +436,9 @@ export function MintingPage() {
 
   async function onEnqueue(e: FormEvent) {
     e.preventDefault();
+    if (enqueueing) return; // re-entrancy guard: Enter/double-click during submit
     setErr(null);
+    setEnqueueing(true);
     try {
       const contract = form.contract.trim();
       if (!/^0x[0-9a-fA-F]{40}$/.test(contract)) {
@@ -573,6 +577,8 @@ export function MintingPage() {
       suppressNewTaskToast.current = false;
     } catch (e2) {
       setErr(String(e2));
+    } finally {
+      setEnqueueing(false);
     }
   }
 
@@ -696,6 +702,7 @@ export function MintingPage() {
   }
 
   async function onEnqueueOpenSeaStage() {
+    if (enqueueingOpenSea) return; // re-entrancy guard: no double-submit
     setErr(null);
     setOpenSeaErr(null);
     if (!form.chainId) {
@@ -969,7 +976,8 @@ export function MintingPage() {
     form.contract.trim() &&
     selectedWalletIds.length > 0 &&
     (!form.isHex || form.hexCalldata.trim().length >= 2) &&
-    (!form.allowlist.trim() || matchedAllowlist > 0);
+    (!form.allowlist.trim() || matchedAllowlist > 0) &&
+    !enqueueing;
 
   // Poll task list so toasts fire when run_pending finishes in the background.
   useEffect(() => {
@@ -1669,7 +1677,9 @@ export function MintingPage() {
                 }
                 className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
               >
-                Enqueue ({form.allowlist.trim() ? matchedAllowlist : selectedWalletIds.length})
+                {enqueueing
+                  ? "Queueing…"
+                  : `Enqueue (${form.allowlist.trim() ? matchedAllowlist : selectedWalletIds.length})`}
               </button>
             </div>
           </div>

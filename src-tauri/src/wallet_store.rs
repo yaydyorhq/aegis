@@ -40,6 +40,10 @@ pub struct BulkImportResultItem {
 const WALLET_COLS: &str = "id, label, address, created_at, group_id";
 
 pub fn log_activity(kind: &str, summary: &str, payload: Option<&str>, ok: bool) {
+    // Choke point: every caller formats raw RPC/endpoint URLs into summaries,
+    // and those URLs can carry API keys in the path. Redact before persisting.
+    let summary = crate::chain::redact_urls_in(summary);
+    let payload = payload.map(crate::chain::redact_urls_in);
     let _ = db::with_conn(|conn| {
         conn.execute(
             "INSERT INTO activity(kind, summary, payload, ok, created_at) VALUES (?1,?2,?3,?4,?5)",
