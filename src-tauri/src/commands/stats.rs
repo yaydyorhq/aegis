@@ -1,5 +1,6 @@
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::vault;
+use alloy::primitives::U256;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -50,6 +51,127 @@ pub struct ModuleStatusItem {
     pub status: String,
     pub detail: String,
     pub ok: bool,
+}
+
+/// One wallet's live native balance.
+#[derive(Serialize)]
+pub struct LiveWalletBalance {
+    pub wallet_id: i64,
+    pub label: String,
+    pub address: String,
+    /// ETH decimal string (wei math done backend-side); None when the RPC
+    /// failed for this wallet — excluded from the total, surfaced via `failed`.
+    pub balance_eth: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct PortfolioLive {
+    pub chain_id: i64,
+    pub chain_name: String,
+    pub native_symbol: String,
+    /// Sum over wallets that answered, ETH decimal string.
+    pub total_eth: String,
+    pub wallets: Vec<LiveWalletBalance>,
+    pub failed: u32,
+    pub fetched_at: i64,
+}
+
+/// Live native balances for every wallet, meant for a ~20s UI poll.
+/// Chain anchor: the newest Collection PnL scan's chain, else the first
+/// enabled chain. Bounded concurrency so a 500-wallet vault cannot flood a
+/// public RPC from one tick.
+#[tauri::command]
+pub async fn portfolio_live() -> AppResult<PortfolioLive> {
+    const CONCURRENCY: usize = 6;
+    let chains = crate::chain::list_chains()?;
+    let scanned_chain: Option<i64> = crate::db::with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT chain_id FROM collection_pnl_scans ORDER BY scanned_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok())
+    })?;
+    let anchor = scanned_chain.unwrap_or_else(|| {
+        chains
+            .iter()
+            .find(|c| c.enabled != 0)
+            .map(|c| c.chain_id)
+            .unwrap_or(0)
+    });
+    let chain = chains
+        .into_iter()
+        .find(|c| c.chain_id == anchor && c.enabled != 0)
+        .ok_or_else(|| AppError::NotFound("no enabled chain for the live scan".into()))?;
+
+    let wallets = crate::wallet_store::list_wallets()?;
+    let rpc = chain.rpc_url.clone();
+    let mut queue = wallets.iter().enumerate();
+    let mut set = tokio::task::JoinSet::new();
+    let mut balances: Vec<Option<U256>> = vec![None; wallets.len()];
+
+    let spawn_one = |set: &mut tokio::task::JoinSet<(usize, Option<U256>)>,
+                     rpc: &str,
+                     i: usize,
+                     address: &str| {
+        let rpc = rpc.to_string();
+        let address = address.to_string();
+        set.spawn(async move {
+            let bal = crate::chain::native_balance(&rpc, &address)
+                .await
+                .ok()
+                .and_then(|h| U256::from_str_radix(h.trim_start_matches("0x"), 16).ok());
+            (i, bal)
+        });
+    };
+    while set.len() < CONCURRENCY {
+        match queue.next() {
+            Some((i, w)) => spawn_one(&mut set, &rpc, i, &w.address),
+            None => break,
+        }
+    }
+    while let Some(res) = set.join_next().await {
+        let (i, bal) = res.map_err(|e| AppError::Other(e.to_string()))?;
+        balances[i] = bal;
+        if let Some((i, w)) = queue.next() {
+            spawn_one(&mut set, &rpc, i, &w.address);
+        }
+    }
+
+    let mut total = U256::ZERO;
+    let mut rows = Vec::with_capacity(wallets.len());
+    let mut failed = 0u32;
+    for (w, bal) in wallets.iter().zip(balances.iter()) {
+        let balance_eth = bal.map(|v| {
+            total = total.saturating_add(v);
+            crate::wallet::balance_to_eth(v)
+        });
+        if bal.is_none() {
+            failed += 1;
+        }
+        rows.push(LiveWalletBalance {
+            wallet_id: w.id,
+            label: w.label.clone(),
+            address: w.address.clone(),
+            balance_eth,
+        });
+    }
+    rows.sort_by(|a, b| {
+        let av = a.balance_eth.as_deref().and_then(|s| s.parse::<f64>().ok());
+        let bv = b.balance_eth.as_deref().and_then(|s| s.parse::<f64>().ok());
+        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(PortfolioLive {
+        chain_id: chain.chain_id,
+        chain_name: chain.name.clone(),
+        native_symbol: chain.symbol.clone(),
+        total_eth: crate::wallet::balance_to_eth(total),
+        wallets: rows,
+        failed,
+        fetched_at: crate::db::now_ms(),
+    })
 }
 
 /// Parse a signed ETH flow string ("+1.5", "-0.25", "0") to f64.

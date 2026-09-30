@@ -10,7 +10,7 @@ import type {
   PnlResult,
 } from "../lib/types";
 import { EmptyState, PageHeader } from "../components/ui";
-import { shortAddress } from "../lib/utils";
+import { formatEth, shortAddress } from "../lib/utils";
 import {
   filterWalletsByGroup,
   groupNameMap,
@@ -370,7 +370,7 @@ function CollectionTab() {
             <div className="rounded-[14px] border border-line bg-card p-4">
               <div className="text-[12px] text-muted">Floor price</div>
               <div className="mt-1 text-[20px] font-semibold">
-                {result.floor_eth ?? "n/a"}{" "}
+                {result.floor_eth ? formatEth(result.floor_eth) : "n/a"}{" "}
                 <span className="text-[13px] font-normal text-muted">
                   {result.floor_eth ? result.native_symbol : ""}
                 </span>
@@ -389,8 +389,9 @@ function CollectionTab() {
                 className={`mt-1 text-[20px] font-semibold ${
                   t?.net_eth ? flowClass(t.net_eth) : "text-muted"
                 }`}
+                title={t?.net_eth ?? undefined}
               >
-                {t?.net_eth ?? "n/a"}{" "}
+                {t?.net_eth != null ? formatEth(t.net_eth) : "n/a"}{" "}
                 <span className="text-[13px] font-normal text-muted">
                   {result.native_symbol}
                 </span>
@@ -437,10 +438,10 @@ function CollectionTab() {
           <div className="rounded-[14px] border border-line bg-card">
             <div className="grid grid-cols-2 gap-y-3 p-4 sm:grid-cols-3 lg:grid-cols-6">
               {[
-                ["Spent", `${t?.spent_eth ?? "0"} ${result.native_symbol}`],
-                ["Realized", t?.realized_eth ?? "0"],
-                ["Unrealized", t?.unrealized_eth ?? "n/a"],
-                ["Gas", `${t?.gas_eth ?? "0"} ${result.native_symbol}`],
+                ["Spent", `${t ? formatEth(t.spent_eth) : "0"} ${result.native_symbol}`],
+                ["Realized", t ? formatEth(t.realized_eth) : "0"],
+                ["Unrealized", t?.unrealized_eth != null ? formatEth(t.unrealized_eth) : "n/a"],
+                ["Gas", `${t ? formatEth(t.gas_eth) : "0"} ${result.native_symbol}`],
                 ["Wallets", String(t?.wallets ?? 0)],
                 [
                   "Unpriced sales",
@@ -531,14 +532,17 @@ function CollectionTab() {
                           ? r.balance
                           : `~${r.holding}`}
                       </td>
-                      <td className="px-2 py-2 text-right">{r.spent_eth}</td>
-                      <td className="px-2 py-2 text-right text-muted">
-                        {r.gas_eth}
+                      <td className="px-2 py-2 text-right" title={r.spent_eth}>
+                        {formatEth(r.spent_eth)}
+                      </td>
+                      <td className="px-2 py-2 text-right text-muted" title={r.gas_eth}>
+                        {formatEth(r.gas_eth)}
                       </td>
                       <td
                         className={`px-2 py-2 text-right ${flowClass(r.realized_eth)}`}
+                        title={r.realized_eth}
                       >
-                        {r.realized_eth}
+                        {formatEth(r.realized_eth)}
                       </td>
                       <td
                         className={`px-2 py-2 text-right ${
@@ -546,15 +550,17 @@ function CollectionTab() {
                             ? "text-muted"
                             : flowClass(r.unrealized_eth)
                         }`}
+                        title={r.unrealized_eth ?? undefined}
                       >
-                        {r.unrealized_eth ?? "n/a"}
+                        {r.unrealized_eth != null ? formatEth(r.unrealized_eth) : "n/a"}
                       </td>
                       <td
                         className={`px-2 py-2 text-right font-semibold ${
                           r.net_eth == null ? "text-muted" : flowClass(r.net_eth)
                         }`}
+                        title={r.net_eth ?? undefined}
                       >
-                        {r.net_eth ?? "n/a"}
+                        {r.net_eth != null ? formatEth(r.net_eth) : "n/a"}
                       </td>
                       <td className="px-2 py-2 text-right">
                         {r.roi_pct != null
@@ -590,32 +596,35 @@ function CollectionTab() {
                     <td className="px-2 py-2 text-right text-[12px]">
                       {t?.balance ?? 0}
                     </td>
-                    <td className="px-2 py-2 text-right text-[12px]">
-                      {t?.spent_eth ?? "0"}
+                    <td className="px-2 py-2 text-right text-[12px]" title={t?.spent_eth}>
+                      {t ? formatEth(t.spent_eth) : "0"}
                     </td>
-                    <td className="px-2 py-2 text-right text-[12px] text-muted">
-                      {t?.gas_eth ?? "0"}
+                    <td className="px-2 py-2 text-right text-[12px] text-muted" title={t?.gas_eth}>
+                      {t ? formatEth(t.gas_eth) : "0"}
                     </td>
                     <td
                       className={`px-2 py-2 text-right text-[12px] ${
                         t ? flowClass(t.realized_eth) : ""
                       }`}
+                      title={t?.realized_eth}
                     >
-                      {t?.realized_eth ?? "0"}
+                      {t ? formatEth(t.realized_eth) : "0"}
                     </td>
                     <td
                       className={`px-2 py-2 text-right text-[12px] ${
                         t?.unrealized_eth ? flowClass(t.unrealized_eth) : "text-muted"
                       }`}
+                      title={t?.unrealized_eth ?? undefined}
                     >
-                      {t?.unrealized_eth ?? "n/a"}
+                      {t?.unrealized_eth != null ? formatEth(t.unrealized_eth) : "n/a"}
                     </td>
                     <td
                       className={`px-2 py-2 text-right text-[12px] ${
                         t?.net_eth ? flowClass(t.net_eth) : "text-muted"
                       }`}
+                      title={t?.net_eth ?? undefined}
                     >
-                      {t?.net_eth ?? "n/a"}
+                      {t?.net_eth != null ? formatEth(t.net_eth) : "n/a"}
                     </td>
                     <td className="px-2 py-2 text-right text-[12px]">
                       {t?.roi_pct != null

@@ -403,6 +403,32 @@ export interface CollectionPnlResult {
   scanned_at: number;
 }
 
+/** One point of the dashboard net-worth sparkline (a past Collection PnL scan). */
+export interface CollectionPnlPoint {
+  scanned_at: number;
+  net_eth: string | null;
+  roi_pct: number | null;
+}
+
+/** Live native balance for one wallet (from the ~20s dashboard poll). */
+export interface LiveWalletBalance {
+  wallet_id: number;
+  label: string;
+  address: string;
+  /** ETH decimal string; null when the RPC failed for this wallet. */
+  balance_eth: string | null;
+}
+
+export interface PortfolioLive {
+  chain_id: number;
+  chain_name: string;
+  native_symbol: string;
+  total_eth: string;
+  wallets: LiveWalletBalance[];
+  failed: number;
+  fetched_at: number;
+}
+
 /** Per-stage eligibility cell for one wallet. */
 export interface StageMatrixCell {
   stage_name: string;

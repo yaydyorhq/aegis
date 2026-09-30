@@ -164,6 +164,7 @@ pub fn run() {
             commands::activity::activity_list,
             commands::stats::stats_overview,
             commands::stats::module_status,
+            commands::stats::portfolio_live,
             // meta (local prefs)
             commands::meta::meta_get,
             commands::meta::meta_set,
@@ -177,6 +178,7 @@ pub fn run() {
             commands::pnl::pnl_history,
             commands::pnl::collection_pnl_scan,
 commands::pnl::collection_pnl_last,
+commands::pnl::collection_pnl_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
