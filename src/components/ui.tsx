@@ -35,9 +35,12 @@ export function ToastHost() {
     function onToast(e: Event) {
       const item = (e as CustomEvent<ToastItem>).detail;
       setItems((prev) => [...prev, item].slice(-5));
+      // Errors need reading time; info can go quickly.
+      const ttl =
+        item.tone === "error" ? 9000 : item.tone === "warn" ? 6500 : 4500;
       window.setTimeout(() => {
         setItems((prev) => prev.filter((x) => x.id !== item.id));
-      }, 5000);
+      }, ttl);
     }
     window.addEventListener("aegis:toast", onToast);
     return () => window.removeEventListener("aegis:toast", onToast);
@@ -179,32 +182,174 @@ export function StatCard({
   value,
   hint,
   icon,
+  onClick,
 }: {
   label: string;
   value: string | number;
   hint?: string;
   icon?: ReactNode;
+  /** When set the card navigates — rendered as a button with hover affordance. */
+  onClick?: () => void;
 }) {
-  return (
-    <div className="rounded-[14px] border border-line bg-card p-4">
+  const inner = (
+    <>
       <div className="flex items-start justify-between">
         <div className="text-[12px] text-muted">{label}</div>
         {icon ? <div className="text-muted">{icon}</div> : null}
       </div>
       <div className="mt-3 text-[28px] font-semibold tracking-tight text-fg">{value}</div>
       {hint ? <div className="mt-1 text-[12px] text-muted">{hint}</div> : null}
-    </div>
+    </>
   );
+  if (onClick) {
+    return (
+      <button
+        onClick={onClick}
+        className="rounded-[14px] border border-line bg-card p-4 text-left transition-colors hover:border-accent/50"
+      >
+        {inner}
+      </button>
+    );
+  }
+  return <div className="rounded-[14px] border border-line bg-card p-4">{inner}</div>;
 }
 
-export function StatusDot({ ok }: { ok: boolean }) {
+export type StatusTone = "ok" | "info" | "warn" | "danger" | "idle";
+
+export function StatusDot({
+  ok,
+  tone,
+  pulse,
+}: {
+  ok?: boolean;
+  /** Explicit tone — wins over the boolean `ok` shorthand. */
+  tone?: StatusTone;
+  /** Subtle breathing for in-flight states (signing / broadcasting). */
+  pulse?: boolean;
+}) {
+  const t = tone ?? (ok ? "ok" : "idle");
+  const cls = {
+    ok: "bg-ok",
+    info: "bg-accent",
+    warn: "bg-warn",
+    danger: "bg-danger",
+    idle: "bg-muted/60",
+  }[t];
   return (
     <span
       className={cn(
-        "inline-block h-[7px] w-[7px] rounded-full",
-        ok ? "bg-ok" : "bg-muted/60",
+        "inline-block h-[7px] w-[7px] shrink-0 rounded-full",
+        cls,
+        pulse && "animate-pulse",
       )}
     />
+  );
+}
+
+/** Close overlays (modals, dialogs) with Escape while mounted/active. */
+export function useDismissOnEscape(
+  active: boolean,
+  onClose: () => void,
+): void {
+  useEffect(() => {
+    if (!active) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active, onClose]);
+}
+
+/**
+ * In-app replacement for the webview's confirm()/prompt() dialogs: matches
+ * the design system, masks the passphrase field, closes on Escape/backdrop.
+ * With `passwordLabel` set, confirm stays disabled until something is typed
+ * and `onConfirm` receives the passphrase.
+ */
+export function ConfirmDialog({
+  open,
+  title,
+  body,
+  confirmLabel = "Confirm",
+  cancelLabel = "Cancel",
+  danger = false,
+  busy = false,
+  passwordLabel,
+  onConfirm,
+  onClose,
+}: {
+  open: boolean;
+  title: string;
+  body?: ReactNode;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  danger?: boolean;
+  busy?: boolean;
+  passwordLabel?: string;
+  onConfirm: (passphrase: string) => void;
+  onClose: () => void;
+}) {
+  const [pass, setPass] = useState("");
+  useEffect(() => {
+    if (open) setPass("");
+  }, [open]);
+  useDismissOnEscape(open, onClose);
+  if (!open) return null;
+  const canConfirm = !busy && (!passwordLabel || pass.length > 0);
+  return (
+    <div
+      className="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (canConfirm) onConfirm(pass);
+        }}
+        onClick={(e) => e.stopPropagation()}
+        className="w-[400px] rounded-[14px] border border-line bg-panel shadow-2xl"
+      >
+        <div className="border-b border-line px-5 py-4 text-[14px] font-semibold text-fg">
+          {title}
+        </div>
+        <div className="space-y-2 px-5 py-4">
+          {body ? (
+            <div className="text-[12.5px] leading-relaxed text-muted">{body}</div>
+          ) : null}
+          {passwordLabel ? (
+            <input
+              type="password"
+              autoFocus
+              value={pass}
+              onChange={(e) => setPass(e.target.value)}
+              placeholder={passwordLabel}
+              className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
+            />
+          ) : null}
+        </div>
+        <div className="flex justify-end gap-2 border-t border-line px-5 py-3.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg border border-line bg-card px-3 py-2 text-[13px] text-fg hover:border-muted/40"
+          >
+            {cancelLabel}
+          </button>
+          <button
+            type="submit"
+            disabled={!canConfirm}
+            autoFocus={passwordLabel == null}
+            className={cn(
+              "rounded-lg px-3.5 py-2 text-[13px] font-semibold text-white disabled:opacity-40",
+              danger ? "bg-danger" : "bg-accent",
+            )}
+          >
+            {busy ? "Working…" : confirmLabel}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 

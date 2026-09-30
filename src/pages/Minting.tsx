@@ -19,11 +19,10 @@ import type {
   OpenSeaMintPlan,
   SeaDropPlan,
 } from "../lib/types";
-import { EmptyState, MultiSelectDropdown, PageHeader, StatusDot, pushToast, type DropdownGroup } from "../components/ui";
+import { EmptyState, MultiSelectDropdown, PageHeader, StatusDot, pushToast, ConfirmDialog, useDismissOnEscape, type DropdownGroup, type StatusTone } from "../components/ui";
 import { shortAddress } from "../lib/utils";
-import {
-  useWalletStore,
-} from "../store/app";
+import { useWalletStore } from "../store/app";
+import { suppressNextNewTaskToast, useMintTaskFeed } from "../store/tasks";
 
 type Mode = "execute" | "simulate" | "spam" | "sweep";
 
@@ -81,7 +80,10 @@ const emptyForm = {
 
 export function MintingPage() {
   const { wallets, groups, load: loadWallets } = useWalletStore();
-  const [tasks, setTasks] = useState<MintTaskRow[]>([]);
+  // Task list + status toasts come from the app-wide feed (polled in AppShell)
+  // so confirm/fail notifications fire on any page, not just this one.
+  const tasks = useMintTaskFeed((s) => s.tasks);
+  const refreshTasks = useMintTaskFeed((s) => s.refresh);
   const [chains, setChains] = useState<ChainRow[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [running, setRunning] = useState(false);
@@ -116,11 +118,9 @@ export function MintingPage() {
   const [encodeErr, setEncodeErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [statusFilter, setStatusFilter] = useState<"all" | "draft" | "pending" | "done" | "failed">("all");
-  const seenTaskIds = useRef<Set<number>>(new Set());
-  const seenStatuses = useRef<Map<number, string>>(new Map());
-  const primedTasks = useRef(false);
-  /** After local enqueue we already toast — suppress the "new task" duplicate. */
-  const suppressNewTaskToast = useRef(false);
+  /** Cancel is destructive and irreversible — needs an explicit confirm. */
+  const [cancelTarget, setCancelTarget] = useState<MintTaskRow | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   /** RPC selection is initialised exactly once per selected chain. */
   const rpcInitKey = useRef<string | null>(null);
 
@@ -239,80 +239,18 @@ export function MintingPage() {
     };
   }, [form.contract, form.chainId, enabledChains]);
 
-  function applyTaskNotifications(next: MintTaskRow[]) {
-    const newIds: number[] = [];
-    const statusHits: {
-      title: string;
-      detail: string;
-      tone: "ok" | "warn" | "error";
-    }[] = [];
-    for (const t of next) {
-      if (!primedTasks.current) {
-        seenTaskIds.current.add(t.id);
-        seenStatuses.current.set(t.id, t.status);
-        continue;
-      }
-      if (!seenTaskIds.current.has(t.id)) {
-        seenTaskIds.current.add(t.id);
-        seenStatuses.current.set(t.id, t.status);
-        if (!suppressNewTaskToast.current) newIds.push(t.id);
-      } else {
-        const prev = seenStatuses.current.get(t.id);
-        if (prev && prev !== t.status) {
-          seenStatuses.current.set(t.id, t.status);
-          if (t.status === "confirmed" || t.status === "simulated") {
-            statusHits.push({
-              title: `Mint #${t.id} ${t.status}`,
-              detail: t.tx_hash ? shortAddress(t.tx_hash, 8) : shortAddress(t.contract, 6),
-              tone: "ok",
-            });
-          } else if (
-            t.status === "failed" ||
-            t.status === "canceled" ||
-            t.status === "cancelled"
-          ) {
-            statusHits.push({
-              title: `Mint #${t.id} ${t.status}`,
-              detail: (t.error || t.status).slice(0, 140),
-              tone: "error",
-            });
-          }
-        }
-      }
-    }
-    primedTasks.current = true;
-    if (newIds.length > 0) {
-      const list = newIds.map((id) => `#${id}`).join(", ");
-      pushToast(
-        newIds.length === 1 ? `New mint task ${list}` : `New mint tasks ${list}`,
-        "info",
-        next
-          .filter((t) => newIds.includes(t.id))
-          .map((t) => shortAddress(t.contract, 6))
-          .join(", "),
-      );
-    }
-    for (const hit of statusHits) {
-      pushToast(hit.title, hit.tone, hit.detail);
-    }
-  }
-
   const load = useCallback(async () => {
     try {
-      const [t, c] = await Promise.all([
-        ipc<MintTaskRow[]>("mint_list"),
+      const [c] = await Promise.all([
         ipc<ChainRow[]>("chain_list"),
+        refreshTasks(),
+        loadWallets(),
       ]);
-      applyTaskNotifications(t);
-      setTasks(t);
       setChains(c);
-      await loadWallets();
     } catch (e) {
       setErr(String(e));
     }
-    // applyTaskNotifications uses only refs + setState
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadWallets]);
+  }, [loadWallets, refreshTasks]);
 
   useEffect(() => {
     void load();
@@ -562,7 +500,8 @@ export function MintingPage() {
           ? `${queued} queued · ${skipped} skipped · ${form.mode}`
           : `${queued} wallet(s) · ${form.mode} · qty ${qty}`,
       );
-      suppressNewTaskToast.current = true;
+      // The queued-toast above already covers it — skip the feed's duplicate.
+      suppressNextNewTaskToast();
       setShowForm(false);
       setForm(emptyForm);
       setSeaDrop(null);
@@ -574,7 +513,6 @@ export function MintingPage() {
       setSelectedWalletIds([]);
       setSelectedRpcUrls([]);
       await load();
-      suppressNewTaskToast.current = false;
     } catch (e2) {
       setErr(String(e2));
     } finally {
@@ -779,7 +717,7 @@ export function MintingPage() {
             .slice(0, 400),
         );
       }
-      suppressNewTaskToast.current = true;
+      suppressNextNewTaskToast();
       setShowForm(false);
       setForm(emptyForm);
       setSeaDrop(null);
@@ -791,7 +729,6 @@ export function MintingPage() {
       setSelectedWalletIds([]);
       setSelectedRpcUrls([]);
       await load();
-      suppressNewTaskToast.current = false;
     } catch (e) {
       setOpenSeaErr(String(e));
       pushToast("OpenSea mint failed", "error", String(e).slice(0, 160));
@@ -935,11 +872,15 @@ export function MintingPage() {
   }
 
   async function onCancel(id: number) {
+    setCancelling(true);
     try {
       await ipc("mint_cancel", { id });
+      setCancelTarget(null);
       await load();
     } catch (e) {
       setErr(String(e));
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -979,20 +920,21 @@ export function MintingPage() {
     (!form.allowlist.trim() || matchedAllowlist > 0) &&
     !enqueueing;
 
-  // Poll task list so toasts fire when run_pending finishes in the background.
-  useEffect(() => {
-    const iv = window.setInterval(() => {
-      void ipc<MintTaskRow[]>("mint_list")
-        .then((t) => {
-          applyTaskNotifications(t);
-          setTasks(t);
-        })
-        .catch(() => {
-          /* keep last known list */
-        });
-    }, 4000);
-    return () => window.clearInterval(iv);
-  }, []);
+  // Chain names for the task rows (resolved per chain_id, not raw ids).
+  const chainNameById = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const c of chains) m.set(c.chain_id, c.name);
+    return m;
+  }, [chains]);
+  const walletById = useMemo(() => {
+    const m = new Map<number, (typeof wallets)[number]>();
+    for (const w of wallets) m.set(w.id, w);
+    return m;
+  }, [wallets]);
+
+  useDismissOnEscape(showForm, () => setShowForm(false));
+
+  // Task refreshes are handled app-wide by the mint task feed (AppShell).
 
   return (
     <div className="p-6">
@@ -1631,11 +1573,11 @@ export function MintingPage() {
                     className={`flex items-center gap-1 rounded-lg border px-3 py-2 text-[13px] font-medium transition ${
                       active
                         ? mode === "simulate"
-                          ? "border-sky-500 bg-sky-500/15 text-sky-300"
+                          ? "border-sky-500 bg-sky-500/15 text-sky-700 dark:text-sky-300"
                           : mode === "spam"
-                            ? "border-amber-500 bg-amber-500/15 text-amber-300"
+                            ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-300"
                             : mode === "sweep"
-                              ? "border-rose-500 bg-rose-500/15 text-rose-300"
+                              ? "border-rose-500 bg-rose-500/15 text-rose-700 dark:text-rose-300"
                               : "border-accent bg-accent/20 text-fg"
                         : "border-line bg-bg text-muted hover:border-muted/40"
                     }`}
@@ -1721,9 +1663,10 @@ export function MintingPage() {
       </div>
 
       <div className="overflow-x-auto rounded-[14px] border border-line bg-card">
-        <div className="grid min-w-[740px] grid-cols-[36px_1fr_80px_66px_82px_72px_196px_50px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid min-w-[920px] grid-cols-[36px_1fr_130px_80px_66px_82px_72px_190px_50px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
           <div>ID</div>
           <div>Contract</div>
+          <div>Wallet</div>
           <div>Gas</div>
           <div>Value</div>
           <div>Schedule</div>
@@ -1739,10 +1682,14 @@ export function MintingPage() {
         ) : filteredTasks.length === 0 ? (
           <div className="px-4 py-6 text-center text-[13px] text-muted">No {statusFilter} tasks.</div>
         ) : (
-          filteredTasks.map((t) => (
+          filteredTasks.map((t) => {
+            const st = statusTone(t.status);
+            const w = t.wallet_id != null ? walletById.get(t.wallet_id) : undefined;
+            const chainName = chainNameById.get(t.chain_id);
+            return (
             <div
               key={t.id}
-              className="grid min-w-[740px] grid-cols-[36px_1fr_80px_66px_82px_72px_196px_50px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
+              className="grid min-w-[920px] grid-cols-[36px_1fr_130px_80px_66px_82px_72px_190px_50px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
             >
               <div className="text-muted">#{t.id}</div>
               <div className="min-w-0 overflow-hidden truncate font-mono text-[12px]" title={t.contract}>
@@ -1753,10 +1700,25 @@ export function MintingPage() {
                 {t.is_hex && t.calldata ? (
                   <span className="ml-1.5 text-muted opacity-70">· hex</span>
                 ) : null}
+                {chainName ? (
+                  <span className="ml-1.5 text-muted opacity-70">· {chainName}</span>
+                ) : null}
               </div>
-              <div className="truncate text-[12px] text-muted" title={t.gas_limit || ""}>
+              <div
+                className="min-w-0 truncate text-[12px]"
+                title={w ? `${w.label} · ${w.address}` : t.wallet_id != null ? `wallet #${t.wallet_id}` : undefined}
+              >
+                {w ? (
+                  <span className="truncate">{w.label}</span>
+                ) : t.wallet_id != null ? (
+                  <span className="text-muted">#{t.wallet_id}</span>
+                ) : (
+                  <span className="text-muted">—</span>
+                )}
+              </div>
+              <div className="truncate text-[12px] text-muted" title={t.gas_limit ? `gas limit ${t.gas_limit}` : t.max_fee_gwei ? `max fee ${t.max_fee_gwei} gwei` : "auto"}>
                 {t.gas_limit
-                  ? `${t.gas_limit} g`
+                  ? t.gas_limit
                   : t.max_fee_gwei
                     ? `${t.max_fee_gwei} gwei`
                     : "auto"}
@@ -1782,8 +1744,8 @@ export function MintingPage() {
               </div>
               <div className="flex min-w-0 flex-col gap-0.5 overflow-hidden text-[12px] capitalize">
                 <div className="flex items-center gap-1.5">
-                  <StatusDot ok={t.status === "confirmed" || t.status === "simulated"} />
-                  <span className="min-w-0 truncate">
+                  <StatusDot tone={st.tone} pulse={st.pulse} />
+                  <span className={`min-w-0 truncate ${st.tone === "danger" ? "text-danger" : ""}`}>
                     {t.status === "confirmed" && t.tx_hash
                       ? `minted · ${shortAddress(t.tx_hash, 4)}`
                       : t.status}
@@ -1842,30 +1804,56 @@ export function MintingPage() {
                 ) : null}
                 {t.status === "pending" || t.status === "draft" ? (
                   <button
-                    onClick={() => onCancel(t.id)}
+                    onClick={() => setCancelTarget(t)}
                     className="rounded p-1 text-muted hover:bg-line hover:text-danger"
-                    title="Cancel"
+                    title="Cancel (asks for confirmation)"
                   >
                     <X className="h-4 w-4" />
                   </button>
                 ) : null}
               </div>
             </div>
-          ))
+            );
+          })
         )}
       </div>
+
+      <ConfirmDialog
+        open={cancelTarget != null}
+        title={cancelTarget ? `Cancel mint task #${cancelTarget.id}?` : ""}
+        body="The queued task is deleted. This cannot be undone — tasks already broadcasting keep running."
+        confirmLabel="Cancel task"
+        cancelLabel="Keep"
+        danger
+        busy={cancelling}
+        onConfirm={() => cancelTarget && void onCancel(cancelTarget.id)}
+        onClose={() => setCancelTarget(null)}
+      />
     </div>
   );
+}
+
+/** Dot + text tone per task status; in-flight states breathe. */
+function statusTone(status: string): { tone: StatusTone; pulse: boolean } {
+  if (status === "confirmed" || status === "simulated")
+    return { tone: "ok", pulse: false };
+  if (status === "failed" || status === "canceled" || status === "cancelled")
+    return { tone: "danger", pulse: false };
+  if (status === "draft") return { tone: "warn", pulse: false };
+  if (status === "signing" || status === "broadcasting")
+    return { tone: "info", pulse: true };
+  if (status === "pending") return { tone: "info", pulse: false };
+  return { tone: "idle", pulse: false };
 }
 
 function ModeBadge({ mode }: { mode: string }) {
   const cls =
     mode === "simulate"
-      ? "border-sky-500/50 text-sky-300"
+      ? "border-sky-500/50 text-sky-700 dark:text-sky-300"
       : mode === "spam"
-        ? "border-amber-500/50 text-amber-300"
+        ? "border-amber-500/50 text-amber-700 dark:text-amber-300"
         : mode === "sweep"
-          ? "border-rose-500/50 text-rose-300"
+          ? "border-rose-500/50 text-rose-700 dark:text-rose-300"
           : "border-line text-muted";
   return (
     <span className={`inline-flex rounded border px-1.5 py-0.5 text-[11px] capitalize ${cls}`}>

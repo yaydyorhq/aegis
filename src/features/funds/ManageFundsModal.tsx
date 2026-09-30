@@ -10,7 +10,7 @@ import type {
   FundsStartArgs,
 } from "../../lib/types";
 import { shortAddress } from "../../lib/utils";
-import { pushToast } from "../../components/ui";
+import { pushToast, useDismissOnEscape } from "../../components/ui";
 import { filterWalletsByGroup, groupNameMap, useWalletStore } from "../../store/app";
 
 type Mode = "disperse" | "consolidate";
@@ -59,6 +59,9 @@ function parseUnitsToWei(input: string, decimals: number): string | null {
 
 export function ManageFundsModal({ onClose }: { onClose: () => void }) {
   const { wallets, groups, load: loadWallets } = useWalletStore();
+  // Esc closes; a running job keeps going in the backend runner (the UI poll
+  // just stops with the modal — reopening Wallets → Manage Funds reattaches).
+  useDismissOnEscape(true, onClose);
   const [step, setStep] = useState<Step>("config");
   const [mode, setMode] = useState<Mode>("disperse");
   const [amountMode, setAmountMode] = useState<AmountMode>("fixed");

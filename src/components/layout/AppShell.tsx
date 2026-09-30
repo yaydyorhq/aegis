@@ -5,6 +5,7 @@ import { TopBar } from "./TopBar";
 import { VaultGate } from "../../features/vault/VaultGate";
 import { QuickTaskPalette } from "../../features/quicktask/QuickTaskPalette";
 import { ToastHost } from "../ui";
+import { startMintTaskFeed } from "../../store/tasks";
 
 interface ShellCtx {
   openQuickTask: () => void;
@@ -27,6 +28,11 @@ export function AppShell({ profileName }: { profileName: string }) {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // One global task poll drives status toasts everywhere.
+  useEffect(() => {
+    startMintTaskFeed();
   }, []);
 
   return (

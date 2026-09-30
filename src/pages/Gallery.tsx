@@ -31,6 +31,9 @@ export function GalleryPage() {
   const [walletGroupFilter, setWalletGroupFilter] = useState<GroupFilter>("all");
   const [chainFilter, setChainFilter] = useState("");
   const [query, setQuery] = useState("");
+  /** Image URLs that failed to load — fall back to the "no image" placeholder
+   *  instead of the browser's broken-image icon with raw alt text. */
+  const [broken, setBroken] = useState<Set<string>>(new Set());
 
   const groupNames = useMemo(() => groupNameMap(groups), [groups]);
   const formWallets = useMemo(
@@ -189,18 +192,29 @@ export function GalleryPage() {
             const chain = chainMap.get(n.chain_id);
             const url = n.opensea_url || explorerTokenUrl(chain, n);
             const stale = Date.now() - n.fetched_at > 24 * 60 * 60 * 1000;
+            const key = n.id
+              ? `id${n.id}`
+              : `${n.chain_id}-${n.contract}-${n.token_id}`;
+            const showImage = n.image && !broken.has(key);
             return (
               <div
-                key={n.id || `${n.chain_id}-${n.contract}-${n.token_id}`}
+                key={key}
                 className="group relative overflow-hidden rounded-xl border border-line bg-card"
               >
                 <div className="aspect-square bg-line/40">
-                  {n.image ? (
+                  {showImage ? (
                     <img
-                      src={n.image}
+                      src={n.image!}
                       alt={n.name || n.token_id}
                       loading="lazy"
                       className="h-full w-full object-cover"
+                      onError={() =>
+                        setBroken((prev) => {
+                          const next = new Set(prev);
+                          next.add(key);
+                          return next;
+                        })
+                      }
                     />
                   ) : (
                     <div className="flex h-full items-center justify-center text-[11px] text-muted">

@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard,
   Activity,
@@ -49,6 +49,7 @@ const groups = [
 ];
 
 export function Sidebar({ profileName }: { profileName: string }) {
+  const nav = useNavigate();
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-line bg-panel">
       <div className="flex h-[52px] items-center gap-2.5 border-b border-line px-4" data-tauri-drag-region>
@@ -89,7 +90,11 @@ export function Sidebar({ profileName }: { profileName: string }) {
       </nav>
 
       <div className="border-t border-line p-2.5">
-        <button className="flex w-full items-center gap-2.5 rounded-lg border border-line bg-card px-2.5 py-2 text-left transition-colors hover:border-muted/40">
+        <button
+          onClick={() => nav("/settings")}
+          title="Profile & settings"
+          className="flex w-full items-center gap-2.5 rounded-lg border border-line bg-card px-2.5 py-2 text-left transition-colors hover:border-muted/40"
+        >
           <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-md bg-accent/20 text-[11px] font-semibold text-accent">
             {profileName.slice(0, 2).toUpperCase()}
           </div>

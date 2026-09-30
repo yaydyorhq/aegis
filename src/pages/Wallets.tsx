@@ -16,7 +16,7 @@ import type {
   BulkImportResultItem,
 } from "../lib/types";
 import { shortAddress } from "../lib/utils";
-import { EmptyState, PageHeader, pushToast } from "../components/ui";
+import { EmptyState, PageHeader, pushToast, ConfirmDialog } from "../components/ui";
 import { useVaultStore, useWalletStore } from "../store/app";
 import { ManageFundsModal } from "../features/funds/ManageFundsModal";
 
@@ -79,6 +79,16 @@ export function WalletsPage() {
   const [newGroupName, setNewGroupName] = useState("");
   const [renameId, setRenameId] = useState<number | null>(null);
   const [renameVal, setRenameVal] = useState("");
+
+  /** Destructive/secret action awaiting in-app confirmation (replaces the
+   *  webview's confirm()/prompt() — those are unstyled and, for prompt(),
+   *  show the passphrase unmasked). */
+  type Pending =
+    | { kind: "delete-wallet"; id: number; label: string; address: string }
+    | { kind: "delete-group"; id: number; name: string }
+    | { kind: "export"; id: number; label: string };
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [pendingBusy, setPendingBusy] = useState(false);
 
   const load = useCallback(async () => {
     await loadStore();
@@ -203,30 +213,34 @@ export function WalletsPage() {
   }
 
   // ── row actions ───────────────────────────────────────────────────
-  async function onDelete(id: number) {
-    const w = wallets.find((x) => x.id === id);
-    const ok = confirm(
-      `Delete wallet #${id} "${w?.label ?? ""}" (${w?.address ?? ""})?\n\nThis permanently destroys the encrypted private key. Make sure you exported it first.`,
-    );
-    if (!ok) return;
+  async function onDeleteWallet(id: number) {
+    setPendingBusy(true);
     try {
       await ipc("wallet_delete", { id });
+      setPending(null);
       await load();
     } catch (e) {
       setErr(String(e));
+    } finally {
+      setPendingBusy(false);
     }
   }
 
-  async function onExport(id: number) {
-    const pass = prompt("Confirm vault passphrase to export private key:");
-    if (!pass) return;
+  async function onExportWithPass(id: number, pass: string) {
+    setPendingBusy(true);
     try {
       const key = await ipc<string>("wallet_export", { id, passConfirm: pass });
       await navigator.clipboard.writeText(key);
-      setCopied(String(id));
-      setTimeout(() => setCopied(null), 2000);
+      setPending(null);
+      pushToast(
+        "Private key copied",
+        "warn",
+        `Wallet #${id} — paste it somewhere safe now; it is on your clipboard`,
+      );
     } catch (e) {
       setErr(String(e));
+    } finally {
+      setPendingBusy(false);
     }
   }
 
@@ -290,17 +304,16 @@ export function WalletsPage() {
   }
 
   async function onDeleteGroup(id: number) {
-    const g = groups.find((x) => x.id === id);
-    const ok = confirm(
-      `Delete group "${g?.name ?? ""}"?\n\nWallets in this group will be ungrouped (not deleted).`,
-    );
-    if (!ok) return;
+    setPendingBusy(true);
     try {
       await ipc("group_delete", { id });
       if (filterGroupId === id) setFilterGroupId("all");
+      setPending(null);
       await load();
     } catch (e) {
       setErr(String(e));
+    } finally {
+      setPendingBusy(false);
     }
   }
 
@@ -641,7 +654,13 @@ export function WalletsPage() {
                         <Pencil className="h-3.5 w-3.5" />
                       </button>
                       <button
-                        onClick={() => void onDeleteGroup(g.id)}
+                        onClick={() =>
+                          setPending({
+                            kind: "delete-group",
+                            id: g.id,
+                            name: g.name,
+                          })
+                        }
                         title="Delete group"
                         className="rounded-md p-1.5 text-muted hover:bg-line hover:text-danger"
                       >
@@ -771,14 +790,27 @@ export function WalletsPage() {
                   <Pencil className="h-4 w-4" />
                 </button>
                 <button
-                  onClick={() => onExport(w.id)}
+                  onClick={() =>
+                    setPending({
+                      kind: "export",
+                      id: w.id,
+                      label: w.label,
+                    })
+                  }
                   title="Export key"
                   className="rounded-md p-1.5 text-muted hover:bg-line hover:text-fg"
                 >
                   <KeyRound className="h-4 w-4" />
                 </button>
                 <button
-                  onClick={() => onDelete(w.id)}
+                  onClick={() =>
+                    setPending({
+                      kind: "delete-wallet",
+                      id: w.id,
+                      label: w.label,
+                      address: w.address,
+                    })
+                  }
                   title="Delete"
                   className="rounded-md p-1.5 text-muted hover:bg-line hover:text-danger"
                 >
@@ -799,6 +831,57 @@ export function WalletsPage() {
       </div>
 
       {showFunds ? <ManageFundsModal onClose={() => setShowFunds(false)} /> : null}
+
+      <ConfirmDialog
+        open={pending?.kind === "delete-wallet"}
+        title={pending?.kind === "delete-wallet" ? `Delete wallet #${pending.id} "${pending.label}"?` : ""}
+        body={
+          pending?.kind === "delete-wallet" ? (
+            <>
+              <span className="font-mono">{pending.address}</span>
+              <br />
+              This permanently destroys the encrypted private key. Make sure you
+              exported it first.
+            </>
+          ) : null
+        }
+        confirmLabel="Delete wallet"
+        cancelLabel="Keep"
+        danger
+        busy={pendingBusy}
+        onConfirm={() => pending?.kind === "delete-wallet" && void onDeleteWallet(pending.id)}
+        onClose={() => setPending(null)}
+      />
+
+      <ConfirmDialog
+        open={pending?.kind === "delete-group"}
+        title={pending?.kind === "delete-group" ? `Delete group "${pending.name}"?` : ""}
+        body="Wallets in this group will be ungrouped (not deleted)."
+        confirmLabel="Delete group"
+        danger
+        busy={pendingBusy}
+        onConfirm={() => pending?.kind === "delete-group" && void onDeleteGroup(pending.id)}
+        onClose={() => setPending(null)}
+      />
+
+      <ConfirmDialog
+        open={pending?.kind === "export"}
+        title="Export private key"
+        body={
+          pending?.kind === "export" ? (
+            <>
+              Wallet #{pending.id} “{pending.label}” — the key will be copied to
+              your clipboard. Confirm your vault passphrase to decrypt it.
+            </>
+          ) : null
+        }
+        confirmLabel="Unlock & copy"
+        cancelLabel="Cancel"
+        passwordLabel="Vault passphrase"
+        busy={pendingBusy}
+        onConfirm={(pass) => pending?.kind === "export" && void onExportWithPass(pending.id, pass)}
+        onClose={() => setPending(null)}
+      />
     </div>
   );
 }

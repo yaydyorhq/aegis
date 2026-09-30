@@ -637,19 +637,46 @@ export function EligibleCheckPage() {
         {history.length === 0 ? (
           <EmptyState title="No checks yet" description="Run an eligibility check to populate history." />
         ) : (
-          history.map((h) => (
-            <div
-              key={h.id}
-              className="grid grid-cols-[1fr_1.2fr_100px_140px] gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0"
-            >
-              <div className="truncate font-mono text-[12px]">{h.collection}</div>
-              <div className="truncate text-muted">{h.detail || "—"}</div>
-              <div className={h.result ? "text-ok" : "text-muted"}>
-                {h.result ? "Yes" : "No"}
-              </div>
-              <div className="text-[12px] text-muted">{new Date(h.checked_at).toLocaleString()}</div>
+          <>
+            <div className="grid grid-cols-[170px_1fr_1.2fr_70px_150px] gap-2 border-b border-line/60 px-4 py-2 text-[11px] uppercase tracking-wide text-muted">
+              <div>Wallet</div>
+              <div>Collection</div>
+              <div>Detail</div>
+              <div>Result</div>
+              <div>When</div>
             </div>
-          ))
+            {history.map((h) => {
+              const w =
+                h.wallet_id != null
+                  ? wallets.find((x) => x.id === h.wallet_id)
+                  : undefined;
+              return (
+                <div
+                  key={h.id}
+                  className="grid grid-cols-[170px_1fr_1.2fr_70px_150px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0"
+                >
+                  <div
+                    className="min-w-0 truncate text-[12px]"
+                    title={
+                      w
+                        ? `${w.label} · ${w.address}`
+                        : h.wallet_id != null
+                          ? `wallet #${h.wallet_id}`
+                          : undefined
+                    }
+                  >
+                    {w ? w.label : h.wallet_id != null ? `#${h.wallet_id}` : "—"}
+                  </div>
+                  <div className="truncate font-mono text-[12px]">{h.collection}</div>
+                  <div className="truncate text-muted">{h.detail || "—"}</div>
+                  <div className={h.result ? "text-ok" : "text-muted"}>
+                    {h.result ? "Yes" : "No"}
+                  </div>
+                  <div className="text-[12px] text-muted">{new Date(h.checked_at).toLocaleString()}</div>
+                </div>
+              );
+            })}
+          </>
         )}
       </div>
     </div>
