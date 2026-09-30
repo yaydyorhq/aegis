@@ -410,22 +410,26 @@ export interface CollectionPnlPoint {
   roi_pct: number | null;
 }
 
-/** Live native balance for one wallet (from the ~20s dashboard poll). */
+/** Live native balance for one wallet on one chain (~20s dashboard poll). */
 export interface LiveWalletBalance {
   wallet_id: number;
-  label: string;
-  address: string;
   /** ETH decimal string; null when the RPC failed for this wallet. */
   balance_eth: string | null;
 }
 
-export interface PortfolioLive {
+export interface LiveChainBalance {
   chain_id: number;
   chain_name: string;
   native_symbol: string;
   total_eth: string;
-  wallets: LiveWalletBalance[];
   failed: number;
+  /** One entry per vault wallet, richest first. */
+  balances: LiveWalletBalance[];
+}
+
+export interface PortfolioLive {
+  /** Every enabled chain, same order as chain_list. */
+  chains: LiveChainBalance[];
   fetched_at: number;
 }
 

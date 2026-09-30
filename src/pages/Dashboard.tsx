@@ -142,7 +142,7 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
   const unlocked = useVaultStore((s) => s.status?.unlocked ?? false);
   const lock = useVaultStore((s) => s.lock);
   const refreshVault = useVaultStore((s) => s.refresh);
-  const { groups, load: loadWallets } = useWalletStore();
+  const { wallets, groups, load: loadWallets } = useWalletStore();
   const nav = useNavigate();
   const [stats, setStats] = useState<StatsOverview | null>(null);
   const [modules, setModules] = useState<ModuleStatusItem[]>([]);
@@ -152,6 +152,8 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
   /** Realtime native balances (separate, slower poll — RPC-friendly). */
   const [live, setLive] = useState<PortfolioLive | null>(null);
   const [liveOn, setLiveOn] = useState(true);
+  /** Which chain the LIVE WALLETS board shows; null = first in response. */
+  const [liveChainId, setLiveChainId] = useState<number | null>(null);
 
   const fetchLive = useCallback(async () => {
     try {
@@ -235,6 +237,17 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
         .map((p) => (p.net_eth != null ? Number(p.net_eth) : Number.NaN))
         .filter((x) => Number.isFinite(x)),
     [pnlHistory],
+  );
+  const selectedLiveChain =
+    live?.chains.find((c) => c.chain_id === liveChainId) ?? live?.chains[0] ?? null;
+  const walletById = useMemo(() => {
+    const m = new Map<number, (typeof wallets)[number]>();
+    for (const w of wallets) m.set(w.id, w);
+    return m;
+  }, [wallets]);
+  const liveFailedTotal = useMemo(
+    () => (live ? live.chains.reduce((n, c) => n + c.failed, 0) : 0),
+    [live],
   );
   /** Change vs the previous scan — the terminal-style Δ chip. */
   const lastDelta = useMemo(() => {
@@ -485,25 +498,33 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
             label={
               <span className="flex items-center gap-1.5">
                 <StatusDot tone={liveOn ? "info" : "idle"} pulse={liveOn} />
-                Live wallets ·{" "}
-                <span className="font-mono normal-case tracking-normal text-fg">
-                  {live?.chain_name ?? "—"}
-                </span>
+                Live wallets
+                {live ? (
+                  <span className="font-mono normal-case tracking-normal">
+                    · {live.chains.length} chains
+                  </span>
+                ) : null}
               </span>
             }
             right={
               <span
                 className="font-mono text-[11.5px] tabular-nums text-fg"
-                title={live ? `total · updated ${agoLabel(live.fetched_at)}` : undefined}
+                title={
+                  live && selectedLiveChain
+                    ? `${selectedLiveChain.chain_name} total · updated ${agoLabel(live.fetched_at)}`
+                    : undefined
+                }
               >
-                Σ {live ? `${formatEth(live.total_eth)} ${live.native_symbol}` : "—"}
+                {selectedLiveChain
+                  ? `Σ ${formatEth(selectedLiveChain.total_eth)} ${selectedLiveChain.native_symbol}`
+                  : "Σ —"}
               </span>
             }
             footer={
               <>
                 <BoardLabel>
                   {live
-                    ? `UPDATED ${agoLabel(live.fetched_at).toUpperCase()}${live.failed > 0 ? ` · ${live.failed} RPC FAILED` : ""}`
+                    ? `UPDATED ${agoLabel(live.fetched_at).toUpperCase()}${liveFailedTotal > 0 ? ` · ${liveFailedTotal} RPC FAILED` : ""}`
                     : "WAITING FOR FIRST POLL"}
                 </BoardLabel>
                 <button
@@ -515,39 +536,63 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
               </>
             }
           >
-            <div className="max-h-[268px] divide-y divide-line/60 overflow-y-auto">
-              {live == null ? (
+            {live != null && live.chains.length > 0 ? (
+              <div className="flex flex-wrap gap-1 border-b border-line/60 px-3 py-2">
+                {live.chains.map((c) => (
+                  <button
+                    key={c.chain_id}
+                    onClick={() => setLiveChainId(c.chain_id)}
+                    className={cn(
+                      "rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em] transition-colors",
+                      selectedLiveChain?.chain_id === c.chain_id
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-line text-muted hover:text-fg",
+                    )}
+                  >
+                    {c.chain_name}
+                    {c.failed > 0 ? ` ·${c.failed}` : ""}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            <div className="max-h-[232px] divide-y divide-line/60 overflow-y-auto">
+              {live == null || selectedLiveChain == null ? (
                 <div className="px-4 py-6 text-center font-mono text-[11px] uppercase tracking-[0.08em] text-muted">
-                  Loading…
+                  {live == null ? "Loading…" : "No enabled chains"}
                 </div>
-              ) : live.wallets.length === 0 ? (
+              ) : selectedLiveChain.balances.length === 0 ? (
                 <div className="px-4 py-6 text-center font-mono text-[11px] uppercase tracking-[0.08em] text-muted">
                   No wallets yet
                 </div>
               ) : (
-                live.wallets.map((w) => (
-                  <div
-                    key={w.wallet_id}
-                    className="flex items-center justify-between gap-2 px-4 py-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-[12.5px]">{w.label}</div>
-                      <div className="font-mono text-[10px] text-muted">
-                        {shortAddress(w.address, 4)}
+                selectedLiveChain.balances.map((b) => {
+                  const w = walletById.get(b.wallet_id);
+                  return (
+                    <div
+                      key={b.wallet_id}
+                      className="flex items-center justify-between gap-2 px-4 py-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-[12.5px]">
+                          {w ? w.label : `#${b.wallet_id}`}
+                        </div>
+                        <div className="font-mono text-[10px] text-muted">
+                          {w ? shortAddress(w.address, 4) : "—"}
+                        </div>
+                      </div>
+                      <div
+                        className={cn(
+                          "shrink-0 font-mono text-[12.5px] tabular-nums",
+                          b.balance_eth == null && "text-muted",
+                        )}
+                      >
+                        {b.balance_eth != null
+                          ? `${formatEth(b.balance_eth)} ${selectedLiveChain.native_symbol}`
+                          : "—"}
                       </div>
                     </div>
-                    <div
-                      className={cn(
-                        "shrink-0 font-mono text-[12.5px] tabular-nums",
-                        w.balance_eth == null && "text-muted",
-                      )}
-                    >
-                      {w.balance_eth != null
-                        ? `${formatEth(w.balance_eth)} ${live.native_symbol}`
-                        : "—"}
-                    </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </Board>

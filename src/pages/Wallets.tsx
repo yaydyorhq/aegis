@@ -71,9 +71,11 @@ export function WalletsPage() {
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [showFunds, setShowFunds] = useState(false);
-  /** Live native balances (anchor chain = newest Collection PnL scan). */
+  /** Live native balances across every enabled chain (refreshable). */
   const [live, setLive] = useState<PortfolioLive | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
+  /** Which chain the Balance column shows; null = first in response. */
+  const [liveChainId, setLiveChainId] = useState<number | null>(null);
 
   const loadLive = useCallback(async () => {
     setLiveLoading(true);
@@ -117,9 +119,14 @@ export function WalletsPage() {
     }
   }, [unlocked, load, loadLive]);
 
+  const selectedLiveChain =
+    live?.chains.find((c) => c.chain_id === liveChainId) ?? live?.chains[0] ?? null;
   const balanceById = useMemo(
-    () => new Map((live?.wallets ?? []).map((w) => [w.wallet_id, w])),
-    [live],
+    () =>
+      new Map(
+        (selectedLiveChain?.balances ?? []).map((b) => [b.wallet_id, b]),
+      ),
+    [selectedLiveChain],
   );
 
   const groupNameById = useMemo(() => {
@@ -705,17 +712,28 @@ export function WalletsPage() {
           <div>ID</div>
           <div>Label</div>
           <div>Address</div>
-          <div className="flex items-center gap-1.5 text-right">
+          <div className="flex items-center justify-end gap-1.5 text-right">
             <button
               onClick={() => void loadLive()}
-              title={`Refresh balances${live ? ` · ${live.chain_name}` : ""}`}
+              title="Refresh balances"
               className="rounded p-0.5 hover:text-fg"
             >
               <RefreshCw className={cn("h-3 w-3", liveLoading && "animate-spin")} />
             </button>
             <span>Balance</span>
-            {live ? (
-              <span className="normal-case text-muted/70">· {live.chain_name}</span>
+            {live && live.chains.length > 0 ? (
+              <select
+                value={String(selectedLiveChain?.chain_id ?? "")}
+                onChange={(e) => setLiveChainId(Number(e.target.value))}
+                title="Chain for the balance column"
+                className="max-w-[110px] rounded border border-line bg-bg px-1 py-0.5 text-[10px] normal-case text-muted outline-none hover:text-fg focus:border-accent"
+              >
+                {live.chains.map((c) => (
+                  <option key={c.chain_id} value={c.chain_id}>
+                    {c.chain_name}
+                  </option>
+                ))}
+              </select>
             ) : null}
           </div>
           <div>Group</div>
@@ -794,10 +812,14 @@ export function WalletsPage() {
               </button>
               <div
                 className="text-right font-mono text-[12px] tabular-nums"
-                title={b?.balance_eth != null ? `${b.balance_eth} ${live?.native_symbol ?? ""}` : undefined}
+                title={
+                  b?.balance_eth != null
+                    ? `${b.balance_eth} ${selectedLiveChain?.native_symbol ?? ""}`
+                    : undefined
+                }
               >
                 {b?.balance_eth != null
-                  ? `${formatEth(b.balance_eth)} ${live?.native_symbol ?? ""}`
+                  ? `${formatEth(b.balance_eth)} ${selectedLiveChain?.native_symbol ?? ""}`
                   : "—"}
               </div>
               <div>
