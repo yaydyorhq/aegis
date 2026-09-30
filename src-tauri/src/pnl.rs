@@ -226,6 +226,36 @@ fn parse_erc20_flows(
     out
 }
 
+/// Fetch up to `max_pages`×1000 records of an etherscan-style account action.
+/// The old single call silently truncated a busy wallet's window at 1000 —
+/// flows were understated without any warning. A failing page keeps the
+/// partial data (better than none); `max_pages` caps total requests.
+async fn explorer_paged(
+    explorer: &str,
+    base_query: &str,
+    max_pages: u32,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for page in 1..=max_pages {
+        let query = format!("{base_query}&page={page}&offset=1000&sort=asc");
+        let v = match explorer_api(explorer, &query).await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        match v.get("result").and_then(|r| r.as_array()) {
+            Some(arr) => {
+                let n = arr.len();
+                out.extend(arr.iter().cloned());
+                if n < 1000 {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 /// Fallback portfolio discovery: unique contracts from transfer logs → balance/symbol/decimals.
 async fn tokens_from_logs(
     rpc_url: &str,
@@ -368,82 +398,78 @@ pub async fn scan_pnl(wallet_id: i64, chain_id: i64, window_blocks: u64) -> AppR
             }
         }
 
-        // ERC-20 windowed flows from tokentx
-        let tokentx = explorer_api(
+        // ERC-20 windowed flows from tokentx (paged — up to 10×1000 records)
+        let tokentx = explorer_paged(
             ex,
             &format!(
-                "module=account&action=tokentx&address={addr}&startblock={from_block}&endblock={latest}&page=1&offset=1000&sort=asc"
+                "module=account&action=tokentx&address={addr}&startblock={from_block}&endblock={latest}"
             ),
+            10,
         )
-        .await
-        .ok();
-        if let Some(v) = tokentx {
-            if let Some(arr) = v.get("result").and_then(|r| r.as_array()) {
-                for t in arr {
-                    if t.get("isError").and_then(|x| x.as_str()) == Some("1") {
-                        continue;
-                    }
-                    let contract = t
-                        .get("contractAddress")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    if !is_address(&contract) {
-                        continue;
-                    }
-                    let from = t.get("from").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
-                    let to = t.get("to").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
-                    let value = t
-                        .get("value")
-                        .and_then(|x| x.as_str())
-                        .and_then(|s| s.parse::<U256>().ok())
-                        .unwrap_or(U256::ZERO);
-                    if from == addr {
-                        let e = flows.entry(contract.clone()).or_default();
-                        e.outflow = e.outflow.saturating_add(value);
-                    }
-                    if to == addr {
-                        let e = flows.entry(contract).or_default();
-                        e.inflow = e.inflow.saturating_add(value);
-                    }
+        .await;
+        if !tokentx.is_empty() {
+            for t in &tokentx {
+                if t.get("isError").and_then(|x| x.as_str()) == Some("1") {
+                    continue;
                 }
-                explorer_ok = true;
+                let contract = t
+                    .get("contractAddress")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if !is_address(&contract) {
+                    continue;
+                }
+                let from = t.get("from").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+                let to = t.get("to").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+                let value = t
+                    .get("value")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<U256>().ok())
+                    .unwrap_or(U256::ZERO);
+                if from == addr {
+                    let e = flows.entry(contract.clone()).or_default();
+                    e.outflow = e.outflow.saturating_add(value);
+                }
+                if to == addr {
+                    let e = flows.entry(contract).or_default();
+                    e.inflow = e.inflow.saturating_add(value);
+                }
             }
+            explorer_ok = true;
         }
 
-        // Native windowed flows from txlist
-        let txlist = explorer_api(
+        // Native windowed flows from txlist (paged — up to 10×1000 records)
+        let txlist = explorer_paged(
             ex,
             &format!(
-                "module=account&action=txlist&address={addr}&startblock={from_block}&endblock={latest}&page=1&offset=1000&sort=asc"
+                "module=account&action=txlist&address={addr}&startblock={from_block}&endblock={latest}"
             ),
+            10,
         )
-        .await
-        .ok();
-        if let Some(v) = txlist {
-            if let Some(arr) = v.get("result").and_then(|r| r.as_array()) {
-                let mut inflow = U256::ZERO;
-                let mut outflow = U256::ZERO;
-                for t in arr {
-                    if t.get("isError").and_then(|x| x.as_str()) == Some("1") {
-                        continue;
-                    }
-                    let from = t.get("from").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
-                    let to = t.get("to").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
-                    let value = t
-                        .get("value")
-                        .and_then(|x| x.as_str())
-                        .and_then(|s| s.parse::<U256>().ok())
-                        .unwrap_or(U256::ZERO);
-                    if to == addr {
-                        inflow = inflow.saturating_add(value);
-                    }
-                    if from == addr {
-                        outflow = outflow.saturating_add(value);
-                    }
+        .await;
+        if !txlist.is_empty() {
+            let mut inflow = U256::ZERO;
+            let mut outflow = U256::ZERO;
+            for t in &txlist {
+                if t.get("isError").and_then(|x| x.as_str()) == Some("1") {
+                    continue;
                 }
-                net_native_flow = Some(signed_flow(inflow, outflow));
+                let from = t.get("from").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+                let to = t.get("to").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+                let value = t
+                    .get("value")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<U256>().ok())
+                    .unwrap_or(U256::ZERO);
+                if to == addr {
+                    inflow = inflow.saturating_add(value);
+                }
+                if from == addr {
+                    outflow = outflow.saturating_add(value);
+                }
             }
+            net_native_flow = Some(signed_flow(inflow, outflow));
         }
     }
 

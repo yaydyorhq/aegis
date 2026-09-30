@@ -432,10 +432,24 @@ fn decode_rpc_error(e: &AppError) -> String {
 
     // Pull the revert data payload if present — Aegis formats RPC failures as
     // `rpc: {"code":3,"message":"execution reverted","data":"0x13da22f2"}`.
-    let data_hex = raw
-        .split("data")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(2))
+    // Parsed as JSON (first `{` → last `}`) instead of splitting on the word
+    // "data": a provider URL or message containing that word used to hijack
+    // the split and mis-extract the payload.
+    let json_payload = (|| -> Option<serde_json::Value> {
+        let start = raw.find('{')?;
+        let end = raw.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(&raw[start..=end]).ok()
+    })();
+    let data_hex = json_payload
+        .as_ref()
+        .and_then(|v| {
+            v.get("data")
+                .or_else(|| v.get("error").and_then(|err| err.get("data")))
+        })
+        .and_then(|d| d.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| s.starts_with("0x") && s.len() >= 10);
 
