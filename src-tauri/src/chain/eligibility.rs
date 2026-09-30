@@ -4,10 +4,13 @@ use crate::mint::seadrop::{self, PublicDrop};
 
 /// balanceOf(address)
 const SEL_BALANCE_OF: &str = "0x70a08231";
-/// SeaDrop.getMintStats(address minter, address nftContract) → (mintable, minted, price)
-const SEL_GET_MINT_STATS: &str = "0xec1c35be";
-/// ERC721SeaDrop.mintStatsForMinter(address) → (mintable, minted, price)
-const SEL_MINT_STATS_FOR_MINTER: &str = "0x25e31cd4";
+/// ERC721SeaDrop.getMintStats(address minter)
+///   → (minterNumMinted, currentTotalSupply, maxSupply).
+/// Lives on the NFT token, not the SeaDrop singleton — upstream ISeaDrop has
+/// no getMintStats at all, and neither old constant ("getMintStats(address,
+/// address)" 0xec1c35be nor "mintStatsForMinter(address)" 0x25e31cd4)
+/// resolves on 4byte.directory.
+const SEL_GET_MINT_STATS: &str = "0x840e15d4";
 
 fn pad_word_addr(addr: &str) -> AppResult<String> {
     let a = alloy::primitives::Address::parse_checksummed(addr, None)
@@ -56,27 +59,16 @@ pub async fn erc721_balance_of(rpc: &str, collection: &str, owner: &str) -> AppR
     Ok(u64::try_from(v).unwrap_or(u64::MAX))
 }
 
-/// Minted count for the wallet on a SeaDrop public drop (0 when unknown).
-/// Tries SeaDrop.getMintStats, then ERC721SeaDrop.mintStatsForMinter.
+/// Minted count for the wallet on a SeaDrop drop (0 when unknown).
+/// Reads the NFT token's own `getMintStats(address)` — word 0 is
+/// `minterNumMinted` (word 1 is the collection total supply, NOT per-wallet).
 pub async fn minted_quantity(rpc: &str, collection: &str, minter: &str) -> Option<u64> {
     let m = pad_word_addr(minter).ok()?;
-    let n = pad_word_addr(collection).ok()?;
-    if let Ok(ret) = eth_call(rpc, seadrop::SEADROP_ADDRESS, &format!("{SEL_GET_MINT_STATS}{m}{n}")).await
-    {
-        if let Ok(w) = decode_u256_words(&ret) {
-            if w.len() >= 2 {
-                return Some(u64::try_from(w[1]).unwrap_or(u64::MAX));
-            }
-        }
-    }
-    if let Ok(ret) = eth_call(rpc, collection, &format!("{SEL_MINT_STATS_FOR_MINTER}{m}")).await {
-        if let Ok(w) = decode_u256_words(&ret) {
-            if w.len() >= 2 {
-                return Some(u64::try_from(w[1]).unwrap_or(u64::MAX));
-            }
-        }
-    }
-    None
+    let ret = eth_call(rpc, collection, &format!("{SEL_GET_MINT_STATS}{m}"))
+        .await
+        .ok()?;
+    let w = decode_u256_words(&ret).ok()?;
+    w.first().and_then(|v| u64::try_from(*v).ok())
 }
 
 /// Public-drop window: live iff start ≤ now, and now < end when end is set.
@@ -263,5 +255,17 @@ mod tests {
     fn format_wei() {
         assert_eq!(format_wei_eth("380000000000000"), "0.00038");
         assert_eq!(format_wei_eth("1000000000000000000"), "1");
+    }
+
+    /// The minted-count read must target ERC721SeaDrop's real
+    /// `getMintStats(address)` — a wrong selector silently disables the
+    /// per-wallet cap check (minted always 0).
+    #[test]
+    fn get_mint_stats_selector_matches_signature() {
+        let h = alloy::primitives::keccak256(b"getMintStats(address)");
+        assert_eq!(
+            format!("0x{}", hex::encode(&h[..4])),
+            SEL_GET_MINT_STATS
+        );
     }
 }
