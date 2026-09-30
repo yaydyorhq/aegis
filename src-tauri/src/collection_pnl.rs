@@ -761,11 +761,20 @@ async fn fetch_tx_meta(rpc: &str, tx_hash: &str) -> Option<(String, TxMeta)> {
 
 async fn opensea_floor(slug: &str) -> Option<U256> {
     let url = format!("https://api.opensea.io/api/v2/collections/{slug}/stats");
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
-        .user_agent("Aegis/0.1")
-        .build()
-        .ok()?;
+        .user_agent("Aegis/0.1");
+    // v2 stats require an API key — use the stored one (API Settings) when the
+    // vault is unlocked; without it this 401s and the floor silently falls
+    // back to the Seaport window scan.
+    if let Some(key) = crate::commands::api_keys::lookup("opensea") {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&key) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("X-API-KEY", value);
+            builder = builder.default_headers(headers);
+        }
+    }
+    let client = builder.build().ok()?;
     let v: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
     let f = v.pointer("/total/floor_price")?.as_f64()?;
     if !f.is_finite() || f < 0.0 || f > 1_000_000.0 {

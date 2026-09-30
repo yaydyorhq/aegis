@@ -473,11 +473,22 @@ pub struct OpenSeaClient {
 impl OpenSeaClient {
     pub fn new() -> AppResult<Self> {
         let jar = Arc::new(Jar::default());
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .cookie_provider(jar.clone())
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("Aegis/0.1")
+            .user_agent("Aegis/0.1");
+        // Stored key (API Settings, provider "opensea") rides every request —
+        // raises rate limits and unlocks the v2 stats endpoints. Locked vault
+        // or no key → anonymous, same as before.
+        if let Some(key) = crate::commands::api_keys::lookup("opensea") {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&key) {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("X-API-KEY", value);
+                builder = builder.default_headers(headers);
+            }
+        }
+        let client = builder
             .build()
             .map_err(|_| os_err("http client"))?;
         Ok(Self { client, jar })
@@ -561,9 +572,11 @@ impl OpenSeaClient {
                 .collect();
             if exact.len() == 1 {
                 exact.into_iter().next()
-            } else if candidates.len() == 1 {
-                candidates.into_iter().next()
             } else if exact.is_empty() {
+                // The wrong-network guard must win even when there is exactly
+                // one candidate — the old branch order picked a collection on
+                // a different OpenSea network and failed later with a
+                // confusing "network mismatch".
                 return Err(os_err("collection on different OpenSea network"));
             } else {
                 return Err(os_err("ambiguous collection"));

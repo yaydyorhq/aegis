@@ -108,6 +108,30 @@ pub fn api_key_list() -> AppResult<Vec<ApiKeyRow>> {
     Ok(rows)
 }
 
+/// Backend-internal: decrypt one stored provider key for outbound requests.
+/// Never exposed via IPC — the frontend only ever sees the masked form from
+/// [`api_key_list`]. Locked vault / missing row / decrypt failure → None, and
+/// callers simply fall back to anonymous (keyless) requests.
+pub fn lookup(provider: &str) -> Option<String> {
+    if !vault::is_unlocked().unwrap_or(false) {
+        return None;
+    }
+    let row: Option<(Vec<u8>, Vec<u8>)> = crate::db::with_conn(|conn| {
+        let mut stmt =
+            conn.prepare("SELECT key_enc, nonce FROM api_keys WHERE provider = ?1")?;
+        let mut rows = stmt.query([provider])?;
+        match rows.next()? {
+            Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
+            None => Ok(None),
+        }
+    })
+    .ok()
+    .flatten();
+    let (ct, nonce) = row?;
+    let plain = vault::decrypt(&nonce, &ct).ok()?;
+    String::from_utf8(plain).ok().filter(|s| !s.is_empty())
+}
+
 #[tauri::command]
 pub fn api_key_delete(id: i64) -> AppResult<()> {
     if !vault::is_unlocked()? {

@@ -99,7 +99,17 @@ async fn explorer_api(
     query: &str,
 ) -> AppResult<serde_json::Value> {
     let base = explorer.trim_end_matches('/');
-    let url = format!("{base}/api?{query}");
+    let mut url = format!("{base}/api?{query}");
+    // Etherscan-family explorers rate-limit unkeyed requests hard; attach the
+    // stored key (API Settings, provider "etherscan") when one exists. Non-
+    // etherscan explorers (Blockscout) ignore the extra param. Only URL-safe
+    // key characters are kept so a pasted key cannot inject query params.
+    if let Some(key) = crate::commands::api_keys::lookup("etherscan") {
+        let safe: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if !safe.is_empty() {
+            url.push_str(&format!("&apikey={safe}"));
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()
