@@ -1017,7 +1017,7 @@ pub async fn scan(
                 floor_wei = Some(p);
                 floor_source = Some("seaport-sales".into());
                 warnings.push(
-                    "floor from cheapest Seaport sale in window (all-in price incl. fees; fee% not applied)"
+                    "floor from cheapest Seaport sale in window (all-in sale price; fee % applied as the marketplace fee for net unrealized)"
                         .into(),
                 );
             }
@@ -1042,8 +1042,15 @@ pub async fn scan(
     }
     on_progress("floor", 3, 3);
 
+    // Marketplace fee is subtracted from EVERY floor that is quoted as an
+    // all-in price: OpenSea stats (list price) and Seaport-window sales
+    // (what the buyer paid). Both approximate "what you would net if you
+    // sold now", matching the seller-net proceeds used for realized. The
+    // window-sales fallback is already seller-net, so no fee there.
     let floor_net = floor_wei.map(|f| {
-        if floor_source.as_deref() == Some("opensea") && fee_bps < 10_000 {
+        if matches!(floor_source.as_deref(), Some("opensea") | Some("seaport-sales"))
+            && fee_bps < 10_000
+        {
             f * U256::from(10_000 - fee_bps) / U256::from(10_000)
         } else {
             f

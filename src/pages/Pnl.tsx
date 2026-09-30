@@ -171,7 +171,8 @@ function CollectionTab() {
         walletIds,
         extraAddresses,
         windowBlocks,
-        feeBps: Math.round(feePct * 10),
+        // % → basis points (backend divides by 10_000): 2.5% = 250 bps.
+        feeBps: Math.round(feePct * 100),
       });
       setResult(r);
     } catch (e) {
@@ -247,8 +248,9 @@ function CollectionTab() {
       <div className="text-[11px] text-muted">
         Window 0 = full history from genesis (recommended). Fast chains matter:
         Robinhood Chain runs ~10 blocks/sec, so 50,000 blocks only covers the
-        last ~1.4 hours. Fee % is applied to the OpenSea floor only (native
-        ETH pricing).
+        last ~1.4 hours. Fee % approximates the marketplace fee and is applied
+        to floor-based unrealized value (OpenSea stats and in-window Seaport
+        sales).
       </div>
 
       {/* wallet picker */}
