@@ -170,7 +170,22 @@ pub async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) ->
                 return Err(AppError::Rpc(format!("HTTP {status}")));
             }
             if !status.is_success() {
-                return Err(AppError::Rpc(format!("HTTP {status}")));
+                // Keep the body: providers explain 4xx rejections there
+                // ("block range greater than 1000 max", "limited to a 2,000
+                // range") — without it every oversized getLogs reads as an
+                // opaque "HTTP 400" and nothing can react to the cause.
+                let body = resp.text().await.unwrap_or_default();
+                let mut snippet: String = body
+                    .chars()
+                    .take(240)
+                    .collect();
+                snippet = snippet.replace(['\n', '\r', '\t'], " ").trim().to_string();
+                let msg = if snippet.is_empty() {
+                    format!("HTTP {status}")
+                } else {
+                    format!("HTTP {status} {snippet}")
+                };
+                return Err(AppError::Rpc(msg));
             }
             let v: serde_json::Value = resp
                 .json()
@@ -466,7 +481,10 @@ pub async fn get_logs_value(
 
 /// RPC rejected the block range (result/size limits) — the adaptive fetcher
 /// should halve its span. Transient HTTP errors (429/5xx) are NOT matched so
-/// they stay with rpc_call's retry/backoff.
+/// they stay with rpc_call's retry/backoff. Providers also express range
+/// limits as HTTP 400/413 with the explanation in the body ("block range
+/// greater than 1000 max", "limited to a 2,000 range") — those are matched
+/// too now that rpc_call keeps the body in the message.
 pub fn is_range_error(e: &AppError) -> bool {
     let s = e.to_string().to_lowercase();
     [
@@ -478,6 +496,8 @@ pub fn is_range_error(e: &AppError) -> bool {
         "max results",
         "query returned",
         "block span",
+        "http 400",
+        "http 413",
     ]
     .iter()
     .any(|k| s.contains(k))
@@ -485,8 +505,12 @@ pub fn is_range_error(e: &AppError) -> bool {
 
 /// eth_getLogs over [from..to] that tries the whole range in one request
 /// (fast chains allow 70M+ blocks) and halves the span when the RPC enforces
-/// range/result limits. `on_tick(scanned_blocks, total_blocks)` fires after
-/// each successful chunk.
+/// range/result limits — including HTTP 400/413 rejections (Ink: max 1000
+/// blocks, Base: max 2000). Halving goes below the old 2000 floor: some
+/// providers only allow 1000, so the span can shrink as far as 1 block.
+/// When the chain row lists multiple endpoints, requests rotate across them
+/// to spread load. `on_tick(scanned_blocks, total_blocks)` fires after each
+/// successful chunk.
 pub async fn get_logs_adaptive(
     rpc_url: &str,
     from_block: u64,
@@ -499,14 +523,17 @@ pub async fn get_logs_adaptive(
     if to_block < from_block {
         return Ok(out);
     }
+    let endpoints = endpoint_list(rpc_url);
     let total = to_block - from_block + 1;
-    let min_span = 2_000u64;
     let mut start = from_block;
     let mut span = total;
     let mut scanned = 0u64;
+    let mut endpoint_i = 0usize;
     while start <= to_block {
         let end = (start + span - 1).min(to_block);
-        match get_logs_value(rpc_url, start, end, address, topics.clone()).await {
+        let url = &endpoints[endpoint_i % endpoints.len().max(1)];
+        endpoint_i += 1;
+        match get_logs_value(url, start, end, address, topics.clone()).await {
             Ok(res) => {
                 if let Some(arr) = res.as_array() {
                     out.extend(arr.iter().cloned());
@@ -517,8 +544,16 @@ pub async fn get_logs_adaptive(
                 }
                 start = end + 1;
             }
-            Err(e) if is_range_error(&e) && (end - start + 1) > min_span => {
-                span = ((end - start + 1) / 2).max(min_span);
+            Err(e) if is_range_error(&e) && end > start => {
+                span = (end - start + 1) / 2;
+            }
+            Err(e) if is_range_error(&e) => {
+                // Rejected even at a 1-block span — not a range problem the
+                // fetcher can walk around. Say so instead of a bare 400.
+                return Err(AppError::Rpc(format!(
+                    "getLogs rejected even at a 1-block span via {} — provider-side restriction: {e}",
+                    redact_rpc(url)
+                )));
             }
             Err(e) => return Err(e),
         }
@@ -692,6 +727,24 @@ mod tests {
         // Empty input still yields something pollable instead of a panic.
         assert_eq!(endpoint_list(""), vec!["".to_string()]);
         assert_eq!(endpoint_list("  ,\n ").len(), 1); // degenerate input
+    }
+
+    /// Real provider rejections captured live: Ink returns HTTP 400 with
+    /// "block range greater than 1000 max", Base returns HTTP 413 with
+    /// "limited to a 2,000 range" — the adaptive fetcher must treat all of
+    /// these as "halve the span", not a dead end.
+    #[test]
+    fn range_error_detection_covers_http_400_413_bodies() {
+        assert!(is_range_error(&AppError::Rpc(
+            "HTTP 400 {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32602,\"message\":\"block range greater than 1000 max\"}}".into()
+        )));
+        assert!(is_range_error(&AppError::Rpc(
+            "HTTP 413 {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32614,\"message\":\"eth_getLogs is limited to a 2,000 range\"}}".into()
+        )));
+        // Body-less 400s (some gateways) still signal "shrink the range".
+        assert!(is_range_error(&AppError::Rpc("HTTP 400 Bad Request".into())));
+        assert!(!is_range_error(&AppError::Rpc("HTTP 502".into())));
+        assert!(!is_range_error(&AppError::Rpc("HTTP 401 unauthorized".into())));
     }
 
     fn passing(url: &str, latency: u64) -> (String, EndpointOutcome) {
