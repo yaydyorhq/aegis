@@ -7,6 +7,7 @@ import {
   Layers,
   Pencil,
   Plus,
+  RefreshCw,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -14,8 +15,9 @@ import { ipc } from "../lib/ipc";
 import type {
   BulkImportItem,
   BulkImportResultItem,
+  PortfolioLive,
 } from "../lib/types";
-import { shortAddress } from "../lib/utils";
+import { cn, formatEth, shortAddress } from "../lib/utils";
 import { EmptyState, PageHeader, pushToast, ConfirmDialog } from "../components/ui";
 import { useVaultStore, useWalletStore } from "../store/app";
 import { ManageFundsModal } from "../features/funds/ManageFundsModal";
@@ -69,6 +71,20 @@ export function WalletsPage() {
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [showFunds, setShowFunds] = useState(false);
+  /** Live native balances (anchor chain = newest Collection PnL scan). */
+  const [live, setLive] = useState<PortfolioLive | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+
+  const loadLive = useCallback(async () => {
+    setLiveLoading(true);
+    try {
+      setLive(await ipc<PortfolioLive>("portfolio_live"));
+    } catch {
+      setLive(null);
+    } finally {
+      setLiveLoading(false);
+    }
+  }, []);
 
   // inline label edit
   const [editId, setEditId] = useState<number | null>(null);
@@ -95,8 +111,16 @@ export function WalletsPage() {
   }, [loadStore]);
 
   useEffect(() => {
-    if (unlocked) void load();
-  }, [unlocked, load]);
+    if (unlocked) {
+      void load();
+      void loadLive();
+    }
+  }, [unlocked, load, loadLive]);
+
+  const balanceById = useMemo(
+    () => new Map((live?.wallets ?? []).map((w) => [w.wallet_id, w])),
+    [live],
+  );
 
   const groupNameById = useMemo(() => {
     const m = new Map<number, string>();
@@ -677,10 +701,23 @@ export function WalletsPage() {
 
       {/* ── Wallet table ── */}
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
-        <div className="grid grid-cols-[70px_1.2fr_1.3fr_130px_140px_140px] border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid grid-cols-[64px_1.1fr_1.2fr_130px_110px_130px_136px] items-center gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
           <div>ID</div>
           <div>Label</div>
           <div>Address</div>
+          <div className="flex items-center gap-1.5 text-right">
+            <button
+              onClick={() => void loadLive()}
+              title={`Refresh balances${live ? ` · ${live.chain_name}` : ""}`}
+              className="rounded p-0.5 hover:text-fg"
+            >
+              <RefreshCw className={cn("h-3 w-3", liveLoading && "animate-spin")} />
+            </button>
+            <span>Balance</span>
+            {live ? (
+              <span className="normal-case text-muted/70">· {live.chain_name}</span>
+            ) : null}
+          </div>
           <div>Group</div>
           <div className="text-right">Move to</div>
           <div className="text-right">Actions</div>
@@ -695,10 +732,12 @@ export function WalletsPage() {
             }
           />
         ) : (
-          filteredWallets.map((w) => (
+          filteredWallets.map((w) => {
+            const b = balanceById.get(w.id);
+            return (
             <div
               key={w.id}
-              className="grid grid-cols-[70px_1.2fr_1.3fr_130px_140px_140px] items-center border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
+              className="grid grid-cols-[64px_1.1fr_1.2fr_130px_110px_130px_136px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
             >
               <div className="text-muted">#{w.id}</div>
               <div className="min-w-0">
@@ -753,6 +792,14 @@ export function WalletsPage() {
                 {copied === w.address ? "Copied!" : shortAddress(w.address, 6)}
                 <Copy className="h-3.5 w-3.5" />
               </button>
+              <div
+                className="text-right font-mono text-[12px] tabular-nums"
+                title={b?.balance_eth != null ? `${b.balance_eth} ${live?.native_symbol ?? ""}` : undefined}
+              >
+                {b?.balance_eth != null
+                  ? `${formatEth(b.balance_eth)} ${live?.native_symbol ?? ""}`
+                  : "—"}
+              </div>
               <div>
                 {w.group_id != null ? (
                   <span className="inline-block max-w-full truncate rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[11px] text-accent">
@@ -818,7 +865,8 @@ export function WalletsPage() {
                 </button>
               </div>
             </div>
-          ))
+            );
+          })
         )}
       </div>
 

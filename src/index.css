@@ -58,6 +58,12 @@ textarea {
   user-select: text;
 }
 
+/* Keyboard navigation needs to be visible — hover styles alone hide it. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 ::selection {
   background: color-mix(in srgb, var(--color-accent) 40%, transparent);
 }
