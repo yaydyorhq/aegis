@@ -2,6 +2,42 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import type { VaultStatus, WalletGroup, WalletRow } from "../lib/types";
 
+// ── Theme (system / light / dark) ───────────────────────────────────
+// Canonical value lives in the backend `meta` table; localStorage mirrors it
+// so the right palette applies before the first paint (no dark→light flash).
+
+export type ThemePref = "system" | "light" | "dark";
+const THEME_MIRROR_KEY = "aegis.theme";
+const lightQuery = window.matchMedia("(prefers-color-scheme: light)");
+
+function resolveTheme(pref: ThemePref): "light" | "dark" {
+  return pref === "system" ? (lightQuery.matches ? "light" : "dark") : pref;
+}
+
+export function applyTheme(pref: ThemePref): void {
+  const resolved = resolveTheme(pref);
+  document.documentElement.classList.toggle("light", resolved === "light");
+  document.documentElement.classList.toggle("dark", resolved === "dark");
+}
+
+/** Apply the stored preference synchronously — call before React renders. */
+export function initTheme(): ThemePref {
+  let pref: ThemePref = "system";
+  try {
+    const stored = localStorage.getItem(THEME_MIRROR_KEY);
+    if (stored === "light" || stored === "dark" || stored === "system") {
+      pref = stored;
+    }
+  } catch {
+    /* storage unavailable — system default */
+  }
+  applyTheme(pref);
+  lightQuery.addEventListener("change", () => {
+    if (useAppStore.getState().theme === "system") applyTheme("system");
+  });
+  return pref;
+}
+
 interface VaultState {
   status: VaultStatus | null;
   loading: boolean;
@@ -42,25 +78,45 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
 interface AppState {
   profileName: string;
+  theme: ThemePref;
   setProfileName: (n: string) => void;
+  setTheme: (t: ThemePref) => void;
   loadProfile: () => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
   profileName: "XieBall",
+  theme: "system",
   setProfileName: (n) => {
     set({ profileName: n });
     void ipc("meta_set", { key: "profile_name", value: n }).catch(() => {
       /* keep in-memory even if persist fails */
     });
   },
+  setTheme: (t) => {
+    set({ theme: t });
+    applyTheme(t);
+    try {
+      localStorage.setItem(THEME_MIRROR_KEY, t);
+    } catch {
+      /* mirror is best-effort */
+    }
+    void ipc("meta_set", { key: "theme", value: t }).catch(() => {});
+  },
   loadProfile: async () => {
     if (get().profileName !== "XieBall") return;
     try {
-      const v = await ipc<string | null>("meta_get", { key: "profile_name" });
-      if (v && v.trim()) set({ profileName: v });
+      const [profile, theme] = await Promise.all([
+        ipc<string | null>("meta_get", { key: "profile_name" }),
+        ipc<ThemePref | null>("meta_get", { key: "theme" }),
+      ]);
+      if (profile && profile.trim()) set({ profileName: profile });
+      if (theme === "light" || theme === "dark" || theme === "system") {
+        set({ theme });
+        applyTheme(theme);
+      }
     } catch {
-      /* default remains */
+      /* defaults remain */
     }
   },
 }));

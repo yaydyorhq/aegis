@@ -1,11 +1,20 @@
 import { useEffect, useState } from "react";
-import { Lock, ShieldCheck, Info } from "lucide-react";
+import { Lock, ShieldCheck, Info, Monitor, Moon, Sun } from "lucide-react";
 import { PageHeader, StatusDot } from "../components/ui";
-import { useAppStore, useVaultStore } from "../store/app";
+import { cn } from "../lib/utils";
+import { useAppStore, useVaultStore, type ThemePref } from "../store/app";
+
+const THEME_OPTIONS: { value: ThemePref; label: string; icon: typeof Monitor }[] = [
+  { value: "system", label: "System", icon: Monitor },
+  { value: "light", label: "Light", icon: Sun },
+  { value: "dark", label: "Dark", icon: Moon },
+];
 
 export function SettingsPage() {
   const profileName = useAppStore((s) => s.profileName);
   const setProfileName = useAppStore((s) => s.setProfileName);
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
   const { status, lock, refresh } = useVaultStore();
   const [draft, setDraft] = useState(profileName);
   const [saved, setSaved] = useState(false);
@@ -39,6 +48,30 @@ export function SettingsPage() {
       <PageHeader suite="Infrastructure" title="Settings" subtitle="Local preferences — stored on this device only" />
 
       <div className="grid max-w-3xl gap-4">
+        <section className="rounded-[14px] border border-line bg-card p-5">
+          <div className="mb-3 text-[13px] font-semibold">Appearance</div>
+          <div className="inline-flex rounded-lg border border-line bg-bg p-0.5">
+            {THEME_OPTIONS.map(({ value, label, icon: Icon }) => (
+              <button
+                key={value}
+                onClick={() => setTheme(value)}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12.5px] transition-colors",
+                  theme === value
+                    ? "bg-line font-medium text-fg"
+                    : "text-muted hover:text-fg",
+                )}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[12px] text-muted">
+            System follows your OS appearance. Saved on this device.
+          </p>
+        </section>
+
         <section className="rounded-[14px] border border-line bg-card p-5">
           <div className="mb-3 text-[13px] font-semibold">Profile</div>
           <div className="flex gap-2">

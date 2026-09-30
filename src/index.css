@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* dark:/light: follow the .dark/.light class on <html>, not the OS media
+   query — the app resolves "system" itself so the picker in Settings can
+   override it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --color-bg: #0a0a0b;
   --color-panel: #121214;
@@ -13,6 +18,21 @@
   --color-danger: #f31260;
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --radius-card: 14px;
+}
+
+/* Light theme: same structure, tuned contrast (darker accent/ok/warn/danger
+   so white text and colored text stay readable on white surfaces). */
+html.light {
+  --color-bg: #f4f4f5;
+  --color-panel: #ffffff;
+  --color-card: #ffffff;
+  --color-line: #e4e4e7;
+  --color-muted: #71717a;
+  --color-fg: #1a1a1f;
+  --color-accent: #2563eb;
+  --color-ok: #059669;
+  --color-warn: #b45309;
+  --color-danger: #e11d48;
 }
 
 html,
@@ -29,6 +49,13 @@ body {
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   user-select: none;
+}
+
+/* The global user-select:none is for chrome, not for data entry — without
+   this, Ctrl+A / drag-select inside inputs and textareas misbehaves. */
+input,
+textarea {
+  user-select: text;
 }
 
 ::selection {
@@ -48,4 +75,10 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #3a3a44;
+}
+html.light ::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+}
+html.light ::-webkit-scrollbar-thumb:hover {
+  background: #c6c6cd;
 }
