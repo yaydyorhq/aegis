@@ -282,21 +282,36 @@ fn opt_trim(s: &Option<String>) -> Option<String> {
 /// endpoint that responds at all.  Used before signing so a dead primary RPC
 /// (node-specific -32603, 503, timeout) does not block the whole task when a
 /// fallback endpoint is configured.
+///
+/// All endpoints are probed concurrently and the first chain-matched answer
+/// wins: sequential probing cost a full request timeout *plus* rpc_call's
+/// retries (≈40s for a hung node) per dead entry, at fire time.
 async fn pick_healthy_endpoint(endpoints: &[String], expected_chain: i64) -> (String, Vec<String>) {
-    let mut mismatch: Option<String> = None;
+    let mut set = tokio::task::JoinSet::new();
     for url in endpoints {
-        match chain::eth_chain_id(url).await {
-            Ok(cid) if cid == expected_chain => {
-                return (url.clone(), endpoints.to_vec());
-            }
-            Ok(cid) => {
+        let url = url.clone();
+        set.spawn(async move {
+            let cid = chain::eth_chain_id(&url).await;
+            (url, cid)
+        });
+    }
+    let mut mismatch: Option<String> = None;
+    let mut healthy: Option<String> = None;
+    while let Some(joined) = set.join_next().await {
+        if let Ok((url, Ok(cid))) = joined {
+            if cid == expected_chain {
+                healthy = Some(url);
+                break; // dropping the JoinSet aborts the remaining probes
+            } else if mismatch.is_none() {
                 mismatch = Some(format!(
                     "{} is chain {cid}, expected {expected_chain}",
-                    chain::redact_rpc(url)
+                    chain::redact_rpc(&url)
                 ));
             }
-            Err(_) => continue, // unreachable node → try the next one
         }
+    }
+    if let Some(url) = healthy {
+        return (url, endpoints.to_vec());
     }
     // No chain-matched endpoint; fall back to the first entry and let the
     // downstream chain-id check report the mismatch explicitly.
@@ -2270,7 +2285,10 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
             }
             v
         }
-        _ => vec![primary],
+        // Plain execute walks the endpoint list in order: a transient primary
+        // rejection (429/503/timeout) previously killed the launch because the
+        // fallbacks were only used for nonce/estimation, never for the send.
+        _ => endpoints,
     };
 
     let mut first_hash: Option<String> = None;
@@ -2278,6 +2296,12 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     for (i, url) in send_targets.iter().enumerate() {
         if task.mode == "sweep" && first_hash.is_some() {
             // Sweep stops at first success (sequential fallback).
+            break;
+        }
+        // Plain execute also stops at the first acceptance — the remaining
+        // entries are fallbacks for rejected sends, not extra broadcasts.
+        // Spam keeps blasting every endpoint; flashbots+primary multi-broadcast.
+        if task.mode == "execute" && !task.flashbots && first_hash.is_some() {
             break;
         }
         if task.delay_ms > 0 && i > 0 {
@@ -2367,8 +2391,51 @@ async fn poll_receipt(id: i64, hash: &str) -> AppResult<MintTaskRow> {
     let prev = task.prev_tx_hash.clone();
     let mut start = 0usize;
     let mut consecutive_errs = 0u32;
-    for _ in 0..15 {
+    for pass in 0..15 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Adjudicate a phantom hash once, ~10s in: when no right-chain endpoint
+        // even knows the tx, the send was never accepted anywhere — polling
+        // would otherwise stall the wallet's queue for the full ~20m window.
+        // Flashbots sends are exempt: private bundles are invisible to public
+        // eth_getTransactionByHash.
+        if pass == 4 && !task.flashbots {
+            let mut probe_answered = false;
+            let mut probe_known = false;
+            for url in &endpoints {
+                if !matches!(
+                    chain::eth_chain_id(url).await,
+                    Ok(cid) if cid == task.chain_id
+                ) {
+                    continue;
+                }
+                if let Ok(v) = chain::rpc_call(
+                    url,
+                    "eth_getTransactionByHash",
+                    serde_json::json!([hash]),
+                )
+                .await
+                {
+                    probe_answered = true;
+                    if v.get("result").map(|r| !r.is_null()).unwrap_or(false) {
+                        probe_known = true;
+                        break;
+                    }
+                }
+            }
+            if probe_answered && !probe_known {
+                release_task_nonce(id);
+                let msg = "tx unknown to every endpoint ~10s after broadcast — the send was never accepted; re-enqueue to retry";
+                set_status(id, "failed", Some(hash), Some(msg));
+                crate::logging::warn("mint.poll", &format!("Mint #{id}: {msg}"));
+                wallet_store::log_activity(
+                    "mint.failed",
+                    &format!("Mint #{id}: {msg}"),
+                    None,
+                    false,
+                );
+                return get_task(id);
+            }
+        }
         let mut answered = false;
         for k in 0..endpoints.len().max(1) {
             let url = &endpoints[(start + k) % endpoints.len().max(1)];
@@ -2471,15 +2538,24 @@ struct FetchedTx {
     value: u128,
     to: String,
     data: String,
+}/// Quantity field off a transaction object. Mainstream nodes hex-encode these
+/// (`"0x…"`); a few gateways send decimal strings. The old generic helper
+/// parsed hex digits with `T::from_str` (decimal-only), so `"0x12"` read as 12
+/// and anything containing a hex letter failed — silently disabling fee bumps.
+fn hex_field_u64(v: &serde_json::Value, key: &str) -> Option<u64> {
+    let s = v.get(key)?.as_str()?;
+    match s.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => s.parse::<u64>().ok(),
+    }
 }
 
-fn hex_field<T: std::str::FromStr>(v: &serde_json::Value, key: &str) -> Option<T> {
+fn hex_field_u128(v: &serde_json::Value, key: &str) -> Option<u128> {
     let s = v.get(key)?.as_str()?;
-    let digits = s.strip_prefix("0x").unwrap_or(s);
-    T::from_str(digits).ok().or_else(|| {
-        // Decimal fallback for nodes that don't hex-encode quantity fields.
-        s.parse::<T>().ok()
-    })
+    match s.strip_prefix("0x") {
+        Some(h) => u128::from_str_radix(h, 16).ok(),
+        None => s.parse::<u128>().ok(),
+    }
 }
 
 async fn fetch_tx_for_bump(endpoints: &[String], hash: &str) -> Option<FetchedTx> {
@@ -2500,11 +2576,11 @@ async fn fetch_tx_for_bump(endpoints: &[String], hash: &str) -> Option<FetchedTx
             .unwrap_or("0x")
             .to_string();
         return Some(FetchedTx {
-            nonce: hex_field(tx, "nonce")?,
-            max_fee: hex_field(tx, "maxFeePerGas")?,
-            tip: hex_field(tx, "maxPriorityFeePerGas")?,
-            gas: hex_field(tx, "gas")?,
-            value: hex_field(tx, "value").unwrap_or(0),
+            nonce: hex_field_u64(tx, "nonce")?,
+            max_fee: hex_field_u128(tx, "maxFeePerGas")?,
+            tip: hex_field_u128(tx, "maxPriorityFeePerGas")?,
+            gas: hex_field_u64(tx, "gas")?,
+            value: hex_field_u128(tx, "value").unwrap_or(0),
             to,
             data,
         });
@@ -2825,6 +2901,36 @@ mod tests {
         assert_eq!(bumped_fee(1_000_000, 20), 3_000_000); // capped at 3x
         assert_eq!(bumped_fee(1, 1), 2); // rounding cannot hand back the original
         assert_eq!(bumped_fee(0, 1), 1);
+    }
+
+    /// Quantity fields off real node payloads: hex with letters must parse as
+    /// hex (the old generic helper read "0x12" as decimal 12 and dropped any
+    /// value containing a-f — silently killing fee bumps).
+    #[test]
+    fn hex_fields_parse_radix_and_decimal() {
+        let tx = serde_json::json!({
+            "nonce": "0x12",
+            "maxFeePerGas": "0x3b9aca00",
+            "maxPriorityFeePerGas": "0x77359400",
+            "gas": "0x5208",
+            "value": "0x2386f26fc10000",
+        });
+        assert_eq!(hex_field_u64(&tx, "nonce"), Some(18));
+        assert_eq!(hex_field_u128(&tx, "maxFeePerGas"), Some(1_000_000_000));
+        assert_eq!(hex_field_u128(&tx, "maxPriorityFeePerGas"), Some(2_000_000_000));
+        assert_eq!(hex_field_u64(&tx, "gas"), Some(21_000));
+        assert_eq!(hex_field_u128(&tx, "value"), Some(10_000_000_000_000_000));
+
+        // Gateways that send decimal strings still parse.
+        let dec = serde_json::json!({ "nonce": "18", "value": "10000000000000000" });
+        assert_eq!(hex_field_u64(&dec, "nonce"), Some(18));
+        assert_eq!(hex_field_u128(&dec, "value"), Some(10_000_000_000_000_000));
+
+        // Garbage is None, never a silent wrong number.
+        let bad = serde_json::json!({ "nonce": "0xzz", "gas": "" });
+        assert_eq!(hex_field_u64(&bad, "nonce"), None);
+        assert_eq!(hex_field_u64(&bad, "gas"), None);
+        assert_eq!(hex_field_u64(&bad, "missing"), None);
     }
 
     /// Terminal failure hands the reserved nonce back, so the next task on the
