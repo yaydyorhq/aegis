@@ -615,6 +615,14 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         .find(|c| c.chain_id == job.chain_id)
         .ok_or_else(|| AppError::NotFound(format!("chain {}", job.chain_id)))?;
 
+    // Single-call sites (balances, gas, nonce, send) use the chain's PRIMARY
+    // endpoint — the raw rpc_url can be a comma-separated endpoint list, which
+    // is only valid after endpoint_list() splits it. poll_receipt rotates.
+    let primary = chain::endpoint_list(&chain_row.rpc_url)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| chain_row.rpc_url.clone());
+
     // Resolves the wallet row (existence check) before any signing work.
     if let Err(e) = wallet_store::get_wallet(tx.wallet_id) {
         fail(format!("wallet: {e}"));
@@ -630,7 +638,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
     };
 
     // Balances
-    let sender_native = match chain::native_balance(&chain_row.rpc_url, &tx.from_address).await {
+    let sender_native = match chain::native_balance(&primary, &tx.from_address).await {
         Ok(hex) => parse_u256(&hex).unwrap_or(U256::ZERO),
         Err(e) => {
             fail(format!("native balance: {e}"));
@@ -640,16 +648,16 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
     let (sender_token_bal, dest_token_bal) = if is_native {
         // Disperse-target math needs the destination's real native balance.
         let dest_native =
-            match chain::native_balance(&chain_row.rpc_url, &tx.to_address).await {
+            match chain::native_balance(&primary, &tx.to_address).await {
                 Ok(hex) => parse_u256(&hex).unwrap_or(U256::ZERO),
                 Err(_) => U256::ZERO,
             };
         (sender_native, dest_native)
     } else {
-        let sb = erc20::balance_of(&chain_row.rpc_url, &job.asset, &tx.from_address)
+        let sb = erc20::balance_of(&primary, &job.asset, &tx.from_address)
             .await
             .unwrap_or(U256::ZERO);
-        let db_ = erc20::balance_of(&chain_row.rpc_url, &job.asset, &tx.to_address)
+        let db_ = erc20::balance_of(&primary, &job.asset, &tx.to_address)
             .await
             .unwrap_or(U256::ZERO);
         (sb, db_)
@@ -703,7 +711,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         (job.asset.clone(), cd, U256::ZERO)
     };
 
-    let gas_price = match chain::gas_price(&chain_row.rpc_url).await {
+    let gas_price = match chain::gas_price(&primary).await {
         Ok(p) => p.saturating_mul(110) / 100,
         Err(e) => {
             fail(format!("gasPrice: {e}"));
@@ -725,7 +733,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         "data": if tx_data == "0x" { serde_json::json!("0x") } else { serde_json::json!(tx_data) },
         "value": format!("0x{:x}", value_for_estimate),
     });
-    let gas = match chain::estimate_gas(&chain_row.rpc_url, estimate_payload).await {
+    let gas = match chain::estimate_gas(&primary, estimate_payload).await {
         Ok(g) => g.saturating_mul(115) / 100,
         Err(_) => {
             if is_native {
@@ -805,7 +813,7 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         0
     };
 
-    let chain_nonce = match chain::get_transaction_count(&chain_row.rpc_url, &tx.from_address).await
+    let chain_nonce = match chain::get_transaction_count(&primary, &tx.from_address).await
     {
         Ok(n) => n,
         Err(e) => {
@@ -862,8 +870,17 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
         format!("0x{}", hex::encode(alloy::primitives::keccak256(&raw)))
     };
     set_tx_status(tx.id, "broadcasting", Some(&local_hash), None, Some(&send_amount.to_string()));
+    // Remember the reserved nonce so the receipt poll can hand it back when
+    // the tx proves to be a phantom (stamped pre-send, never accepted).
+    let _ = crate::db::with_conn(|conn| {
+        conn.execute(
+            "UPDATE fund_txs SET tx_nonce=?1 WHERE id=?2",
+            rusqlite::params![nonce as i64, tx.id],
+        )?;
+        Ok(())
+    });
 
-    match chain::send_raw_transaction(&chain_row.rpc_url, &signed).await {
+    match chain::send_raw_transaction(&primary, &signed).await {
         Ok(hash) => {
             set_tx_status(tx.id, "confirming", Some(&hash), None, None);
             wallet_store::log_activity(
@@ -921,6 +938,60 @@ async fn process_one_tx(tx: &FundTxRow, job: &FundJobRow) -> AppResult<()> {
 /// lives on the row because the runner re-enters the poll after every give-up.
 const FUND_POLL_MAX_ATTEMPTS: i64 = 150;
 
+/// Hand a fund tx's reserved nonce back — called when the receipt poll proves
+/// the tx never entered any mempool. Mirrors mint's release_task_nonce.
+fn release_fund_tx_nonce(tx_id: i64) {
+    let row: Option<(i64, Option<i64>, i64)> = crate::db::with_conn(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT t.wallet_id, t.tx_nonce, j.chain_id
+                 FROM fund_txs t JOIN fund_jobs j ON j.id = t.job_id
+                 WHERE t.id = ?1",
+                [tx_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok())
+    })
+    .ok()
+    .flatten();
+    if let Some((wallet_id, Some(nonce), chain_id)) = row {
+        crate::nonce::release(wallet_id, chain_id, nonce as u64);
+        crate::logging::info(
+            "fund",
+            &format!("Fund tx #{tx_id}: released unused nonce {nonce}"),
+        );
+    }
+}
+
+/// True when at least one right-chain endpoint still knows `hash` — receipt
+/// mined or sitting in a mempool. Drives both the fast phantom check (~10s)
+/// and the over-budget "keep watching" decision (double-send guard).
+async fn tx_known_anywhere(hash: &str, chain_id: i64, endpoints: &[String]) -> bool {
+    for url in endpoints {
+        if !matches!(
+            chain::eth_chain_id(url).await,
+            Ok(cid) if cid == chain_id
+        ) {
+            continue;
+        }
+        if let Ok(Some(_)) = chain::get_receipt(url, hash).await {
+            return true;
+        }
+        if let Ok(v) = chain::rpc_call(
+            url,
+            "eth_getTransactionByHash",
+            serde_json::json!([hash]),
+        )
+        .await
+        {
+            if v.get("result").map(|r| !r.is_null()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 async fn poll_receipt(tx_id: i64, hash: &str, chain_id: i64) -> AppResult<()> {
     let chains = chain::list_chains()?;
     let chain_row = match chains.into_iter().find(|c| c.chain_id == chain_id) {
@@ -943,22 +1014,48 @@ async fn poll_receipt(tx_id: i64, hash: &str, chain_id: i64) -> AppResult<()> {
         Ok(n)
     })
     .unwrap_or(0);
+    // Rows resumed mid-budget (crash recovery) skip the fast phantom check —
+    // their true age is unknown; the over-budget adjudication still applies.
+    let mut phantom_checked = attempts >= 5;
     let mut cycle = 0usize;
     let mut consecutive_errs = 0u32;
     loop {
         if attempts >= FUND_POLL_MAX_ATTEMPTS {
-            // Nothing verifiable after the budget: say so precisely instead of
-            // pretending the tx failed — the hash is the only proof that
-            // matters before someone re-runs the job.
+            // Over budget. Adjudicate before ANY failure: a tx still known to
+            // some node must NOT be marked failed — the natural next step
+            // ("run the job again") would send the amount twice. Reset the
+            // budget and keep watching; only a tx absent from every endpoint's
+            // mempool is provably dead.
+            if tx_known_anywhere(hash, chain_id, &endpoints).await {
+                let _ = crate::db::with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE fund_txs SET poll_attempts=0, updated_at=?1 WHERE id=?2",
+                        rusqlite::params![crate::db::now_ms(), tx_id],
+                    )?;
+                    Ok(())
+                });
+                crate::logging::warn(
+                    "fund",
+                    &format!("Fund tx #{tx_id}: over budget but {hash} is still in a mempool — watching"),
+                );
+                set_tx_status(
+                    tx_id,
+                    "confirming",
+                    Some(hash),
+                    Some("still in mempool after ~5m — keeping watch; re-running the job now would double-send"),
+                    None,
+                );
+                return Ok(());
+            }
             crate::logging::warn(
                 "fund",
-                &format!("Fund tx #{tx_id}: gave up polling {hash} after {attempts} attempts"),
+                &format!("Fund tx #{tx_id}: gave up polling {hash} after {attempts} attempts — absent everywhere"),
             );
             set_tx_status(
                 tx_id,
                 "failed",
                 Some(hash),
-                Some("no receipt after ~5m of polling — verify this hash before re-running"),
+                Some("no receipt after ~5m — tx is absent from every endpoint's mempool; verify the hash before re-running"),
                 None,
             );
             return Ok(());
@@ -973,6 +1070,29 @@ async fn poll_receipt(tx_id: i64, hash: &str, chain_id: i64) -> AppResult<()> {
             Ok(())
         });
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Fast phantom check (~10s in): the hash was stamped pre-send, so a
+        // tx unknown to every node was never accepted (crash before send, or
+        // every endpoint rejected). Fail now and free the nonce instead of
+        // burning the whole 5-minute budget.
+        if !phantom_checked && attempts >= 5 {
+            phantom_checked = true;
+            if !tx_known_anywhere(hash, chain_id, &endpoints).await {
+                release_fund_tx_nonce(tx_id);
+                crate::logging::warn(
+                    "fund",
+                    &format!("Fund tx #{tx_id}: phantom {hash} — never accepted"),
+                );
+                set_tx_status(
+                    tx_id,
+                    "failed",
+                    Some(hash),
+                    Some("tx unknown to every endpoint ~10s after broadcast — the send was never accepted; safe to re-run the job"),
+                    None,
+                );
+                return Ok(());
+            }
+        }
 
         let mut answered = false;
         for k in 0..endpoints.len().max(1) {
@@ -1103,7 +1223,11 @@ pub async fn asset_meta(chain_id: i64, asset: &str) -> AppResult<(u8, String)> {
             "asset must be 'native' or a 0x token address".into(),
         ));
     }
-    token_meta(&row.rpc_url, asset).await
+    let primary = chain::endpoint_list(&row.rpc_url)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| row.rpc_url.clone());
+    token_meta(&primary, asset).await
 }
 
 /// Compute per-transfer amounts using live balances (UI preview).
@@ -1114,17 +1238,21 @@ pub async fn preview(a: FundStartArgs) -> AppResult<FundPreview> {
         .into_iter()
         .find(|c| c.chain_id == a.chain_id)
         .ok_or_else(|| AppError::NotFound(format!("chain {}", a.chain_id)))?;
+    let primary = chain::endpoint_list(&chain_row.rpc_url)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| chain_row.rpc_url.clone());
     let is_native = a.asset.trim() == "native";
     let (decimals, symbol) = if is_native {
         (18u8, chain_row.symbol.clone())
     } else {
-        token_meta(&chain_row.rpc_url, a.asset.trim()).await?
+        token_meta(&primary, a.asset.trim()).await?
     };
     let configured = parse_u256(&a.amount_wei)?;
     let is_disperse = a.mode == "disperse";
     let anchor = wallet_store::get_wallet(a.anchor_wallet_id)?;
 
-    let gas_price = chain::gas_price(&chain_row.rpc_url).await.unwrap_or(1_000_000_000);
+    let gas_price = chain::gas_price(&primary).await.unwrap_or(1_000_000_000);
     let est_gas: u64 = if is_native { 21_000 } else { 65_000 };
     let gas_cost = U256::from(est_gas) * U256::from(gas_price.saturating_mul(110) / 100);
 
@@ -1150,23 +1278,23 @@ pub async fn preview(a: FundStartArgs) -> AppResult<FundPreview> {
             )
         };
 
-        let sender_native = chain::native_balance(&chain_row.rpc_url, &sender_addr)
+        let sender_native = chain::native_balance(&primary, &sender_addr)
             .await
             .ok()
             .and_then(|h| parse_u256(&h).ok())
             .unwrap_or(U256::ZERO);
         let (sender_token_bal, dest_token_bal) = if is_native {
-            let dest_native = chain::native_balance(&chain_row.rpc_url, &dest_addr)
+            let dest_native = chain::native_balance(&primary, &dest_addr)
                 .await
                 .ok()
                 .and_then(|h| parse_u256(&h).ok())
                 .unwrap_or(U256::ZERO);
             (sender_native, dest_native)
         } else {
-            let sb = erc20::balance_of(&chain_row.rpc_url, a.asset.trim(), &sender_addr)
+            let sb = erc20::balance_of(&primary, a.asset.trim(), &sender_addr)
                 .await
                 .unwrap_or(U256::ZERO);
-            let dbal = erc20::balance_of(&chain_row.rpc_url, a.asset.trim(), &dest_addr)
+            let dbal = erc20::balance_of(&primary, a.asset.trim(), &dest_addr)
                 .await
                 .unwrap_or(U256::ZERO);
             (sb, dbal)
@@ -1220,7 +1348,7 @@ pub async fn preview(a: FundStartArgs) -> AppResult<FundPreview> {
     }
     if is_disperse && is_native {
         let need = total + gas_cost * U256::from(a.peer_wallet_ids.len() as u64);
-        let anchor_bal = chain::native_balance(&chain_row.rpc_url, &anchor.address)
+        let anchor_bal = chain::native_balance(&primary, &anchor.address)
             .await
             .ok()
             .and_then(|h| parse_u256(&h).ok())

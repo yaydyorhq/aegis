@@ -157,9 +157,11 @@ export function ManageFundsModal({ onClose }: { onClose: () => void }) {
     };
   }, [loadWallets]);
 
-  // Poll while progress step + job running
+  // Poll while progress step + job running. `stopped` still settles in-flight
+  // rows in the background, so keep watching; `done` is terminal.
   useEffect(() => {
     if (step !== "progress" || !job) return;
+    if (job.status !== "running" && job.status !== "stopped") return;
     const tick = async () => {
       try {
         const [j, rows] = await Promise.all([
@@ -193,7 +195,25 @@ export function ManageFundsModal({ onClose }: { onClose: () => void }) {
 
   async function runPreview(silent = false) {
     if (chainId === "" || anchorWalletId === "") return null;
-    const wei = parseUnitsToWei(amount, isNative ? 18 : preview?.decimals ?? 18);
+    // First pass for an ERC-20 has no cached decimals — resolve them BEFORE
+    // parsing the amount, or a 6-decimal token gets read as 18 and the
+    // preview shows the wrong scale (Start re-resolves; the display misled).
+    let decimals = isNative ? 18 : (preview?.decimals ?? -1);
+    if (!isNative && decimals < 0) {
+      try {
+        const meta = await ipc<[number, string]>("funds_asset_meta", {
+          chainId,
+          asset: tokenAddress.trim(),
+        });
+        decimals = meta[0];
+      } catch {
+        if (!silent) {
+          setErr("Cannot read token decimals — check the contract address and chain");
+        }
+        return null;
+      }
+    }
+    const wei = parseUnitsToWei(amount, decimals);
     if (!wei) {
       if (!silent) setErr("Invalid amount");
       return null;
@@ -385,6 +405,9 @@ export function ManageFundsModal({ onClose }: { onClose: () => void }) {
                     value={chainId}
                     onChange={(e) => {
                       setChainId(e.target.value === "" ? "" : Number(e.target.value));
+                      // Token contracts are chain-specific — a pasted address
+                      // from another chain only produces confusing previews.
+                      setTokenAddress("");
                       resetPreview();
                     }}
                     className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"

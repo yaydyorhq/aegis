@@ -90,6 +90,10 @@ fn migrate(conn: &Connection) -> AppResult<()> {
         "poll_attempts",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // Nonce handed out by the shared allocator for this attempt — lets the
+    // fund receipt poll hand it back when the tx proves to be a phantom
+    // (stamped pre-broadcast, never accepted by any node).
+    ensure_column(conn, "fund_txs", "tx_nonce", "INTEGER")?;
     Ok(())
 }
 
