@@ -20,7 +20,7 @@ import type {
   SeaDropPlan,
 } from "../lib/types";
 import { EmptyState, MultiSelectDropdown, PageHeader, StatusDot, pushToast, ConfirmDialog, useDismissOnEscape, type DropdownGroup, type StatusTone } from "../components/ui";
-import { shortAddress } from "../lib/utils";
+import { cn, shortAddress } from "../lib/utils";
 import { useWalletStore } from "../store/app";
 import { suppressNextNewTaskToast, useMintTaskFeed } from "../store/tasks";
 
@@ -1632,44 +1632,37 @@ export function MintingPage() {
 
       {err ? <div className="mb-3 text-[12px] text-danger">{err}</div> : null}
 
-      {/* Status filter + retry failed */}
-      <div className="mb-3 flex flex-wrap items-center gap-1.5">
-        {(["all", "draft", "pending", "done", "failed"] as const).map((s) => (
-          <button
-            key={s}
-            type="button"
-            onClick={() => setStatusFilter(s)}
-            className={`rounded-full border px-2.5 py-1 text-[11px] transition ${
-              statusFilter === s
-                ? "border-accent bg-accent/10 text-accent"
-                : "border-line text-muted hover:text-fg"
-            }`}
-          >
-            {s === "all" ? "All" : s === "done" ? "Done" : s.charAt(0).toUpperCase() + s.slice(1)}
-            <span className="ml-1 opacity-60">{statusCounts[s]}</span>
-          </button>
-        ))}
-        <div className="flex-1" />
-        {hasFailed ? (
-          <button
-            type="button"
-            onClick={() => void onRetryAll()}
-            disabled={running}
-            className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-1.5 text-[12px] text-warn hover:bg-warn/20 disabled:opacity-40"
-          >
-            Retry all failed ({statusCounts.failed})
-          </button>
-        ) : null}
-      </div>
-
-      <div className="overflow-x-auto rounded-[14px] border border-line bg-card">
-        <div className="grid min-w-[920px] grid-cols-[36px_1fr_130px_80px_66px_82px_72px_190px_50px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+      {/* ── Mint queue board ── */}
+      <div className="overflow-hidden rounded-[14px] border border-line bg-card">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2">
+          <span className="font-mono text-[10.5px] font-semibold uppercase tracking-[0.1em] text-muted">
+            Mint queue
+          </span>
+          <div className="flex flex-wrap items-center gap-1">
+            {(["all", "draft", "pending", "done", "failed"] as const).map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStatusFilter(s)}
+                className={cn(
+                  "rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.06em] transition-colors",
+                  statusFilter === s
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-line text-muted hover:text-fg",
+                )}
+              >
+                {s} <span className="opacity-60">{statusCounts[s]}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="grid min-w-[920px] grid-cols-[36px_1fr_130px_80px_66px_82px_72px_190px_50px] gap-2 border-b border-line px-4 py-2 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted">
           <div>ID</div>
           <div>Contract</div>
           <div>Wallet</div>
           <div>Gas</div>
           <div>Value</div>
-          <div>Schedule</div>
+          <div>Sched</div>
           <div>Mode</div>
           <div>Status</div>
           <div />
@@ -1680,7 +1673,9 @@ export function MintingPage() {
             description="Enqueue a task targeting any contract you control or a public mint."
           />
         ) : filteredTasks.length === 0 ? (
-          <div className="px-4 py-6 text-center text-[13px] text-muted">No {statusFilter} tasks.</div>
+          <div className="px-4 py-6 text-center font-mono text-[11px] uppercase tracking-[0.08em] text-muted">
+            No {statusFilter} tasks.
+          </div>
         ) : (
           filteredTasks.map((t) => {
             const st = statusTone(t.status);
@@ -1691,7 +1686,7 @@ export function MintingPage() {
               key={t.id}
               className="grid min-w-[920px] grid-cols-[36px_1fr_130px_80px_66px_82px_72px_190px_50px] items-center gap-2 border-b border-line/60 px-4 py-2.5 text-[13px] last:border-0 hover:bg-line/30"
             >
-              <div className="text-muted">#{t.id}</div>
+              <div className="font-mono text-[12px] text-muted">#{t.id}</div>
               <div className="min-w-0 overflow-hidden truncate font-mono text-[12px]" title={t.contract}>
                 {shortAddress(t.contract, 6)}
                 {t.function_name ? (
@@ -1716,20 +1711,20 @@ export function MintingPage() {
                   <span className="text-muted">—</span>
                 )}
               </div>
-              <div className="truncate text-[12px] text-muted" title={t.gas_limit ? `gas limit ${t.gas_limit}` : t.max_fee_gwei ? `max fee ${t.max_fee_gwei} gwei` : "auto"}>
+              <div className="truncate font-mono text-[12px] text-muted tabular-nums" title={t.gas_limit ? `gas limit ${t.gas_limit}` : t.max_fee_gwei ? `max fee ${t.max_fee_gwei} gwei` : "auto"}>
                 {t.gas_limit
                   ? t.gas_limit
                   : t.max_fee_gwei
                     ? `${t.max_fee_gwei} gwei`
                     : "auto"}
               </div>
-              <div className="truncate text-[12px] text-muted" title={t.value_wei || ""}>
+              <div className="truncate font-mono text-[12px] text-muted tabular-nums" title={t.value_wei || ""}>
                 {formatValue(t.value_wei)}
               </div>
               <div>
                 <ModeBadge mode={t.mode || "execute"} />
               </div>
-              <div className="truncate text-[12px] text-muted" title={t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : ""}>
+              <div className="truncate font-mono text-[12px] tabular-nums text-muted" title={t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : ""}>
                 {t.scheduled_at ? (t.scheduled_at > Date.now() ? (
                   <span className="text-warn">{
                     t.scheduled_at - Date.now() < 60000
@@ -1742,7 +1737,7 @@ export function MintingPage() {
                   <span className="opacity-50">+{t.delay_ms}ms</span>
                 ) : null)}
               </div>
-              <div className="flex min-w-0 flex-col gap-0.5 overflow-hidden text-[12px] capitalize">
+              <div className="flex min-w-0 flex-col gap-0.5 overflow-hidden font-mono text-[11.5px]">
                 <div className="flex items-center gap-1.5">
                   <StatusDot tone={st.tone} pulse={st.pulse} />
                   <span className={`min-w-0 truncate ${st.tone === "danger" ? "text-danger" : ""}`}>
@@ -1816,6 +1811,21 @@ export function MintingPage() {
             );
           })
         )}
+        <div className="flex items-center justify-between gap-2 border-t border-line px-4 py-2">
+          <span className="font-mono text-[9.5px] uppercase tracking-[0.1em] text-muted">
+            {tasks.length} task(s) · live poll 4s
+          </span>
+          {hasFailed ? (
+            <button
+              type="button"
+              onClick={() => void onRetryAll()}
+              disabled={running}
+              className="rounded border border-warn/40 bg-warn/10 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.06em] text-warn hover:bg-warn/20 disabled:opacity-40"
+            >
+              Retry all failed ({statusCounts.failed})
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <ConfirmDialog
@@ -1856,7 +1866,7 @@ function ModeBadge({ mode }: { mode: string }) {
           ? "border-rose-500/50 text-rose-700 dark:text-rose-300"
           : "border-line text-muted";
   return (
-    <span className={`inline-flex rounded border px-1.5 py-0.5 text-[11px] capitalize ${cls}`}>
+    <span className={`inline-flex rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide ${cls}`}>
       {mode}
     </span>
   );
