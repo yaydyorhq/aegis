@@ -252,6 +252,52 @@ pub fn meta_set(key: &str, value: &str) -> AppResult<()> {
     })
 }
 
+/// Rows deleted by [`prune_old_data`], per table.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct PruneReport {
+    pub activity: u64,
+    pub pnl_scans: u64,
+    pub collection_scans: u64,
+    pub eligibility: u64,
+    pub nft_cache: u64,
+}
+
+/// Delete rows older than `retention_days` from append-only tables so the
+/// database stops growing forever. Money trails — mint_tasks, fund_jobs,
+/// fund_txs — are NEVER touched; those are the records that matter.
+pub fn prune_old_data(retention_days: i64) -> AppResult<PruneReport> {
+    let cutoff = now_ms() - retention_days.saturating_mul(86_400_000);
+    with_conn(|conn| {
+        let activity = conn
+            .execute("DELETE FROM activity WHERE created_at < ?1", [cutoff])? as u64;
+        let pnl_scans = conn
+            .execute("DELETE FROM pnl_scans WHERE scanned_at < ?1", [cutoff])? as u64;
+        let collection_scans = conn
+            .execute(
+                "DELETE FROM collection_pnl_scans WHERE scanned_at < ?1",
+                [cutoff],
+            )? as u64;
+        let eligibility = conn
+            .execute(
+                "DELETE FROM eligibility_checks WHERE checked_at < ?1",
+                [cutoff],
+            )? as u64
+            + conn.execute(
+                "DELETE FROM eligibility_matrix WHERE checked_at < ?1",
+                [cutoff],
+            )? as u64;
+        let nft_cache = conn
+            .execute("DELETE FROM nft_cache WHERE fetched_at < ?1", [cutoff])? as u64;
+        Ok(PruneReport {
+            activity,
+            pnl_scans,
+            collection_scans,
+            eligibility,
+            nft_cache,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChartNoAxesCombined, Clock, Flame, FolderOpen, KeyRound, Network, ShieldCheck, TrendingDown, TrendingUp, Wallet, Zap } from "lucide-react";
 import { ipc } from "../lib/ipc";
-import type { ActivityRow, CollectionPnlPoint, ModuleStatusItem, PortfolioLive, StatsOverview } from "../lib/types";
+import type { ActivityRow, CollectionPnlPoint, ModuleStatusItem, NetworkOverview, PortfolioLive, StatsOverview } from "../lib/types";
 import { StatusDot } from "../components/ui";
 import { cn, formatEth, greeting, shortAddress } from "../lib/utils";
 import { useAppStore, useVaultStore, useWalletStore } from "../store/app";
@@ -154,6 +154,8 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
   const [liveOn, setLiveOn] = useState(true);
   /** Which chain the LIVE WALLETS board shows; null = first in response. */
   const [liveChainId, setLiveChainId] = useState<number | null>(null);
+  /** Gas + endpoint health across enabled chains (~60s poll). */
+  const [network, setNetwork] = useState<NetworkOverview | null>(null);
 
   const fetchLive = useCallback(async () => {
     try {
@@ -182,6 +184,31 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [liveOn, fetchLive]);
+
+  // Network poll (gas + endpoint health) — slower still, it probes every
+  // endpoint of every enabled chain.
+  useEffect(() => {
+    let stopped = false;
+    const tick = () => {
+      if (stopped || document.hidden) return;
+      void ipc<NetworkOverview>("network_overview")
+        .then((n) => setNetwork(n))
+        .catch(() => {
+          /* keep the last snapshot */
+        });
+    };
+    void tick();
+    const t = setInterval(tick, 60_000);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -600,6 +627,58 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
         </div>
 
         {/* ── Ops board ── */}
+        {/* ── Network board ── */}
+        <Board
+          label="Network · gas & endpoints"
+          right={
+            <BoardLabel>
+              {network
+                ? `UPDATED ${agoLabel(network.fetched_at).toUpperCase()}`
+                : "PROBING…"}
+            </BoardLabel>
+          }
+          className="mb-6"
+        >
+          {network && network.chains.length > 0 ? (
+            <div className="divide-y divide-line/60">
+              <div className="grid grid-cols-[1fr_130px_110px_80px] gap-2 px-4 py-1.5 text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted">
+                <div>Chain</div>
+                <div className="text-right">Gas</div>
+                <div className="text-right">Endpoints</div>
+                <div className="text-right">Ping</div>
+              </div>
+              {network.chains.map((c) => (
+                <div
+                  key={c.chain_id}
+                  className="grid grid-cols-[1fr_130px_110px_80px] items-center gap-2 px-4 py-2 text-[12.5px]"
+                >
+                  <div className="min-w-0 truncate">{c.chain_name}</div>
+                  <div className="text-right font-mono tabular-nums">
+                    {c.gas_gwei != null
+                      ? `${c.gas_gwei < 1 ? c.gas_gwei.toFixed(4) : c.gas_gwei.toFixed(2)} ${c.symbol}`
+                      : "—"}
+                  </div>
+                  <div
+                    className={cn(
+                      "text-right font-mono tabular-nums",
+                      c.endpoints_ok === 0 && c.endpoints_total > 0 && "text-danger",
+                    )}
+                  >
+                    {c.endpoints_ok}/{c.endpoints_total}
+                  </div>
+                  <div className="text-right font-mono tabular-nums text-muted">
+                    {c.best_latency_ms != null ? `${c.best_latency_ms}ms` : "—"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="px-4 py-5 text-center font-mono text-[11px] uppercase tracking-[0.08em] text-muted">
+              {network == null ? "Probing endpoints…" : "No enabled chains"}
+            </div>
+          )}
+        </Board>
+
         <div className="mb-3 flex items-baseline justify-between">
           <div>
             <div className="text-[12px] text-muted">Workspace</div>

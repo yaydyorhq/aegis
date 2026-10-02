@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::vault;
 use alloy::primitives::U256;
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize)]
 pub struct PortfolioCollectionSummary {
@@ -408,4 +408,100 @@ mod tests {
         assert_eq!(fmt_eth(-0.0000004), "0");
         assert_eq!(fmt_eth(0.123456789), "0.123457");
     }
+}
+
+// ── Network overview (gas + endpoint health per enabled chain) ─────────
+
+#[derive(Serialize)]
+pub struct ChainNetworkStatus {
+    pub chain_id: i64,
+    pub chain_name: String,
+    pub symbol: String,
+    /// eth_gasPrice from the first matching endpoint, in gwei.
+    pub gas_gwei: Option<f64>,
+    pub endpoints_total: u32,
+    /// Endpoints that answered eth_chainId with the EXPECTED chain id.
+    pub endpoints_ok: u32,
+    pub best_latency_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct NetworkOverview {
+    pub chains: Vec<ChainNetworkStatus>,
+    pub fetched_at: i64,
+}
+
+/// Gas price + endpoint health for every enabled chain, meant for a ~60s
+/// Dashboard poll. Each chain probes its own endpoint list (wrong-chain and
+/// dead endpoints count as not-ok) with a 6s cap per call.
+#[tauri::command]
+pub async fn network_overview() -> AppResult<NetworkOverview> {
+    const PER_CALL_TIMEOUT: Duration = Duration::from_secs(6);
+
+    let chains = crate::chain::list_chains()?;
+    let enabled: Vec<&crate::chain::ChainRow> =
+        chains.iter().filter(|c| c.enabled != 0).collect();
+
+    let mut set = tokio::task::JoinSet::new();
+    for chain in &enabled {
+        let chain_id = chain.chain_id;
+        let chain_name = chain.name.clone();
+        let symbol = chain.symbol.clone();
+        let rpc_url = chain.rpc_url.clone();
+        set.spawn(async move {
+            let eps = crate::chain::endpoint_list(&rpc_url);
+            let mut ok = 0u32;
+            let mut best: Option<u64> = None;
+            let mut gas: Option<f64> = None;
+            for url in &eps {
+                let t0 = Instant::now();
+                let cid = match tokio::time::timeout(
+                    PER_CALL_TIMEOUT,
+                    crate::chain::eth_chain_id(url),
+                )
+                .await
+                {
+                    Ok(Ok(cid)) => Some(cid),
+                    _ => None,
+                };
+                let Some(cid) = cid else { continue };
+                if cid != chain_id {
+                    continue; // wrong-chain endpoint — not healthy for this chain
+                }
+                ok += 1;
+                let lat = t0.elapsed().as_millis() as u64;
+                best = Some(best.map_or(lat, |b: u64| b.min(lat)));
+                if gas.is_none() {
+                    if let Ok(Ok(gp)) = tokio::time::timeout(
+                        PER_CALL_TIMEOUT,
+                        crate::chain::gas_price(url),
+                    )
+                    .await
+                    {
+                        gas = Some(gp as f64 / 1e9);
+                    }
+                }
+            }
+            ChainNetworkStatus {
+                chain_id,
+                chain_name,
+                symbol,
+                gas_gwei: gas,
+                endpoints_total: eps.len() as u32,
+                endpoints_ok: ok,
+                best_latency_ms: best,
+            }
+        });
+    }
+
+    let mut out = Vec::with_capacity(enabled.len());
+    while let Some(res) = set.join_next().await {
+        out.push(res.map_err(|e| AppError::Other(e.to_string()))?);
+    }
+    out.sort_by_key(|c| c.chain_id);
+
+    Ok(NetworkOverview {
+        chains: out,
+        fetched_at: crate::db::now_ms(),
+    })
 }

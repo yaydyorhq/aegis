@@ -43,6 +43,25 @@ pub fn run() {
             logging::info("app", "aegis starting");
             let db_path = dir.join("aegis.db");
             db::init(&db_path)?;
+            // Startup prune per the retention setting (0 / unset = keep all).
+            if let Ok(Some(days)) = db::meta_get("db_retention_days") {
+                if let Ok(days) = days.parse::<i64>() {
+                    if days > 0 {
+                        match db::prune_old_data(days) {
+                            Ok(r) if r.activity + r.pnl_scans + r.collection_scans + r.eligibility + r.nft_cache > 0 => {
+                                logging::info(
+                                    "db",
+                                    &format!(
+                                        "pruned {} activity / {} pnl / {} collection scans / {} eligibility / {} nft cache rows (>{}d)",
+                                        r.activity, r.pnl_scans, r.collection_scans, r.eligibility, r.nft_cache, days
+                                    ),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             mint::recover_stale_tasks();
             fund::recover_stale();
             // Auto-run scheduler: fire due scheduled tasks without a manual "Run queue".
@@ -208,6 +227,8 @@ pub fn run() {
             // meta (local prefs)
             commands::meta::meta_get,
             commands::meta::meta_set,
+            commands::meta::db_prune,
+            commands::stats::network_overview,
             // api keys
             commands::api_keys::api_key_set,
             commands::api_keys::api_key_list,

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Bell, Lock, RefreshCw, ShieldCheck, Info, Monitor, Moon, Sun } from "lucide-react";
-import { PageHeader, StatusDot } from "../components/ui";
+import { Bell, Lock, RefreshCw, ShieldCheck, Info, Monitor, Moon, Sun, Trash2 } from "lucide-react";
+import { PageHeader, StatusDot, pushToast } from "../components/ui";
 import { ipc } from "../lib/ipc";
 import { cn } from "../lib/utils";
 import {
@@ -30,6 +30,11 @@ export function SettingsPage() {
   const [notifySound, setNotifySound] = useState(notifySoundEnabled);
   /** Auto re-scan interval for the Collection PnL, minutes (0 = off). */
   const [autoscan, setAutoscan] = useState<string>("0");
+  /** Vault auto-lock after idle minutes (0 = off). */
+  const [autolock, setAutolock] = useState<string>("0");
+  /** Append-only table retention in days (0 = keep everything). */
+  const [retention, setRetention] = useState<string>("0");
+  const [pruning, setPruning] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -39,15 +44,20 @@ export function SettingsPage() {
     setDraft(profileName);
   }, [profileName]);
 
-  // Auto re-scan preference lives in the backend meta table (the scheduler
-  // re-reads it every tick), hydrated once on mount.
+  // Settings persisted in the backend meta table, hydrated once on mount.
   useEffect(() => {
     void (async () => {
       try {
-        const v = await ipc<string | null>("meta_get", { key: "pnl_autoscan" });
-        if (v !== null && v !== undefined) setAutoscan(v);
+        const [v, a, r] = await Promise.all([
+          ipc<string | null>("meta_get", { key: "pnl_autoscan" }),
+          ipc<string | null>("meta_get", { key: "vault_autolock" }),
+          ipc<string | null>("meta_get", { key: "db_retention_days" }),
+        ]);
+        if (v != null) setAutoscan(v);
+        if (a != null) setAutolock(a);
+        if (r != null) setRetention(r);
       } catch {
-        /* default off */
+        /* defaults off */
       }
     })();
   }, []);
@@ -57,6 +67,29 @@ export function SettingsPage() {
     void ipc("meta_set", { key: "pnl_autoscan", value: m }).catch(() => {
       setErr("Could not persist auto re-scan setting");
     });
+  }
+
+  async function onPruneNow() {
+    const days = Number(retention) || 0;
+    if (days <= 0) return;
+    setPruning(true);
+    setErr(null);
+    try {
+      const r = await ipc<{
+        activity: number;
+        pnl_scans: number;
+        collection_scans: number;
+        eligibility: number;
+        nft_cache: number;
+      }>("db_prune", { retentionDays: days });
+      const total =
+        r.activity + r.pnl_scans + r.collection_scans + r.eligibility + r.nft_cache;
+      pushToast("Prune complete", "ok", `${total} row(s) removed (${days}-day retention)`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setPruning(false);
+    }
   }
 
   function saveProfile() {
@@ -204,16 +237,77 @@ export function SettingsPage() {
             </div>
           </div>
           {status?.unlocked ? (
-            <button
-              onClick={onLock}
-              className="rounded-lg border border-line bg-bg px-4 py-2 text-[13px] text-danger hover:border-danger/50"
-            >
-              Lock vault now
-            </button>
+            <>
+              <div className="mb-3 flex items-center gap-3">
+                <span className="text-[12px] text-muted">Auto-lock when idle</span>
+                <select
+                  value={autolock}
+                  onChange={(e) => {
+                    setAutolock(e.target.value);
+                    void ipc("meta_set", {
+                      key: "vault_autolock",
+                      value: e.target.value,
+                    }).catch(() => {
+                      setErr("Could not persist auto-lock setting");
+                    });
+                  }}
+                  className="rounded-lg border border-line bg-bg px-2 py-1.5 text-[12px] outline-none focus:border-accent"
+                >
+                  <option value="0">Off</option>
+                  <option value="5">After 5 minutes</option>
+                  <option value="15">After 15 minutes</option>
+                  <option value="30">After 30 minutes</option>
+                </select>
+              </div>
+              <button
+                onClick={onLock}
+                className="rounded-lg border border-line bg-bg px-4 py-2 text-[13px] text-danger hover:border-danger/50"
+              >
+                Lock vault now
+              </button>
+            </>
           ) : (
             <div className="text-[12px] text-warn">Unlock the vault from the gate overlay to manage secrets.</div>
           )}
           {err ? <div className="mt-2 text-[12px] text-danger">{err}</div> : null}
+        </section>
+
+        <section className="rounded-[14px] border border-line bg-card p-5">
+          <div className="mb-3 flex items-center gap-2 text-[13px] font-semibold">
+            <Trash2 className="h-4 w-4" /> Data retention
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <select
+              value={retention}
+              onChange={(e) => {
+                setRetention(e.target.value);
+                void ipc("meta_set", {
+                  key: "db_retention_days",
+                  value: e.target.value,
+                }).catch(() => {
+                  setErr("Could not persist retention setting");
+                });
+              }}
+              className="rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
+            >
+              <option value="0">Keep everything</option>
+              <option value="30">Keep last 30 days</option>
+              <option value="90">Keep last 90 days</option>
+              <option value="365">Keep last 365 days</option>
+            </select>
+            <button
+              onClick={() => void onPruneNow()}
+              disabled={pruning || retention === "0"}
+              className="rounded-lg border border-line bg-bg px-4 py-2 text-[12.5px] text-danger hover:border-danger/50 disabled:opacity-40"
+            >
+              {pruning ? "Pruning…" : "Prune now"}
+            </button>
+          </div>
+          <p className="mt-2 text-[12px] text-muted">
+            Removes old activity, PnL scans, eligibility checks, and NFT cache.
+            Money trails — mint tasks and fund jobs — are never pruned. A prune
+            also runs at startup when a retention is set.
+          </p>
         </section>
 
         <section className="rounded-[14px] border border-line bg-card p-5">

@@ -433,6 +433,22 @@ export interface PortfolioLive {
   fetched_at: number;
 }
 
+/** Per-chain gas price + endpoint health (Dashboard Network board, ~60s poll). */
+export interface ChainNetworkStatus {
+  chain_id: number;
+  chain_name: string;
+  symbol: string;
+  gas_gwei: number | null;
+  endpoints_total: number;
+  endpoints_ok: number;
+  best_latency_ms: number | null;
+}
+
+export interface NetworkOverview {
+  chains: ChainNetworkStatus[];
+  fetched_at: number;
+}
+
 /** Per-stage eligibility cell for one wallet. */
 export interface StageMatrixCell {
   stage_name: string;

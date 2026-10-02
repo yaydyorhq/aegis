@@ -1,35 +1,90 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Command, Flame, BadgeCheck, GalleryVerticalEnd, Wallet, ChartNoAxesCombined, Network } from "lucide-react";
+import { Command, Flame, BadgeCheck, GalleryVerticalEnd, Wallet, ChartNoAxesCombined, Network, Play, Lock, RefreshCw } from "lucide-react";
+import { ipc } from "../../lib/ipc";
+import { pushToast } from "../../components/ui";
+import { useVaultStore } from "../../store/app";
+
+type IconType = typeof Wallet;
 
 interface Item {
-  to: string;
+  key: string;
   label: string;
   hint: string;
-  icon: typeof Wallet;
+  icon: IconType;
+  /** Navigation target — mutually exclusive with `action`. */
+  to?: string;
+  /** In-place action (queue, vault, rescans) — mutually exclusive with `to`. */
+  action?: () => void;
 }
-
-const ITEMS: Item[] = [
-  { to: "/minting", label: "Minting", hint: "Queue & broadcast mint tasks", icon: Flame },
-  { to: "/eligible", label: "Eligible Check", hint: "Batch eligibility for wallets", icon: BadgeCheck },
-  { to: "/nft-checker", label: "NFT Checker", hint: "Scan ERC-721 holdings", icon: GalleryVerticalEnd },
-  { to: "/wallets", label: "Wallets", hint: "Create / import / export", icon: Wallet },
-  { to: "/pnl", label: "PnL", hint: "Historical scan estimate", icon: ChartNoAxesCombined },
-  { to: "/chains", label: "Chains & RPC", hint: "Add or test endpoints", icon: Network },
-];
 
 export function QuickTaskPalette({ open, onClose }: { open: boolean; onClose: () => void }) {
   const nav = useNavigate();
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
 
+  // Actions alongside routes: the palette became the keyboard entry point for
+  // the app's most-repeated operations, not just a page switcher.
+  const items = useMemo<Item[]>(
+    () => [
+      { key: "nav-minting", label: "Minting", hint: "Queue & broadcast mint tasks", icon: Flame, to: "/minting" },
+      { key: "nav-eligible", label: "Eligible Check", hint: "Batch eligibility for wallets", icon: BadgeCheck, to: "/eligible" },
+      { key: "nav-nft", label: "NFT Checker", hint: "Scan ERC-721 holdings", icon: GalleryVerticalEnd, to: "/nft-checker" },
+      { key: "nav-wallets", label: "Wallets", hint: "Create / import / export", icon: Wallet, to: "/wallets" },
+      { key: "nav-pnl", label: "PnL", hint: "Historical scan estimate", icon: ChartNoAxesCombined, to: "/pnl" },
+      { key: "nav-chains", label: "Chains & RPC", hint: "Add or test endpoints", icon: Network, to: "/chains" },
+      {
+        key: "act-run-queue",
+        label: "Run mint queue",
+        hint: "action — process pending tasks now",
+        icon: Play,
+        action: () => {
+          pushToast("Running mint queue…", "info");
+          void ipc("mint_run").catch(() => pushToast("Queue run failed", "error"));
+        },
+      },
+      {
+        key: "act-rescan",
+        label: "Re-scan portfolio",
+        hint: "action — repeat last Collection PnL scan",
+        icon: RefreshCw,
+        action: () => {
+          pushToast("Portfolio re-scan started", "info");
+          void ipc("collection_pnl_rescan")
+            .then((r) =>
+              pushToast(
+                r ? "Portfolio re-scanned" : "Nothing to re-scan yet",
+                "ok",
+                r ? "result persisted to the dashboard" : "run a Collection PnL scan first",
+              ),
+            )
+            .catch(() => pushToast("Portfolio re-scan failed", "error"));
+        },
+      },
+      {
+        key: "act-lock",
+        label: "Lock vault",
+        hint: "action — private keys out of memory",
+        icon: Lock,
+        action: () => {
+          void useVaultStore
+            .getState()
+            .lock()
+            .then(() => pushToast("Vault locked", "warn", "unlock to sign again"))
+            .catch(() => pushToast("Could not lock vault", "error"));
+        },
+      },
+    ],
+    [],
+  );
+
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
-    if (!s) return ITEMS;
-    return ITEMS.filter(
+    if (!s) return items;
+    return items.filter(
       (i) => i.label.toLowerCase().includes(s) || i.hint.toLowerCase().includes(s),
     );
-  }, [q]);
+  }, [q, items]);
 
   useEffect(() => {
     if (open) {
@@ -51,7 +106,9 @@ export function QuickTaskPalette({ open, onClose }: { open: boolean; onClose: ()
         setIdx((i) => Math.max(i - 1, 0));
       }
       if (e.key === "Enter" && filtered[idx]) {
-        nav(filtered[idx].to);
+        const item = filtered[idx];
+        if (item.to) nav(item.to);
+        else item.action?.();
         onClose();
       }
     }
@@ -90,10 +147,11 @@ export function QuickTaskPalette({ open, onClose }: { open: boolean; onClose: ()
           ) : (
             filtered.map((item, i) => (
               <button
-                key={item.to}
+                key={item.key}
                 onMouseEnter={() => setIdx(i)}
                 onClick={() => {
-                  nav(item.to);
+                  if (item.to) nav(item.to);
+                  else item.action?.();
                   onClose();
                 }}
                 className={`flex w-full items-center gap-3 px-4 py-2.5 text-left ${
