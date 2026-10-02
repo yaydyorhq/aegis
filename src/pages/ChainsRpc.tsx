@@ -199,7 +199,7 @@ export function ChainsRpcPage() {
       {err ? <div className="mb-3 text-[12px] text-danger">{err}</div> : null}
 
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
-        <div className="grid grid-cols-[1.2fr_80px_1fr_70px_140px_50px] gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid grid-cols-[1.2fr_80px_1fr_70px_140px_50px] gap-2 border-b border-line px-4 py-2 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted">
           <div>Network</div>
           <div>Chain ID</div>
           <div>RPC</div>
@@ -234,7 +234,7 @@ export function ChainsRpcPage() {
                     </span>
                   )}
                 </div>
-                <div className="text-[12px] text-muted" title={t?.error ?? undefined}>
+                <div className="font-mono text-[11.5px] tabular-nums text-muted" title={t?.error ?? undefined}>
                   {testing === c.id
                     ? "Testing…"
                     : t?.latency_ms != null
@@ -270,8 +270,8 @@ export function ChainsRpcPage() {
         )}
       </div>
 
-      <div className="mt-3 text-[12px] text-muted">
-        {chains.filter((c) => c.enabled).length} enabled · {chains.length} total
+      <div className="mt-3 font-mono text-[9.5px] uppercase tracking-[0.1em] text-muted">
+        {chains.filter((c) => c.enabled).length} ENABLED · {chains.length} TOTAL
       </div>
     </div>
   );

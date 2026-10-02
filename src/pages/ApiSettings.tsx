@@ -103,7 +103,7 @@ export function ApiSettingsPage() {
       </form>
 
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
-        <div className="border-b border-line px-4 py-2.5 text-[12px] font-semibold">Configured providers</div>
+        <div className="border-b border-line px-4 py-2 font-mono text-[10.5px] font-semibold uppercase tracking-[0.1em] text-muted">Configured providers</div>
         {keys.length === 0 ? (
           <EmptyState title="No API keys" description="Add a provider key to unlock external data sources." />
         ) : (

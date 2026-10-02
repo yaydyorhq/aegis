@@ -633,12 +633,12 @@ export function EligibleCheckPage() {
 
       {/* ── History ────────────────────────────────────────────── */}
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
-        <div className="border-b border-line px-4 py-2.5 text-[12px] font-semibold">History</div>
+        <div className="border-b border-line px-4 py-2 font-mono text-[10.5px] font-semibold uppercase tracking-[0.1em] text-muted">History</div>
         {history.length === 0 ? (
           <EmptyState title="No checks yet" description="Run an eligibility check to populate history." />
         ) : (
           <>
-            <div className="grid grid-cols-[170px_1fr_1.2fr_70px_150px] gap-2 border-b border-line/60 px-4 py-2 text-[11px] uppercase tracking-wide text-muted">
+            <div className="grid grid-cols-[170px_1fr_1.2fr_70px_150px] gap-2 border-b border-line/60 px-4 py-2 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted">
               <div>Wallet</div>
               <div>Collection</div>
               <div>Detail</div>
@@ -672,7 +672,7 @@ export function EligibleCheckPage() {
                   <div className={h.result ? "text-ok" : "text-muted"}>
                     {h.result ? "Yes" : "No"}
                   </div>
-                  <div className="text-[12px] text-muted">{new Date(h.checked_at).toLocaleString()}</div>
+                  <div className="font-mono text-[10.5px] tabular-nums text-muted">{new Date(h.checked_at).toLocaleString()}</div>
                 </div>
               );
             })}

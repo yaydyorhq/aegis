@@ -526,28 +526,28 @@ function CollectionTab() {
                             : ""}
                         </div>
                       </td>
-                      <td className="px-2 py-2 text-right">{r.minted}</td>
-                      <td className="px-2 py-2 text-right">{r.bought}</td>
-                      <td className="px-2 py-2 text-right">{r.sold}</td>
-                      <td className="px-2 py-2 text-right">
+                      <td className="px-2 py-2 text-right font-mono tabular-nums">{r.minted}</td>
+                      <td className="px-2 py-2 text-right font-mono tabular-nums">{r.bought}</td>
+                      <td className="px-2 py-2 text-right font-mono tabular-nums">{r.sold}</td>
+                      <td className="px-2 py-2 text-right font-mono tabular-nums">
                         {r.balance_known
                           ? r.balance
                           : `~${r.holding}`}
                       </td>
-                      <td className="px-2 py-2 text-right" title={r.spent_eth}>
+                      <td className="px-2 py-2 text-right font-mono tabular-nums" title={r.spent_eth}>
                         {formatEth(r.spent_eth)}
                       </td>
-                      <td className="px-2 py-2 text-right text-muted" title={r.gas_eth}>
+                      <td className="px-2 py-2 text-right font-mono tabular-nums text-muted" title={r.gas_eth}>
                         {formatEth(r.gas_eth)}
                       </td>
                       <td
-                        className={`px-2 py-2 text-right ${flowClass(r.realized_eth)}`}
+                        className={`px-2 py-2 text-right font-mono tabular-nums ${flowClass(r.realized_eth)}`}
                         title={r.realized_eth}
                       >
                         {formatEth(r.realized_eth)}
                       </td>
                       <td
-                        className={`px-2 py-2 text-right ${
+                        className={`px-2 py-2 text-right font-mono tabular-nums ${
                           r.unrealized_eth == null
                             ? "text-muted"
                             : flowClass(r.unrealized_eth)
@@ -557,7 +557,7 @@ function CollectionTab() {
                         {r.unrealized_eth != null ? formatEth(r.unrealized_eth) : "n/a"}
                       </td>
                       <td
-                        className={`px-2 py-2 text-right font-semibold ${
+                        className={`px-2 py-2 text-right font-mono font-semibold tabular-nums ${
                           r.net_eth == null ? "text-muted" : flowClass(r.net_eth)
                         }`}
                         title={r.net_eth ?? undefined}
@@ -598,14 +598,14 @@ function CollectionTab() {
                     <td className="px-2 py-2 text-right text-[12px]">
                       {t?.balance ?? 0}
                     </td>
-                    <td className="px-2 py-2 text-right text-[12px]" title={t?.spent_eth}>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums text-[12px]" title={t?.spent_eth}>
                       {t ? formatEth(t.spent_eth) : "0"}
                     </td>
-                    <td className="px-2 py-2 text-right text-[12px] text-muted" title={t?.gas_eth}>
+                    <td className="px-2 py-2 text-right font-mono tabular-nums text-[12px] text-muted" title={t?.gas_eth}>
                       {t ? formatEth(t.gas_eth) : "0"}
                     </td>
                     <td
-                      className={`px-2 py-2 text-right text-[12px] ${
+                      className={`px-2 py-2 text-right font-mono tabular-nums text-[12px] ${
                         t ? flowClass(t.realized_eth) : ""
                       }`}
                       title={t?.realized_eth}
@@ -613,7 +613,7 @@ function CollectionTab() {
                       {t ? formatEth(t.realized_eth) : "0"}
                     </td>
                     <td
-                      className={`px-2 py-2 text-right text-[12px] ${
+                      className={`px-2 py-2 text-right font-mono tabular-nums text-[12px] ${
                         t?.unrealized_eth ? flowClass(t.unrealized_eth) : "text-muted"
                       }`}
                       title={t?.unrealized_eth ?? undefined}
@@ -621,7 +621,7 @@ function CollectionTab() {
                       {t?.unrealized_eth != null ? formatEth(t.unrealized_eth) : "n/a"}
                     </td>
                     <td
-                      className={`px-2 py-2 text-right text-[12px] ${
+                      className={`px-2 py-2 text-right font-mono tabular-nums text-[12px] ${
                         t?.net_eth ? flowClass(t.net_eth) : "text-muted"
                       }`}
                       title={t?.net_eth ?? undefined}

@@ -56,7 +56,7 @@ export function ActivityPage() {
       />
       {err ? <div className="mb-3 text-[12px] text-danger">{err}</div> : null}
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
-        <div className="grid grid-cols-[150px_1fr_140px_70px] border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid grid-cols-[150px_1fr_140px_70px] border-b border-line px-4 py-2 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted">
           <div>Kind</div>
           <div>Summary</div>
           <div>Time</div>
@@ -74,7 +74,7 @@ export function ActivityPage() {
               <div className="truncate" title={a.summary}>
                 {a.summary}
               </div>
-              <div className="text-[12px] text-muted">
+              <div className="font-mono text-[10.5px] tabular-nums text-muted">
                 {new Date(a.created_at).toLocaleString()}
               </div>
               <div className="flex items-center gap-1.5 text-[12px]">
@@ -85,7 +85,7 @@ export function ActivityPage() {
           ))
         )}
       </div>
-      <div className="mt-3 text-[12px] text-muted">{rows.length} records</div>
+      <div className="mt-3 font-mono text-[9.5px] uppercase tracking-[0.1em] text-muted">{rows.length} records</div>
     </div>
   );
 }

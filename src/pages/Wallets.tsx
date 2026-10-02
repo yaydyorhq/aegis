@@ -708,7 +708,7 @@ export function WalletsPage() {
 
       {/* ── Wallet table ── */}
       <div className="overflow-hidden rounded-[14px] border border-line bg-card">
-        <div className="grid grid-cols-[64px_1.1fr_1.2fr_130px_110px_130px_136px] items-center gap-2 border-b border-line px-4 py-2.5 text-[11px] uppercase tracking-wide text-muted">
+        <div className="grid grid-cols-[64px_1.1fr_1.2fr_130px_110px_130px_136px] items-center gap-2 border-b border-line px-4 py-2 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted">
           <div>ID</div>
           <div>Label</div>
           <div>Address</div>
@@ -892,8 +892,8 @@ export function WalletsPage() {
         )}
       </div>
 
-      <div className="mt-3 text-[12px] text-muted">
-        {wallets.length} stored locally
+      <div className="mt-3 font-mono text-[9.5px] uppercase tracking-[0.1em] text-muted">
+        {wallets.length} STORED LOCALLY
         {filterGroupId !== "all" || search.trim()
           ? ` · showing ${filteredWallets.length}`
           : ""}
