@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   Bell,
   Info,
@@ -30,7 +31,7 @@ const THEME_OPTIONS: { value: ThemePref; label: string; icon: typeof Monitor }[]
 ];
 
 const selectCls =
-  "rounded-lg border border-line bg-bg px-3 py-2 text-[12.5px] outline-none focus:border-accent";
+  "w-full rounded-lg border border-line bg-bg px-3 py-2 text-[12.5px] outline-none focus:border-accent sm:w-auto";
 
 // ── consistent section + setting-row primitives ─────────────────────
 
@@ -39,14 +40,21 @@ function Section({
   title,
   right,
   children,
+  className,
 }: {
   icon: typeof Bell;
   title: string;
   right?: ReactNode;
   children: ReactNode;
+  className?: string;
 }) {
   return (
-    <section className="overflow-hidden rounded-[14px] border border-line bg-card">
+    <section
+      className={cn(
+        "overflow-hidden rounded-[14px] border border-line bg-card",
+        className,
+      )}
+    >
       <div className="flex items-center justify-between gap-3 border-b border-line px-5 py-3">
         <div className="flex items-center gap-2 text-[13px] font-semibold text-fg">
           <Icon className="h-4 w-4 text-muted" />
@@ -59,7 +67,8 @@ function Section({
   );
 }
 
-/** Label + description on the left, control on the right — hairline between rows. */
+/** Label + description above the control on narrow windows, side-by-side on
+ *  wide ones — hairline between rows. */
 function Row({
   label,
   description,
@@ -70,14 +79,14 @@ function Row({
   children: ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-3 first:pt-1 last:pb-1 [&:not(:first-child)]:border-t [&:not(:first-child)]:border-line/60">
+    <div className="flex flex-col gap-2.5 py-3 first:pt-1 last:pb-1 sm:flex-row sm:items-center sm:justify-between sm:gap-4 [&:not(:first-child)]:border-t [&:not(:first-child)]:border-line/60">
       <div className="min-w-0">
         <div className="text-[12.5px] text-fg">{label}</div>
         {description ? (
           <div className="mt-0.5 text-[11.5px] leading-relaxed text-muted">{description}</div>
         ) : null}
       </div>
-      <div className="shrink-0">{children}</div>
+      <div className="w-full sm:w-auto sm:shrink-0">{children}</div>
     </div>
   );
 }
@@ -100,6 +109,14 @@ export function SettingsPage() {
   /** Append-only table retention in days (0 = keep everything). */
   const [retention, setRetention] = useState<string>("0");
   const [pruning, setPruning] = useState(false);
+  /** Real app version from the Tauri build — proves which binary you run. */
+  const [appVersion, setAppVersion] = useState("0.2.0");
+
+  useEffect(() => {
+    void getVersion()
+      .then((v) => setAppVersion(v))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -183,13 +200,13 @@ export function SettingsPage() {
         </div>
       ) : null}
 
-      <div className="grid max-w-3xl gap-4">
+      <div className="grid max-w-3xl items-start gap-4 lg:grid-cols-2">
         <Section icon={User} title="Profile">
-          <div className="flex gap-2 py-2 first:pt-1 last:pb-1">
+          <div className="flex flex-col gap-2 py-2 first:pt-1 last:pb-1 sm:flex-row">
             <input
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              className="flex-1 rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
+              className="min-w-0 flex-1 rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
               placeholder="Display name"
             />
             <button
@@ -280,9 +297,7 @@ export function SettingsPage() {
           </div>
         </Section>
 
-        <Section
-          icon={ShieldCheck}
-          title="Security"
+        <Section icon={ShieldCheck} title="Security" className="lg:col-span-2"
           right={
             <div className="flex items-center gap-2 text-[11.5px] text-muted">
               <StatusDot ok={!!status?.unlocked} />
@@ -327,7 +342,7 @@ export function SettingsPage() {
                 <Row label="Lock now" description="Wipe the encryption key from memory — unlock to sign again.">
                   <button
                     onClick={onLock}
-                    className="rounded-lg border border-line bg-bg px-3.5 py-2 text-[12.5px] text-danger hover:border-danger/50"
+                    className="w-full rounded-lg border border-line bg-bg px-3.5 py-2 text-[12.5px] text-danger hover:border-danger/50 sm:w-auto"
                   >
                     Lock vault
                   </button>
@@ -341,7 +356,7 @@ export function SettingsPage() {
           </div>
         </Section>
 
-        <Section icon={Trash2} title="Data retention">
+        <Section icon={Trash2} title="Data retention" className="lg:col-span-2">
           <div className="divide-y divide-line/60">
             <Row
               label="Keep history for"
@@ -373,9 +388,9 @@ export function SettingsPage() {
           </div>
         </Section>
 
-        <Section icon={Info} title="About">
+        <Section icon={Info} title="About" className="lg:col-span-2">
           <div className="space-y-1 py-2 text-[12px] leading-relaxed text-muted first:pt-1 last:pb-1">
-            <div>Aegis 0.1.0 · Tauri 2 + React + SQLite</div>
+            <div>Aegis {appVersion} · Tauri 2 + React + SQLite</div>
             <div>Local database: app data dir · aegis.db</div>
             <div>All RPC, mint, NFT, and eligibility calls run from this machine.</div>
           </div>
