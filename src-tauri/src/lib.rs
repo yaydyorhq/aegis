@@ -141,21 +141,23 @@ pub fn run() {
                         continue;
                     }
                     last_auto = tokio::time::Instant::now();
-                    match tauri::async_runtime::spawn(async {
+                    let joined = tauri::async_runtime::spawn(async {
                         commands::pnl::collection_pnl_rescan().await
                     })
-                    .await
-                    .expect("rescan task")
-                    {
-                        Ok(Some(_)) => {
+                    .await;
+                    match joined {
+                        Ok(Ok(Some(_))) => {
                             logging::info(
                                 "pnl",
                                 &format!("auto re-scan finished (interval {minutes}m)"),
                             );
                         }
-                        Ok(None) => {}
-                        Err(e) => {
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => {
                             logging::warn("pnl", &format!("auto re-scan failed: {e}"));
+                        }
+                        Err(e) => {
+                            logging::warn("pnl", &format!("auto re-scan task crashed: {e}"));
                         }
                     }
                 }

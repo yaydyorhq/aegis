@@ -940,7 +940,7 @@ const FUND_POLL_MAX_ATTEMPTS: i64 = 150;
 
 /// Hand a fund tx's reserved nonce back — called when the receipt poll proves
 /// the tx never entered any mempool. Mirrors mint's release_task_nonce.
-fn release_fund_tx_nonce(tx_id: i64) {
+pub(crate) fn release_fund_tx_nonce(tx_id: i64) {
     let row: Option<(i64, Option<i64>, i64)> = crate::db::with_conn(|conn| {
         Ok(conn
             .query_row(
@@ -967,26 +967,35 @@ fn release_fund_tx_nonce(tx_id: i64) {
 /// mined or sitting in a mempool. Drives both the fast phantom check (~10s)
 /// and the over-budget "keep watching" decision (double-send guard).
 async fn tx_known_anywhere(hash: &str, chain_id: i64, endpoints: &[String]) -> bool {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
     for url in endpoints {
-        if !matches!(
-            chain::eth_chain_id(url).await,
-            Ok(cid) if cid == chain_id
-        ) {
+        let cid = match tokio::time::timeout(PROBE_TIMEOUT, chain::eth_chain_id(url)).await {
+            Ok(Ok(cid)) => Some(cid),
+            _ => None,
+        };
+        let Some(cid) = cid else { continue };
+        if cid != chain_id {
             continue;
         }
-        if let Ok(Some(_)) = chain::get_receipt(url, hash).await {
+        let receipt =
+            match tokio::time::timeout(PROBE_TIMEOUT, chain::get_receipt(url, hash)).await {
+                Ok(Ok(r)) => r,
+                _ => None,
+            };
+        if receipt.is_some() {
             return true;
         }
-        if let Ok(v) = chain::rpc_call(
-            url,
-            "eth_getTransactionByHash",
-            serde_json::json!([hash]),
+        let known = match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            chain::rpc_call(url, "eth_getTransactionByHash", serde_json::json!([hash])),
         )
         .await
         {
-            if v.get("result").map(|r| !r.is_null()).unwrap_or(false) {
-                return true;
-            }
+            Ok(Ok(v)) => v.get("result").map(|r| !r.is_null()).unwrap_or(false),
+            _ => false,
+        };
+        if known {
+            return true;
         }
     }
     false
@@ -1021,11 +1030,43 @@ async fn poll_receipt(tx_id: i64, hash: &str, chain_id: i64) -> AppResult<()> {
     let mut consecutive_errs = 0u32;
     loop {
         if attempts >= FUND_POLL_MAX_ATTEMPTS {
-            // Over budget. Adjudicate before ANY failure: a tx still known to
-            // some node must NOT be marked failed — the natural next step
-            // ("run the job again") would send the amount twice. Reset the
-            // budget and keep watching; only a tx absent from every endpoint's
-            // mempool is provably dead.
+            // Over budget. Adjudicate before ANY failure. First a receipt
+            // sweep — a tx mined between cycles must be confirmed here, not
+            // mis-described as "still in mempool". Then the mempool probe: a
+            // tx still known to some node must NOT be marked failed — the
+            // natural next step ("run the job again") would send the amount
+            // twice. Only a tx absent from every endpoint is provably dead.
+            let mut verdict: Option<bool> = None;
+            for url in &endpoints {
+                if let Ok(Some(receipt)) = chain::get_receipt(url, hash).await {
+                    let status = receipt
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x1");
+                    verdict = Some(status == "0x1");
+                    break;
+                }
+            }
+            if let Some(mined) = verdict {
+                set_tx_status(
+                    tx_id,
+                    if mined { "confirmed" } else { "failed" },
+                    Some(hash),
+                    if mined {
+                        None
+                    } else {
+                        Some("reverted on-chain (found by the final budget sweep)")
+                    },
+                    None,
+                );
+                wallet_store::log_activity(
+                    "fund.settled",
+                    &format!("Fund tx #{tx_id} settled at poll budget — found by final sweep"),
+                    None,
+                    mined,
+                );
+                return Ok(());
+            }
             if tx_known_anywhere(hash, chain_id, &endpoints).await {
                 let _ = crate::db::with_conn(|conn| {
                     conn.execute(

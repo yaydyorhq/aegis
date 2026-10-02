@@ -974,4 +974,155 @@ mod e2e_integration {
         eprintln!("HEX raw mode: status={} err={:?}", result.status, result.error);
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // FUND DOUBLE-SEND GUARD E2E — tx_nonce release after phantom adjudication
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn e2e_fund_phantom_nonce_release() {
+        let _g = serial_guard();
+        fresh_state("fund_nonce");
+        ensure_unlocked();
+
+        let a = wallet_store::create_wallet("fund-nonce-a", None).unwrap();
+        let b = wallet_store::create_wallet("fund-nonce-b", None).unwrap();
+        let cid = base_chain_id();
+
+        let job = crate::fund::create_job(crate::fund::FundStartArgs {
+            mode: "disperse".into(),
+            amount_mode: "fixed".into(),
+            asset: "native".into(),
+            chain_id: cid,
+            amount_wei: "1".into(),
+            anchor_wallet_id: a.id,
+            peer_wallet_ids: vec![b.id],
+        })
+        .unwrap();
+        let tx = crate::fund::list_job_txs(job.id).unwrap().remove(0);
+
+        // Simulate the runner up to broadcast: nonce 7 reserved, hash stamped,
+        // nonce persisted on the row (the poll's release path reads it there).
+        crate::nonce::reset_for_tests(a.id, cid);
+        let nonce = crate::nonce::reserve(a.id, cid, 7, None);
+        assert_eq!(nonce, 7);
+        crate::db::with_conn(|conn| {
+            conn.execute(
+                "UPDATE fund_txs SET tx_nonce=?1, status='broadcasting' WHERE id=?2",
+                rusqlite::params![nonce as i64, tx.id],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Phantom adjudicated (tx unknown to every endpoint) → the poll hands
+        // the nonce back → a re-run of the job reserves 7 again, no gap.
+        crate::fund::release_fund_tx_nonce(tx.id);
+        assert_eq!(
+            crate::nonce::reserve(a.id, cid, 7, None),
+            7,
+            "released nonce must be reusable after phantom adjudication"
+        );
+        crate::nonce::reset_for_tests(a.id, cid);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // DB RETENTION E2E — prune old tables, never the money trails
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn e2e_db_prune_keeps_money_trails() {
+        let _g = serial_guard();
+        fresh_state("prune_trails");
+        let ancient = 1_000_000_000_000i64; // Sep 2001 — older than any retention
+
+        db::with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO activity(kind, summary, ok, created_at) VALUES ('t','ancient',1,?1)",
+                [ancient],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mint_tasks(chain_id, contract, quantity, status, created_at, updated_at)
+                 VALUES (1,'0x0000000000000000000000000000000000000001',1,'confirmed',?1,?1)",
+                [ancient],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let report = db::prune_old_data(365).unwrap();
+        assert!(report.activity >= 1, "old activity must be pruned");
+
+        db::with_conn(|conn| {
+            let acts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM activity WHERE created_at = ?1",
+                    [ancient],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(acts, 0, "ancient activity must be gone");
+            let tasks: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mint_tasks WHERE created_at = ?1",
+                    [ancient],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tasks, 1, "money trails (mint_tasks) must survive pruning");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // PORTFOLIO AUTO RE-SCAN + LIVE SNAPSHOT E2E (offline paths)
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn e2e_pnl_rescan_without_prior_scan_is_none() {
+        let _g = serial_guard();
+        fresh_state("rescan_empty");
+        db::with_conn(|conn| {
+            conn.execute("DELETE FROM collection_pnl_scans", []).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let r = rt
+            .block_on(crate::commands::pnl::collection_pnl_rescan())
+            .unwrap();
+        assert!(r.is_none(), "no prior scan → nothing to re-run");
+    }
+
+    #[test]
+    fn e2e_portfolio_live_empty_vault_shape() {
+        let _g = serial_guard();
+        fresh_state("plive_empty");
+
+        // No wallets → the multi-chain snapshot carries no network work and
+        // empty balance rows; the UI renders "No wallets yet".
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let r = rt
+            .block_on(crate::commands::stats::portfolio_live())
+            .unwrap();
+        assert!(!r.chains.is_empty(), "enabled chains are reported");
+        assert!(
+            r.chains
+                .iter()
+                .all(|c| c.balances.is_empty() && c.failed == 0),
+            "no wallets → no balances and no failures"
+        );
+        assert!(r.chains.iter().all(|c| c.total_eth == "0"));
+    }
+
 }

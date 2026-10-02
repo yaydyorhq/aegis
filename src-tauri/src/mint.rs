@@ -2510,19 +2510,31 @@ async fn poll_receipt(id: i64, hash: &str) -> AppResult<MintTaskRow> {
             let mut probe_answered = false;
             let mut probe_known = false;
             for url in &endpoints {
-                if !matches!(
-                    chain::eth_chain_id(url).await,
-                    Ok(cid) if cid == task.chain_id
-                ) {
-                    continue;
-                }
-                if let Ok(v) = chain::rpc_call(
-                    url,
-                    "eth_getTransactionByHash",
-                    serde_json::json!([hash]),
+                // Bounded probes: a dead endpoint must not stretch the "10s"
+                // check by its full timeout+retry chain.
+                let cid = match tokio::time::timeout(
+                    std::time::Duration::from_secs(6),
+                    chain::eth_chain_id(url),
                 )
                 .await
                 {
+                    Ok(Ok(cid)) => Some(cid),
+                    _ => None,
+                };
+                let Some(cid) = cid else { continue };
+                if cid != task.chain_id {
+                    continue;
+                }
+                let probe = tokio::time::timeout(
+                    std::time::Duration::from_secs(6),
+                    chain::rpc_call(
+                        url,
+                        "eth_getTransactionByHash",
+                        serde_json::json!([hash]),
+                    ),
+                )
+                .await;
+                if let Ok(Ok(v)) = probe {
                     probe_answered = true;
                     if v.get("result").map(|r| !r.is_null()).unwrap_or(false) {
                         probe_known = true;
