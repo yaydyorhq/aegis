@@ -353,6 +353,38 @@ export function ConfirmDialog({
   );
 }
 
+/** Small toggle switch matching the app's controls — replaces raw checkboxes. */
+export function Switch({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      onClick={() => onChange(!checked)}
+      className={cn(
+        "relative h-5 w-9 shrink-0 rounded-full border transition-colors",
+        checked ? "border-accent bg-accent" : "border-line bg-line",
+      )}
+    >
+      <span
+        className={cn(
+          "absolute top-1/2 h-[14px] w-[14px] -translate-y-1/2 rounded-full border border-line bg-card shadow-sm transition-[left]",
+          checked ? "left-[18px]" : "left-[2px]",
+        )}
+      />
+    </button>
+  );
+}
+
 export interface DropdownItem {
   key: string;
   label: string;
