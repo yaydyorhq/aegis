@@ -21,6 +21,18 @@ export function TopBar({ onQuickTask }: { onQuickTask: () => void }) {
   const page = titles[pathname] ?? "Dashboard";
   const win = getCurrentWindow();
 
+  /** toggleMaximize + a forced reflow: frameless maximize on Windows can
+   *  leave the webview layout at the pre-maximize geometry. */
+  async function onToggleMaximize() {
+    await win.toggleMaximize();
+    requestAnimationFrame(() => {
+      document.body.style.width = "100.01%";
+      requestAnimationFrame(() => {
+        document.body.style.width = "";
+      });
+    });
+  }
+
   return (
     <header
       className="flex h-[52px] shrink-0 items-center justify-between border-b border-line bg-panel/80 px-5"
@@ -49,7 +61,7 @@ export function TopBar({ onQuickTask }: { onQuickTask: () => void }) {
             aria-label="Minimize"
           />
           <button
-            onClick={() => void win.toggleMaximize()}
+            onClick={() => void onToggleMaximize()}
             className="h-3 w-3 rounded-full bg-[#f5bf4f] hover:brightness-110"
             title="Maximize"
             aria-label="Maximize"

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Outlet, useOutletContext } from "react-router-dom";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { VaultGate } from "../../features/vault/VaultGate";
@@ -80,8 +81,29 @@ export function AppShell({ profileName }: { profileName: string }) {
     };
   }, []);
 
+  // Frameless windows on Windows (WebView2) sometimes leave the layout stale
+  // after a maximize/restore/edge-resize — the webview bounds change but the
+  // CSS layout keeps the old geometry. Force a reflow pass on every resize.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let timer = 0;
+    const un = win.onResized(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        document.body.style.width = "100.01%";
+        requestAnimationFrame(() => {
+          document.body.style.width = "";
+        });
+      }, 120);
+    });
+    return () => {
+      void un.then((f) => f());
+      window.clearTimeout(timer);
+    };
+  }, []);
+
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-bg">
+    <div className="flex h-full w-full overflow-hidden bg-bg">
       <VaultGate />
       <Sidebar profileName={profileName} />
       <div className="flex min-w-0 flex-1 flex-col">
