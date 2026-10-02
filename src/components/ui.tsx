@@ -132,7 +132,11 @@ export function PageHeader({
   return (
     <div className="mb-6 flex items-start justify-between gap-4">
       <div>
-        {suite ? <div className="mb-1 text-[12px] text-muted">{suite}</div> : null}
+        {suite ? (
+          <div className="mb-1 font-mono text-[10.5px] uppercase tracking-[0.1em] text-muted">
+            {suite}
+          </div>
+        ) : null}
         <h1 className="text-[26px] font-semibold tracking-tight text-fg">{title}</h1>
         {subtitle ? <p className="mt-1 text-[13px] text-muted">{subtitle}</p> : null}
       </div>

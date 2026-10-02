@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { Zap } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -20,6 +21,17 @@ export function TopBar({ onQuickTask }: { onQuickTask: () => void }) {
   const { pathname } = useLocation();
   const page = titles[pathname] ?? "Dashboard";
   const win = getCurrentWindow();
+  const [clock, setClock] = useState(() =>
+    new Date().toLocaleTimeString("en-GB", { hour12: false }),
+  );
+
+  useEffect(() => {
+    const t = setInterval(
+      () => setClock(new Date().toLocaleTimeString("en-GB", { hour12: false })),
+      1000,
+    );
+    return () => clearInterval(t);
+  }, []);
 
   /** toggleMaximize + a forced reflow: frameless maximize on Windows can
    *  leave the webview layout at the pre-maximize geometry. */
@@ -38,12 +50,13 @@ export function TopBar({ onQuickTask }: { onQuickTask: () => void }) {
       className="flex h-[52px] shrink-0 items-center justify-between border-b border-line bg-panel/80 px-5"
       data-tauri-drag-region
     >
-      <div className="flex items-center gap-2 text-[13px]">
-        <span className="text-muted">Aegis</span>
-        <span className="text-muted/50">/</span>
+      <div className="flex items-center gap-2 font-mono text-[10.5px] uppercase tracking-[0.1em]">
+        <span className="text-muted/70">Aegis</span>
+        <span className="text-muted/40">/</span>
         <span className="font-medium text-fg">{page}</span>
       </div>
       <div className="flex items-center gap-3 pr-1">
+        <span className="font-mono text-[11px] tabular-nums text-muted">{clock}</span>
         <button
           onClick={onQuickTask}
           className="flex items-center gap-1.5 rounded-lg border border-line bg-card px-2.5 py-1.5 text-[12px] text-muted transition-colors hover:border-muted/40 hover:text-fg"
