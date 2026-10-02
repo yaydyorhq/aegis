@@ -102,6 +102,8 @@ export function MintingPage() {
   const [abiErr, setAbiErr] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  /** Which source the task targets — drives the Create Task tab bar. */
+  const [tab, setTab] = useState<"custom" | "seadrop" | "opensea">("custom");
   const [seaDrop, setSeaDrop] = useState<SeaDropPlan | null>(null);
   const [fetchingDrop, setFetchingDrop] = useState(false);
   const [dropErr, setDropErr] = useState<string | null>(null);
@@ -1005,10 +1007,62 @@ export function MintingPage() {
               </div>
             ) : null}
             <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          {/* Row: Contract Target + Chain — first, everything below depends on it */}
-          <div className="mb-3 grid grid-cols-2 gap-2">
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Contract Target</label>
+          {/* Source tabs — one flow per tab, one primary action at the bottom */}
+          <div className="mb-4 inline-flex rounded-lg border border-line bg-bg p-0.5">
+            {(
+              [
+                ["custom", "Custom"],
+                ["seadrop", "SeaDrop public"],
+                ["opensea", "OpenSea stage"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setTab(value)}
+                className={cn(
+                  "rounded-md px-3 py-1.5 text-[12.5px] transition-colors",
+                  tab === value
+                    ? "bg-line font-medium text-fg"
+                    : "text-muted hover:text-fg",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Shared: chain — every source needs it */}
+          <div className="mb-3">
+            <label className="mb-1 block font-mono text-[10px] uppercase tracking-[0.1em] text-muted">
+              Chain
+            </label>
+            <select
+              value={form.chainId}
+              onChange={(e) => {
+                const cid = e.target.value;
+                const c = enabledChains.find((x) => String(x.chain_id) === cid);
+                setForm({ ...form, chainId: cid });
+                setCustomRpcUrls([]);
+                setAbiInfo(null);
+                if (c?.rpc_url) setSelectedRpcUrls([c.rpc_url]);
+              }}
+              className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
+            >
+              <option value="">Select chain…</option>
+              {enabledChains.map((c) => (
+                <option key={c.id} value={c.chain_id}>
+                  {c.name} ({c.chain_id})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {tab === "custom" ? (
+            <div className="mb-3">
+              <label className="mb-1 block font-mono text-[10px] uppercase tracking-[0.1em] text-muted">
+                Contract target
+              </label>
               <input
                 placeholder="0x…"
                 value={form.contract}
@@ -1030,52 +1084,29 @@ export function MintingPage() {
                 ) : null}
               </div>
             </div>
-            <div>
-              <label className="mb-1 block text-[11px] text-muted">Chain</label>
-              <select
-                value={form.chainId}
-                onChange={(e) => {
-                  const cid = e.target.value;
-                  const c = enabledChains.find((x) => String(x.chain_id) === cid);
-                  setForm({ ...form, chainId: cid });
-                  setCustomRpcUrls([]);
-                  setAbiInfo(null);
-                  if (c?.rpc_url) setSelectedRpcUrls([c.rpc_url]);
-                }}
-                className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
-              >
-                <option value="">Select chain…</option>
-                {enabledChains.map((c) => (
-                  <option key={c.id} value={c.chain_id}>
-                    {c.name} ({c.chain_id})
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
+          ) : null}
 
-          {/* SeaDrop public mint: fetch plan from NFT collection address */}
-          <div className="mb-3 rounded-lg border border-line bg-bg p-3">
-            <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
-              <div className="min-w-0 flex-1">
-                <label className="mb-1 flex items-center gap-2 text-[11px] text-muted">
-                  NFT Collection
-                  {(seaDrop || openSeaPlan) ? (
-                    <button
-                      type="button"
-                      onClick={() => { setSeaDrop(null); setOpenSeaPlan(null); setDropErr(null); setOpenSeaErr(null); }}
-                      className="rounded border border-line px-1.5 py-0.5 text-[10px] hover:bg-line"
-                    >clear plan</button>
-                  ) : null}
-                </label>
-                <input
-                  placeholder="0x… collection address"
-                  value={form.nftContract}
-                  onChange={(e) => setForm({ ...form, nftContract: e.target.value })}
-                  className="w-full rounded-lg border border-line bg-card px-3 py-2 font-mono text-[13px] outline-none focus:border-accent"
-                />
-              </div>
-              <div className="flex gap-2">
+          {tab === "seadrop" ? (
+            <div className="mb-3 rounded-lg border border-line bg-bg p-3">
+              <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <label className="mb-1 flex items-center gap-2 text-[11px] text-muted">
+                    NFT Collection (SeaDrop public drop)
+                    {seaDrop ? (
+                      <button
+                        type="button"
+                        onClick={() => { setSeaDrop(null); setDropErr(null); }}
+                        className="rounded border border-line px-1.5 py-0.5 text-[10px] hover:bg-line"
+                      >clear plan</button>
+                    ) : null}
+                  </label>
+                  <input
+                    placeholder="0x… collection address"
+                    value={form.nftContract}
+                    onChange={(e) => setForm({ ...form, nftContract: e.target.value })}
+                    className="w-full rounded-lg border border-line bg-card px-3 py-2 font-mono text-[13px] outline-none focus:border-accent"
+                  />
+                </div>
                 <button
                   type="button"
                   onClick={() => void onFetchDrop()}
@@ -1087,8 +1118,90 @@ export function MintingPage() {
                   ) : (
                     <Link2 className="h-4 w-4" />
                   )}
-                  SeaDrop
+                  Fetch plan
                 </button>
+              </div>
+              {dropErr ? <div className="text-[12px] text-danger">{dropErr}</div> : null}
+              {seaDrop ? (
+                <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted">
+                  <span>
+                    to=<span className="text-fg">{shortAddress(seaDrop.to, 6)}</span>
+                  </span>
+                  <span>
+                    price=<span className="text-fg">{seaDrop.drop.mint_price_wei}</span> wei
+                  </span>
+                  <span>
+                    max/wallet=<span className="text-fg">{seaDrop.drop.max_per_wallet}</span>
+                  </span>
+                  <span>
+                    window=
+                    <span className="text-fg">
+                      {fmtTsLocal(seaDrop.drop.start_time)} → {fmtTsLocal(seaDrop.drop.end_time)}
+                    </span>
+                  </span>
+                  {seaDrop.remaining != null ? (
+                    <span>
+                      left=<span className="text-fg">{seaDrop.remaining}</span>
+                      <span className="opacity-60">
+                        {" "}
+                        ({seaDrop.total_supply}/{seaDrop.max_supply} minted)
+                      </span>
+                    </span>
+                  ) : null}
+                  <span>
+                    fee=
+                    <span className="text-fg">{shortAddress(seaDrop.fee_recipient, 4)}</span>
+                    <span className="opacity-60"> ({seaDrop.fee_source})</span>
+                  </span>
+                  <span className={seaDrop.live ? "text-ok" : "text-warn"}>
+                    {seaDrop.live ? "live" : "not live"}
+                  </span>
+                  <span className="flex items-center gap-1 text-muted">
+                    lead(ms)
+                    <input
+                      value={bcLead}
+                      onChange={(e) => setBcLead(e.target.value)}
+                      className="w-16 rounded border border-line bg-bg px-1 py-0.5 text-[11px] text-fg outline-none focus:border-accent"
+                    />
+                    <button
+                      type="button"
+                      onClick={applyDropSchedule}
+                      className="rounded border border-line bg-bg px-2 py-0.5 text-[11px] text-fg hover:border-accent"
+                      title="Set the schedule field to phase start minus the lead"
+                    >
+                      schedule = start − lead
+                    </button>
+                  </span>
+                </div>
+              ) : (
+                <p className="mt-1 text-[11px] text-muted">
+                  Fetch the public drop to bake price + calldata, then Enqueue below.
+                </p>
+              )}
+            </div>
+          ) : null}
+
+          {tab === "opensea" ? (
+            <div className="mb-3 rounded-lg border border-line bg-bg p-3">
+              <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <label className="mb-1 flex items-center gap-2 text-[11px] text-muted">
+                    NFT Collection (OpenSea drop)
+                    {openSeaPlan ? (
+                      <button
+                        type="button"
+                        onClick={() => { setOpenSeaPlan(null); setOpenSeaErr(null); }}
+                        className="rounded border border-line px-1.5 py-0.5 text-[10px] hover:bg-line"
+                      >clear plan</button>
+                    ) : null}
+                  </label>
+                  <input
+                    placeholder="0x… collection address"
+                    value={form.nftContract}
+                    onChange={(e) => setForm({ ...form, nftContract: e.target.value })}
+                    className="w-full rounded-lg border border-line bg-card px-3 py-2 font-mono text-[13px] outline-none focus:border-accent"
+                  />
+                </div>
                 <button
                   type="button"
                   onClick={() => void onFetchOpenSeaStage()}
@@ -1098,6 +1211,11 @@ export function MintingPage() {
                     !form.chainId ||
                     selectedWalletIds.length === 0
                   }
+                  title={
+                    selectedWalletIds.length === 0
+                      ? "Select at least one wallet — the stage check signs an SIWE session"
+                      : undefined
+                  }
                   className="flex h-[38px] items-center gap-1.5 rounded-lg border border-accent/60 bg-accent/15 px-3 text-[13px] font-medium text-fg hover:bg-accent/25 disabled:opacity-40"
                 >
                   {fetchingOpenSea ? (
@@ -1105,107 +1223,43 @@ export function MintingPage() {
                   ) : (
                     <Zap className="h-4 w-4" />
                   )}
-                  OpenSea stage
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void onEnqueueOpenSeaStage()}
-                  disabled={
-                    fetchingOpenSea ||
-                    enqueueingOpenSea ||
-                    !form.chainId ||
-                    selectedWalletIds.length === 0
-                  }
-                  className="flex h-[38px] items-center gap-1.5 rounded-lg bg-accent px-3 text-[13px] font-semibold text-white disabled:opacity-40"
-                >
-                  {enqueueingOpenSea ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Zap className="h-4 w-4" />
-                  )}
-                  Enqueue stage
+                  Fetch stage plan
                 </button>
               </div>
-            </div>
-            {dropErr ? <div className="text-[12px] text-danger">{dropErr}</div> : null}
-            {openSeaErr ? (
-              <div className="text-[12px] text-danger">{openSeaErr}</div>
-            ) : null}
-            {openSeaPlan ? (
-              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted">
-                <span>
-                  stage=<span className="text-fg">{openSeaPlan.stage_type}</span>
-                  <span className="opacity-60">#{openSeaPlan.stage_index}</span>
-                </span>
-                <span>
-                  slug=<span className="text-fg">{openSeaPlan.slug}</span>
-                </span>
-                <span>
-                  to=<span className="text-fg">{shortAddress(openSeaPlan.to, 6)}</span>
-                </span>
-                <span>
-                  value=<span className="text-fg">{openSeaPlan.value_eth}</span> ETH
-                </span>
-                <span>
-                  qty=<span className="text-fg">{openSeaPlan.quantity}</span>
-                </span>
-                <span className="text-ok">MintAction validated</span>
-              </div>
-            ) : null}
-            {seaDrop ? (
-              <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted">
-                <span>
-                  to=<span className="text-fg">{shortAddress(seaDrop.to, 6)}</span>
-                </span>
-                <span>
-                  price=<span className="text-fg">{seaDrop.drop.mint_price_wei}</span> wei
-                </span>
-                <span>
-                  max/wallet=<span className="text-fg">{seaDrop.drop.max_per_wallet}</span>
-                </span>
-                <span>
-                  window=
-                  <span className="text-fg">
-                    {fmtTsLocal(seaDrop.drop.start_time)} → {fmtTsLocal(seaDrop.drop.end_time)}
-                  </span>
-                </span>
-                {seaDrop.remaining != null ? (
+              {openSeaErr ? (
+                <div className="text-[12px] text-danger">{openSeaErr}</div>
+              ) : null}
+              {openSeaPlan ? (
+                <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-muted">
                   <span>
-                    left=<span className="text-fg">{seaDrop.remaining}</span>
-                    <span className="opacity-60">
-                      {" "}
-                      ({seaDrop.total_supply}/{seaDrop.max_supply} minted)
-                    </span>
+                    stage=<span className="text-fg">{openSeaPlan.stage_type}</span>
+                    <span className="opacity-60">#{openSeaPlan.stage_index}</span>
                   </span>
-                ) : null}
-                <span>
-                  fee=
-                  <span className="text-fg">{shortAddress(seaDrop.fee_recipient, 4)}</span>
-                  <span className="opacity-60"> ({seaDrop.fee_source})</span>
-                </span>
-                <span className={seaDrop.live ? "text-ok" : "text-warn"}>
-                  {seaDrop.live ? "live" : "not live"}
-                </span>
-                <span className="flex items-center gap-1 text-muted">
-                  lead(ms)
-                  <input
-                    value={bcLead}
-                    onChange={(e) => setBcLead(e.target.value)}
-                    className="w-16 rounded border border-line bg-bg px-1 py-0.5 text-[11px] text-fg outline-none focus:border-accent"
-                  />
-                  <button
-                    type="button"
-                    onClick={applyDropSchedule}
-                    className="rounded border border-line bg-bg px-2 py-0.5 text-[11px] text-fg hover:border-accent"
-                    title="Set the schedule field to phase start minus the lead"
-                  >
-                    schedule = start − lead
-                  </button>
-                </span>
-              </div>
-            ) : null}
-          </div>
+                  <span>
+                    slug=<span className="text-fg">{openSeaPlan.slug}</span>
+                  </span>
+                  <span>
+                    to=<span className="text-fg">{shortAddress(openSeaPlan.to, 6)}</span>
+                  </span>
+                  <span>
+                    value=<span className="text-fg">{openSeaPlan.value_eth}</span> ETH
+                  </span>
+                  <span>
+                    qty=<span className="text-fg">{openSeaPlan.quantity}</span>
+                  </span>
+                  <span className="text-ok">MintAction validated</span>
+                </div>
+              ) : (
+                <p className="mt-1 text-[11px] text-muted">
+                  Optional — without a fetched plan, a scheduled task defers the
+                  stage lookup to fire time (wallets + schedule below still apply).
+                </p>
+              )}
+            </div>
+          ) : null}
 
+          {tab === "custom" ? (
+          <>
           {/* Function + HEX checkbox */}
           <div className="mb-3 grid grid-cols-[1fr_auto] gap-2">
             <div>
@@ -1402,6 +1456,8 @@ export function MintingPage() {
               </div>
             ) : null}
           </div>
+          </>
+          ) : null}
 
           {/* Wallets — grouped dropdown ("N of M wallets") */}
           <div className="mb-3 rounded-lg border border-line bg-bg p-3">
@@ -1603,26 +1659,53 @@ export function MintingPage() {
               >
                 Cancel
               </button>
-              <button
-                type="submit"
-                disabled={!canSubmit}
-                title={
-                  !form.chainId
-                    ? "Select a chain first"
-                    : !form.contract.trim()
-                      ? "Contract target required (or fetch a SeaDrop/OpenSea plan)"
-                      : !/^0x[0-9a-fA-F]{40}$/.test(form.contract.trim())
-                        ? "Contract must be 0x + 40 hex"
-                        : selectedWalletIds.length === 0
-                          ? "Select at least one wallet"
-                          : "Enqueue mint task(s)"
-                }
-                className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
-              >
-                {enqueueing
-                  ? "Queueing…"
-                  : `Enqueue (${form.allowlist.trim() ? matchedAllowlist : selectedWalletIds.length})`}
-              </button>
+              {tab === "opensea" ? (
+                <button
+                  type="button"
+                  onClick={() => void onEnqueueOpenSeaStage()}
+                  disabled={
+                    enqueueingOpenSea ||
+                    fetchingOpenSea ||
+                    !form.chainId ||
+                    selectedWalletIds.length === 0
+                  }
+                  title={
+                    !form.chainId
+                      ? "Select a chain first"
+                      : selectedWalletIds.length === 0
+                        ? "Select at least one wallet"
+                        : openSeaPlan
+                          ? "Enqueue the validated stage plan"
+                          : "No plan fetched — a scheduled task defers the lookup to fire time"
+                  }
+                  className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
+                >
+                  {enqueueingOpenSea ? "Queueing…" : "Enqueue stage"}
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!canSubmit}
+                  title={
+                    !form.chainId
+                      ? "Select a chain first"
+                      : tab === "seadrop" && !seaDrop
+                        ? "Fetch the SeaDrop plan first"
+                        : !form.contract.trim()
+                          ? "Contract target required"
+                          : !/^0x[0-9a-fA-F]{40}$/.test(form.contract.trim())
+                            ? "Contract must be 0x + 40 hex"
+                            : selectedWalletIds.length === 0
+                              ? "Select at least one wallet"
+                              : "Enqueue mint task(s)"
+                  }
+                  className="rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
+                >
+                  {enqueueing
+                    ? "Queueing…"
+                    : `Enqueue (${form.allowlist.trim() ? matchedAllowlist : selectedWalletIds.length})`}
+                </button>
+              )}
             </div>
           </div>
             </div>
