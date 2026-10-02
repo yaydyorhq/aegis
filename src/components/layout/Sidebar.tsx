@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { StatusDot } from "../ui";
+import { LogoMark } from "../LogoMark";
 import { useVaultStore } from "../../store/app";
 
 const groups = [
@@ -71,9 +72,7 @@ export function Sidebar({ profileName }: { profileName: string }) {
         className="flex h-[52px] items-center gap-2.5 border-b border-line px-4"
         data-tauri-drag-region
       >
-        <div className="flex h-7 w-7 items-center justify-center rounded-md bg-fg text-[13px] font-black text-bg">
-          ∥
-        </div>
+        <LogoMark className="h-7 w-7" />
         <span className="font-mono text-[13px] font-semibold uppercase tracking-[0.18em]">
           Aegis
         </span>

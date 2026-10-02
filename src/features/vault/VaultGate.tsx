@@ -4,6 +4,7 @@ import { Lock, RefreshCw, ShieldCheck } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVaultStore } from "../../store/app";
 import { cn } from "../../lib/utils";
+import { LogoMark } from "../../components/LogoMark";
 
 function WindowDots() {
   const win = getCurrentWindow();
@@ -34,9 +35,7 @@ function WindowDots() {
 function Brand() {
   return (
     <div className="flex items-center gap-2.5" data-tauri-drag-region>
-      <div className="flex h-7 w-7 items-center justify-center rounded-md bg-fg text-[13px] font-black text-bg">
-        ∥
-      </div>
+      <LogoMark className="h-7 w-7" />
       <span className="font-mono text-[13px] font-semibold uppercase tracking-[0.18em]">
         Aegis
       </span>
