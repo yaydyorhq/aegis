@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChartNoAxesCombined, Clock, Flame, FolderOpen, KeyRound, Network, ShieldCheck, TrendingDown, TrendingUp, Wallet, Zap } from "lucide-react";
+import { ChartNoAxesCombined, Clock, Flame, FolderOpen, KeyRound, Network, RefreshCw, ShieldCheck, TrendingDown, TrendingUp, Wallet, Zap } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { ActivityRow, CollectionPnlPoint, ModuleStatusItem, NetworkOverview, PortfolioLive, StatsOverview } from "../lib/types";
 import { StatusDot } from "../components/ui";
@@ -185,30 +185,31 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
     };
   }, [liveOn, fetchLive]);
 
-  // Network poll (gas + endpoint health) — slower still, it probes every
-  // endpoint of every enabled chain.
+  // Network poll (gas + endpoint health) — 10s so fee decisions see spikes;
+  // each tick is one eth_gasPrice per chain, trivially cheap.
+  const [networkBusy, setNetworkBusy] = useState(false);
+  const refreshNetwork = useCallback(() => {
+    if (document.hidden) return;
+    setNetworkBusy(true);
+    void ipc<NetworkOverview>("network_overview")
+      .then((n) => setNetwork(n))
+      .catch(() => {
+        /* keep the last snapshot */
+      })
+      .finally(() => setNetworkBusy(false));
+  }, []);
   useEffect(() => {
-    let stopped = false;
-    const tick = () => {
-      if (stopped || document.hidden) return;
-      void ipc<NetworkOverview>("network_overview")
-        .then((n) => setNetwork(n))
-        .catch(() => {
-          /* keep the last snapshot */
-        });
-    };
-    void tick();
-    const t = setInterval(tick, 60_000);
+    void refreshNetwork();
+    const t = setInterval(refreshNetwork, 10_000);
     const onVisible = () => {
-      if (!document.hidden) tick();
+      if (!document.hidden) refreshNetwork();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
-      stopped = true;
       clearInterval(t);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [refreshNetwork]);
 
   const load = useCallback(async () => {
     try {
@@ -631,11 +632,20 @@ export function DashboardPage({ onQuickTask }: { onQuickTask?: () => void }) {
         <Board
           label="Network · gas & endpoints"
           right={
-            <BoardLabel>
-              {network
-                ? `UPDATED ${agoLabel(network.fetched_at).toUpperCase()}`
-                : "PROBING…"}
-            </BoardLabel>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={refreshNetwork}
+                title="Refresh gas & endpoints"
+                className="rounded p-0.5 text-muted hover:text-fg"
+              >
+                <RefreshCw className={cn("h-3 w-3", networkBusy && "animate-spin")} />
+              </button>
+              <BoardLabel>
+                {network
+                  ? `UPDATED ${agoLabel(network.fetched_at).toUpperCase()}`
+                  : "PROBING…"}
+              </BoardLabel>
+            </div>
           }
           className="mb-6"
         >
