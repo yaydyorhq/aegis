@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
-import { Lock, ShieldCheck, Info, Monitor, Moon, Sun } from "lucide-react";
+import { Bell, Lock, RefreshCw, ShieldCheck, Info, Monitor, Moon, Sun } from "lucide-react";
 import { PageHeader, StatusDot } from "../components/ui";
+import { ipc } from "../lib/ipc";
 import { cn } from "../lib/utils";
+import {
+  notifyOsEnabled,
+  notifySoundEnabled,
+  setNotifyOsEnabled,
+  setNotifySoundEnabled,
+} from "../lib/notify";
 import { useAppStore, useVaultStore, type ThemePref } from "../store/app";
 
 const THEME_OPTIONS: { value: ThemePref; label: string; icon: typeof Monitor }[] = [
@@ -19,6 +26,10 @@ export function SettingsPage() {
   const [draft, setDraft] = useState(profileName);
   const [saved, setSaved] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [notifyOs, setNotifyOs] = useState(notifyOsEnabled);
+  const [notifySound, setNotifySound] = useState(notifySoundEnabled);
+  /** Auto re-scan interval for the Collection PnL, minutes (0 = off). */
+  const [autoscan, setAutoscan] = useState<string>("0");
 
   useEffect(() => {
     void refresh();
@@ -27,6 +38,26 @@ export function SettingsPage() {
   useEffect(() => {
     setDraft(profileName);
   }, [profileName]);
+
+  // Auto re-scan preference lives in the backend meta table (the scheduler
+  // re-reads it every tick), hydrated once on mount.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const v = await ipc<string | null>("meta_get", { key: "pnl_autoscan" });
+        if (v !== null && v !== undefined) setAutoscan(v);
+      } catch {
+        /* default off */
+      }
+    })();
+  }, []);
+
+  function setAutoscanMinutes(m: string) {
+    setAutoscan(m);
+    void ipc("meta_set", { key: "pnl_autoscan", value: m }).catch(() => {
+      setErr("Could not persist auto re-scan setting");
+    });
+  }
 
   function saveProfile() {
     const n = draft.trim() || profileName;
@@ -69,6 +100,72 @@ export function SettingsPage() {
           </div>
           <p className="mt-2 text-[12px] text-muted">
             System follows your OS appearance. Saved on this device.
+          </p>
+        </section>
+
+        <section className="rounded-[14px] border border-line bg-card p-5">
+          <div className="mb-3 flex items-center gap-2 text-[13px] font-semibold">
+            <Bell className="h-4 w-4" /> Notifications
+          </div>
+          <div className="space-y-2.5">
+            <label className="flex cursor-pointer items-center justify-between gap-3">
+              <span className="text-[12.5px] text-fg">
+                OS notification on mint result
+                <span className="block text-[11px] text-muted">
+                  Fires only while the window is hidden — the toast covers the visible case.
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={notifyOs}
+                onChange={(e) => {
+                  setNotifyOs(e.target.checked);
+                  setNotifyOsEnabled(e.target.checked);
+                }}
+                className="h-4 w-4 shrink-0 accent-[var(--accent,#4f7cff)]"
+              />
+            </label>
+            <label className="flex cursor-pointer items-center justify-between gap-3">
+              <span className="text-[12.5px] text-fg">
+                Chime on mint result
+                <span className="block text-[11px] text-muted">
+                  Rising tone on confirmed, falling on failed.
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={notifySound}
+                onChange={(e) => {
+                  setNotifySound(e.target.checked);
+                  setNotifySoundEnabled(e.target.checked);
+                }}
+                className="h-4 w-4 shrink-0 accent-[var(--accent,#4f7cff)]"
+              />
+            </label>
+          </div>
+        </section>
+
+        <section className="rounded-[14px] border border-line bg-card p-5">
+          <div className="mb-3 flex items-center gap-2 text-[13px] font-semibold">
+            <RefreshCw className="h-4 w-4" /> Portfolio auto re-scan
+          </div>
+          <div className="flex items-center gap-3">
+            <select
+              value={autoscan}
+              onChange={(e) => setAutoscanMinutes(e.target.value)}
+              className="rounded-lg border border-line bg-bg px-3 py-2 text-[13px] outline-none focus:border-accent"
+            >
+              <option value="0">Off — manual scans only</option>
+              <option value="5">Every 5 minutes</option>
+              <option value="15">Every 15 minutes</option>
+              <option value="60">Every 60 minutes</option>
+            </select>
+          </div>
+          <p className="mt-2 text-[12px] text-muted">
+            Re-runs your last Collection PnL scan (same contract, wallets,
+            window, and fee) on an interval so the Dashboard sparkline and net
+            PnL fill themselves. Scans are RPC-heavy — 5 minutes suits launch
+            days, 60 minutes is plenty for holding.
           </p>
         </section>
 

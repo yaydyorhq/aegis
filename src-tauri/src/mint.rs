@@ -1693,6 +1693,21 @@ async fn prep_inner(id: i64) -> AppResult<()> {
         return Ok(());
     };
 
+    // Pre-flight: simulate the exact fire-time tx ~10s before launch so a
+    // guaranteed revert (wrong price, sold out, bad calldata) surfaces BEFORE
+    // gas is burnt. Timing reverts (NotActive) are EXPECTED for tasks
+    // scheduled ahead of the stage opening — recorded quietly, never warned.
+    // Deferred OpenSea tasks resolve calldata at fire time: nothing to
+    // simulate yet. Report-only — the launch itself is never delayed, since
+    // firing slightly early costs one tx but firing late loses the race.
+    if task.mode == "execute" && task.opensea_ref.is_none() {
+        if let Some(wid) = task.wallet_id {
+            if let Ok(w) = wallet_store::get_wallet(wid) {
+                preflight_check(id, &task, &url, &w.address).await;
+            }
+        }
+    }
+
     // Prime nonce + gas caches on that endpoint. The values are discarded —
     // they must be re-read at fire time — this only warms connection and node
     // state (OSNM-Z's nonce refresh at T-10..T-2).
@@ -1746,6 +1761,85 @@ async fn prep_inner(id: i64) -> AppResult<()> {
 
 fn collection_cache_key(collection: &str, chain_id: i64) -> String {
     format!("{}|{}", collection.trim().to_lowercase(), chain_id)
+}
+
+/// Fire-time simulation for a scheduled execute task. Report-only: a timing
+/// revert is expected before the stage opens; anything else is a real problem
+/// worth surfacing before gas is burnt.
+async fn preflight_check(task_id: i64, task: &MintTaskRow, url: &str, wallet_address: &str) {
+    let Ok(calldata) = resolve_calldata(task, wallet_address) else {
+        return;
+    };
+    let value_wei = task.value_wei.clone().unwrap_or_else(|| "0x0".into());
+    let Ok(value_u) = parse_u128_hex_or_dec(&value_wei) else {
+        return;
+    };
+    let tx = serde_json::json!({
+        "from": wallet_address,
+        "to": task.contract,
+        "data": calldata,
+        "value": format!("0x{:x}", value_u),
+    });
+    match chain::rpc_call(url, "eth_call", serde_json::json!([tx, "latest"])).await {
+        Ok(_) => {} // predicted success — nothing to report
+        Err(e) => {
+            let decoded = decode_rpc_error(&e);
+            if decoded.starts_with("reverted:") {
+                // Revert with decoded data: NotActive is the expected
+                // pre-open answer; anything else is a real problem.
+                let timing = decoded.to_ascii_lowercase().contains("notactive");
+                let msg = if timing {
+                    "pre-flight: drop not active yet (expected when the stage opens after the fire time)"
+                        .to_string()
+                } else {
+                    format!("pre-flight: predicted revert at fire time — {decoded}")
+                };
+                if timing {
+                    wallet_store::log_activity(
+                        "mint.preflight",
+                        &format!("Mint #{task_id}: {msg}"),
+                        None,
+                        false,
+                    );
+                    crate::logging::info(
+                        "mint.preflight",
+                        &format!("Mint #{task_id}: {msg}"),
+                    );
+                } else {
+                    // Loud: surface on the task row (error column, task stays
+                    // pending) so the Minting table shows it before launch.
+                    set_status(task_id, "pending", None, Some(&msg));
+                    wallet_store::log_activity(
+                        "mint.preflight",
+                        &format!("Mint #{task_id}: {msg}"),
+                        None,
+                        false,
+                    );
+                    crate::logging::warn(
+                        "mint.preflight",
+                        &format!("Mint #{task_id}: {msg}"),
+                    );
+                }
+            } else if decoded.contains("execution reverted") {
+                // Revert without data — real, but the reason is opaque.
+                let msg = format!("pre-flight: predicted revert at fire time — {decoded}");
+                set_status(task_id, "pending", None, Some(&msg));
+                wallet_store::log_activity(
+                    "mint.preflight",
+                    &format!("Mint #{task_id}: {msg}"),
+                    None,
+                    false,
+                );
+                crate::logging::warn("mint.preflight", &format!("Mint #{task_id}: {msg}"));
+            } else {
+                // Transport / node-side failure — inconclusive, stay quiet.
+                crate::logging::info(
+                    "mint.preflight",
+                    &format!("Mint #{task_id}: pre-flight inconclusive: {decoded}"),
+                );
+            }
+        }
+    }
 }
 
 /// Process one pending/broadcasting task: sign + broadcast or re-poll receipt.

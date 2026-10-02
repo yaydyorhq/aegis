@@ -27,6 +27,7 @@ pub fn run() {
     }));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         // A second launch must focus the running window, not start a second
         // 60ms scheduler + a second SQLite writer against the same aegis.db
         // (two writers → SQLITE_BUSY at exactly the mint fire moment).
@@ -97,6 +98,45 @@ pub fn run() {
                                 None,
                                 false,
                             );
+                        }
+                    }
+                }
+            });
+            // Auto re-scan: re-run the last Collection PnL scan on an interval
+            // so the Dashboard sparkline and net PnL fill themselves. The
+            // interval lives in meta ("pnl_autoscan" minutes, 0 = off) and is
+            // re-read every tick — changing the setting needs no restart.
+            tauri::async_runtime::spawn(async {
+                let mut last_auto = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let minutes = crate::db::meta_get("pnl_autoscan")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if minutes == 0 {
+                        continue;
+                    }
+                    if last_auto.elapsed() < tokio::time::Duration::from_secs(minutes * 60) {
+                        continue;
+                    }
+                    last_auto = tokio::time::Instant::now();
+                    match tauri::async_runtime::spawn(async {
+                        commands::pnl::collection_pnl_rescan().await
+                    })
+                    .await
+                    .expect("rescan task")
+                    {
+                        Ok(Some(_)) => {
+                            logging::info(
+                                "pnl",
+                                &format!("auto re-scan finished (interval {minutes}m)"),
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            logging::warn("pnl", &format!("auto re-scan failed: {e}"));
                         }
                     }
                 }

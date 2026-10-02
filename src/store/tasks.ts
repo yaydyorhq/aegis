@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import type { MintTaskRow } from "../lib/types";
+import { notifyOs, playChime } from "../lib/notify";
 import { pushToast } from "../components/ui";
 import { shortAddress } from "../lib/utils";
 
@@ -78,6 +79,11 @@ function applyNotifications(next: MintTaskRow[]): void {
   }
   for (const hit of statusHits) {
     pushToast(hit.title, hit.tone, hit.detail);
+    // Mint results deserve to reach you even when the window is minimized —
+    // an OS notification while hidden (the toast already covers the visible
+    // case), and a chime either way. Both behind the Settings toggles.
+    if (document.hidden) void notifyOs(hit.title, hit.detail);
+    playChime(hit.tone === "ok");
   }
 }
 

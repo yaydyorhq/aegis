@@ -9,7 +9,9 @@ pub fn meta_get(key: String) -> AppResult<Option<String>> {
 pub fn meta_set(key: String, value: String) -> AppResult<()> {
     // Only allow a small allowlist of keys from the frontend.
     match key.as_str() {
-        "profile_name" | "sidebar_collapsed" | "theme" => crate::db::meta_set(&key, &value),
+        "profile_name" | "sidebar_collapsed" | "theme" | "pnl_autoscan" => {
+            crate::db::meta_set(&key, &value)
+        }
         other => Err(crate::error::AppError::Invalid(format!(
             "unknown meta key: {other}"
         ))),

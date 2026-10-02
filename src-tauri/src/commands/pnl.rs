@@ -51,19 +51,57 @@ pub async fn collection_pnl_scan(
     .await?;
 
     // Persist for the Dashboard "Portfolio performance" panel.
-    let payload = serde_json::to_string(&result)
+    persist_collection_scan(&result)?;
+    Ok(result)
+}
+
+fn persist_collection_scan(
+    result: &collection_pnl::CollectionPnlResult,
+) -> AppResult<()> {
+    let payload = serde_json::to_string(result)
         .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
-    let scanned_at = result.scanned_at;
     let contract_lc = result.contract.to_lowercase();
     crate::db::with_conn(|conn| {
         conn.execute(
             "INSERT INTO collection_pnl_scans(contract, chain_id, payload, scanned_at)
              VALUES (?1,?2,?3,?4)",
-            rusqlite::params![contract_lc, result.chain_id, payload, scanned_at],
+            rusqlite::params![contract_lc, result.chain_id, payload, result.scanned_at],
         )?;
         Ok(())
-    })?;
-    Ok(result)
+    })
+}
+
+/// Re-run the LAST Collection PnL scan with identical parameters (contract,
+/// wallets, window, fee) — the engine behind the Settings "Portfolio auto
+/// re-scan" scheduler. `Ok(None)` when there is nothing to repeat yet.
+#[tauri::command]
+pub async fn collection_pnl_rescan() -> AppResult<Option<collection_pnl::CollectionPnlResult>> {
+    let Some(prev) = collection_pnl_last()? else {
+        return Ok(None);
+    };
+    // Rebuild the exact target list (wallets + externals) from the persisted rows.
+    let mut rebuilt: Vec<collection_pnl::Target> = Vec::new();
+    for r in &prev.rows {
+        rebuilt.push(collection_pnl::Target {
+            wallet_id: r.wallet_id,
+            label: r.label.clone(),
+            address: r.address.clone(),
+        });
+    }
+    if rebuilt.is_empty() {
+        return Ok(None);
+    }
+    let result = collection_pnl::scan(
+        &prev.contract,
+        prev.chain_id,
+        rebuilt,
+        prev.window_blocks,
+        prev.fee_bps,
+        &|_, _, _| {},
+    )
+    .await?;
+    persist_collection_scan(&result)?;
+    Ok(Some(result))
 }
 
 #[tauri::command]
