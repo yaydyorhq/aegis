@@ -618,6 +618,7 @@ mod e2e_integration {
             delay_ms: None,
             mode: Some("simulate".into()),
             opensea_ref: None,
+            retry_until: None,
         })
         .unwrap();
         assert_eq!(t.status, "pending");
@@ -881,6 +882,7 @@ mod e2e_integration {
             nonce_override: None, scheduled_at: None, delay_ms: None,
             mode: Some("simulate".into()),
             opensea_ref: None,
+            retry_until: None,
         }).unwrap();
 
         assert_eq!(task.status, "pending");
@@ -918,6 +920,7 @@ mod e2e_integration {
             nonce_override: None, scheduled_at: None, delay_ms: None,
             mode: Some("simulate".into()),
             opensea_ref: None,
+            retry_until: None,
         }).unwrap();
 
         assert_eq!(task.status, "pending");
@@ -956,6 +959,7 @@ mod e2e_integration {
             nonce_override: None, scheduled_at: None, delay_ms: None,
             mode: Some("simulate".into()),
             opensea_ref: None,
+            retry_until: None,
         }).unwrap();
 
         // Debug: verify what calldata will be sent

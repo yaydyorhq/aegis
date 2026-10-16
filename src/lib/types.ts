@@ -71,6 +71,9 @@ export interface MintTaskRow {
   delay_ms?: number;
   mode?: string;
   poll_attempts?: number;
+  prev_tx_hash?: string | null;
+  bump_count?: number;
+  retry_until?: number | null;
 }
 
 export interface EligibilityRow {
@@ -192,6 +195,8 @@ export interface MintOpenSeaEnqueueArgs {
   scheduled_at?: number | null;
   delay_ms?: number | null;
   mode?: string | null;
+  /** War window deadline (unix ms); defaults to scheduled_at + 5 min for execute. */
+  retry_until?: number | null;
 }
 
 export interface PortfolioCollectionSummary {

@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS mint_tasks(
   opensea_ref TEXT,
   prev_tx_hash TEXT,
   bump_count INTEGER NOT NULL DEFAULT 0,
-  tx_nonce INTEGER
+  tx_nonce INTEGER,
+  retry_until INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS eligibility_checks(

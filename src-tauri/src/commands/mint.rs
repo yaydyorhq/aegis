@@ -98,6 +98,9 @@ pub struct MintEnqueueArgs {
     pub scheduled_at: Option<i64>,
     pub delay_ms: Option<i64>,
     pub mode: Option<String>,
+    /// War window deadline (unix ms). Defaults to `scheduled_at + 5 min` for
+    /// scheduled execute tasks; ignored for other modes.
+    pub retry_until: Option<i64>,
     /// Optional allowlist JSON/text — filters wallets and injects proof/signature/calldata.
     pub allowlist: Option<String>,
 }
@@ -215,6 +218,7 @@ pub fn mint_enqueue(args: MintEnqueueArgs) -> AppResult<EnqueueBatchResult> {
             delay_ms: args.delay_ms,
             mode: args.mode.clone(),
             opensea_ref: None,
+            retry_until: args.retry_until,
         };
         if let Some(entry) = &entry {
             a = apply_entry_to_enqueue(a, &wallet.address, entry)?;
@@ -321,6 +325,9 @@ pub struct MintOpenSeaEnqueueArgs {
     pub scheduled_at: Option<i64>,
     pub delay_ms: Option<i64>,
     pub mode: Option<String>,
+    /// War window deadline (unix ms). Defaults to `scheduled_at + 5 min` for
+    /// scheduled execute tasks; ignored for other modes.
+    pub retry_until: Option<i64>,
     /// When true, tasks are stored as `draft` — not auto-run until promoted.
     pub draft: Option<bool>,
 }
@@ -395,6 +402,7 @@ pub async fn mint_opensea_enqueue(args: MintOpenSeaEnqueueArgs) -> AppResult<Enq
                 delay_ms: args.delay_ms,
                 mode: args.mode.clone(),
                 opensea_ref: Some(ref_json.clone()),
+                retry_until: args.retry_until,
             };
             match enqueue_fn(enqueue) {
                 Ok(task) => out.push(task),
@@ -483,6 +491,7 @@ pub async fn mint_opensea_enqueue(args: MintOpenSeaEnqueueArgs) -> AppResult<Enq
             delay_ms: args.delay_ms,
             mode: args.mode.clone(),
             opensea_ref: None,
+            retry_until: args.retry_until,
         };
         match enqueue_fn(enqueue) {
             Ok(task) => out.push(task),

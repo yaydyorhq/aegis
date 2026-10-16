@@ -11,6 +11,72 @@ const FLASHBOTS_RPC: &str = "https://rpc.flashbots.net";
 /// declared failed (one attempt ≈ one scheduler run ≈ up to 30s of polling).
 const MAX_POLL_ATTEMPTS: i64 = 40;
 
+/// Robinhood Chain's sequencer accepts `eth_sendRawTransaction` directly.
+/// Submitting there skips the public-RPC gateway hop at fire time. It is
+/// probed before use, so networks where the host is unreachable (DNS blocks)
+/// just fall back to the regular RPC endpoints at no extra cost.
+const ROBINHOOD_CHAIN_ID: i64 = 4663;
+const ROBINHOOD_SEQUENCER_RPC: &str = "https://sequencer.mainnet.chain.robinhood.com";
+
+/// War window for scheduled execute tasks: for this long after the fire time
+/// the exact mint call is probed with eth_call and the send is held until the
+/// contract would accept it. Robinhood Chain has no mempool — the sequencer
+/// executes immediately, so an early tx reverts (SeaDrop NotActive) and the
+/// launch is lost; the probe turns "fire early and hope" into "fire the moment
+/// the drop opens". A revert inside the window re-arms the task instead of
+/// failing it. NULL `retry_until` keeps the legacy one-shot behavior.
+const WAR_DEFAULT_WINDOW_MS: i64 = 300_000;
+/// When a revert carries the real start time (NotActive args), the deadline is
+/// allowed to extend toward it, but never beyond this total from the fire time.
+const WAR_MAX_WAIT_MS: i64 = 1_800_000;
+/// Extra room after the reported start time before the window is declared lost.
+const WAR_OPEN_GRACE_MS: i64 = 120_000;
+/// Probe cadence while the open time is unknown (fast, then slow).
+const WAR_PROBE_FAST_MS: u64 = 100;
+const WAR_PROBE_SLOW_MS: u64 = 400;
+const WAR_PROBE_FAST_SPAN_MS: i64 = 60_000;
+/// Wake this much before the reported start time and probe flat out.
+const WAR_WAKE_LEAD_MS: i64 = 150;
+/// If every probe fails with transport-class errors (not reverts) this long,
+/// fire blind rather than pin the wallet's lane on a flaky node forever.
+const WAR_BLIND_FIRE_MS: i64 = 45_000;
+/// After a wait longer than this the nonce/gas read is refreshed post-open.
+const WAR_REREAD_NONCE_MS: i64 = 3_000;
+
+/// Custom-error selectors that are terminal inside a war window: retrying the
+/// same calldata cannot succeed (sold out, caps, payment, proof/signature).
+const WAR_TERMINAL_SELECTORS: [&str; 15] = [
+    "e12d2314", // MintQuantityExceedsMaxSupply — sold out
+    "b98dabea", // MintQuantityExceedsMaxTokenSupplyForStage
+    "edc01273", // MintQuantityExceedsMaxMintedPerWallet
+    "0d35e921", // IncorrectPayment
+    "198441cb", // MintQuantityCannotBeZero
+    "09bde339", // InvalidProof
+    "d855c4f4", // InvalidSignature
+    "db8b2fad", // SignedMintsMustRestrictFeeRecipients
+    "a0c3ed0a", // InvalidSignedMintPrice
+    "79fc44ed", // InvalidSignedFeeBps
+    "1fe7da08", // PayerNotAllowed
+    "4cc11713", // PayerNotPresent
+    "32c5d8cf", // OnlyINonFungibleSeaDropToken — wrong target contract
+    "15e26ff3", // OnlyAllowedSeaDrop — caller not allowed
+    "798701ac", // DuplicateFeeRecipient
+];
+
+/// Deadline default for a task: explicit value wins; otherwise scheduled
+/// execute tasks get the standard war window, everything else stays one-shot.
+fn default_retry_until(mode: &str, scheduled_at: Option<i64>, explicit: Option<i64>) -> Option<i64> {
+    if mode != "execute" {
+        return None;
+    }
+    explicit.or_else(|| scheduled_at.map(|s| s.saturating_add(WAR_DEFAULT_WINDOW_MS)))
+}
+
+/// Whether a reverted receipt should re-arm the task instead of failing it.
+fn war_requeue_applies(mode: &str, retry_until: Option<i64>, now_ms: i64) -> bool {
+    mode == "execute" && retry_until.map(|d| now_ms < d).unwrap_or(false)
+}
+
 #[derive(Serialize, Clone)]
 pub struct MintTaskRow {
     pub id: i64,
@@ -45,6 +111,8 @@ pub struct MintTaskRow {
     pub prev_tx_hash: Option<String>,
     /// How many times a stuck broadcast has been re-signed with a higher fee.
     pub bump_count: i64,
+    /// War window deadline (unix ms); see [`WAR_DEFAULT_WINDOW_MS`].
+    pub retry_until: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -69,6 +137,9 @@ pub struct EnqueueArgs {
     pub mode: Option<String>,
     /// Deferred OpenSea mint: JSON `{collection, token_id}` resolved at fire time.
     pub opensea_ref: Option<String>,
+    /// Absolute war-window deadline (unix ms). Defaults to
+    /// `scheduled_at + WAR_DEFAULT_WINDOW_MS` for scheduled execute tasks.
+    pub retry_until: Option<i64>,
 }
 
 /// Wallets with a mint lane currently in flight. One lane per wallet keeps
@@ -182,7 +253,7 @@ pub fn count_runnable() -> AppResult<i64> {
     })
 }
 
-const SELECT_COLS: &str = "id, chain_id, contract, quantity, value_wei, calldata, status, tx_hash, error, wallet_id, created_at, updated_at, function_name, is_hex, parameters, rpc_endpoints, flashbots, gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override, scheduled_at, delay_ms, mode, poll_attempts, auto_retries, opensea_ref, prev_tx_hash, bump_count";
+const SELECT_COLS: &str = "id, chain_id, contract, quantity, value_wei, calldata, status, tx_hash, error, wallet_id, created_at, updated_at, function_name, is_hex, parameters, rpc_endpoints, flashbots, gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override, scheduled_at, delay_ms, mode, poll_attempts, auto_retries, opensea_ref, prev_tx_hash, bump_count, retry_until";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
     Ok(MintTaskRow {
@@ -215,6 +286,7 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<MintTaskRow> {
         opensea_ref: r.get(26)?,
         prev_tx_hash: r.get(27)?,
         bump_count: r.get(28)?,
+        retry_until: r.get(29)?,
     })
 }
 
@@ -422,6 +494,27 @@ fn decode_revert_selector(hex: &str) -> Option<&'static str> {
     })
 }
 
+/// Revert data payload (`0x…`) from an RPC error Display string, when present.
+/// Aegis formats RPC failures as
+/// `rpc: {"code":3,"message":"execution reverted","data":"0x13da22f2"}`.
+/// Parsed as JSON (first `{` → last `}`) instead of splitting on the word
+/// "data": a provider URL or message containing that word used to hijack
+/// the split and mis-extract the payload.
+fn rpc_error_data_hex(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let json_payload = serde_json::from_str::<serde_json::Value>(&raw[start..=end]).ok()?;
+    json_payload
+        .get("data")
+        .or_else(|| json_payload.get("error").and_then(|err| err.get("data")))
+        .and_then(|d| d.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("0x") && s.len() >= 10)
+}
+
 /// Turn a raw RPC error into something a human can act on.  Detects:
 ///   * JSON-RPC error codes (-32603 node fault, 3 revert)
 ///   * `data: "0x........"` custom-error selectors
@@ -430,30 +523,7 @@ fn decode_rpc_error(e: &AppError) -> String {
     let raw = e.to_string();
     let lower = raw.to_ascii_lowercase();
 
-    // Pull the revert data payload if present — Aegis formats RPC failures as
-    // `rpc: {"code":3,"message":"execution reverted","data":"0x13da22f2"}`.
-    // Parsed as JSON (first `{` → last `}`) instead of splitting on the word
-    // "data": a provider URL or message containing that word used to hijack
-    // the split and mis-extract the payload.
-    let json_payload = (|| -> Option<serde_json::Value> {
-        let start = raw.find('{')?;
-        let end = raw.rfind('}')?;
-        if end <= start {
-            return None;
-        }
-        serde_json::from_str::<serde_json::Value>(&raw[start..=end]).ok()
-    })();
-    let data_hex = json_payload
-        .as_ref()
-        .and_then(|v| {
-            v.get("data")
-                .or_else(|| v.get("error").and_then(|err| err.get("data")))
-        })
-        .and_then(|d| d.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| s.starts_with("0x") && s.len() >= 10);
-
-    if let Some(d) = data_hex {
+    if let Some(d) = rpc_error_data_hex(&raw) {
         if let Some(name) = decode_revert_selector(&d) {
             return format!("reverted: {name} (raw {d})");
         }
@@ -470,6 +540,335 @@ fn decode_rpc_error(e: &AppError) -> String {
         return format!("{raw} — call reverted without a readable reason");
     }
     raw
+}
+
+// ── War window: probe-gated fire + revert classification ────────────────────
+
+/// Outcome of one failed eth_call probe (a *successful* call is not an error
+/// and never reaches classification).
+#[derive(Debug)]
+enum ProbeVerdict {
+    /// Not open yet (timing) — keep probing, optionally waking at a known time.
+    NotYet { wake_at_ms: Option<i64>, note: String },
+    /// Retrying the same payload cannot succeed — stop the war.
+    Terminal(String),
+    /// The node itself failed (transport/-32603) — retry the probe.
+    Transport(String),
+}
+
+/// Final verdict of the war-window loop.
+#[derive(Debug)]
+enum WarVerdict {
+    /// Probe confirmed the drop is open (or the blind-fire valve tripped).
+    Ready,
+    /// Stopped without sending: terminal revert or window known to be lost.
+    Terminal(String),
+    /// Stopped without sending: the window elapsed before the drop opened.
+    Expired(String),
+}
+
+/// 4-byte selector (lowercase hex, no 0x) and the low 128 bits of each 32-byte
+/// word that follows it. `None` when the payload is not a selector+words shape.
+fn selector_and_words(data_hex: &str) -> Option<(String, Vec<u128>)> {
+    let h = data_hex.trim_start_matches("0x");
+    if h.len() < 8 || !h[..8].chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let selector = h[..8].to_ascii_lowercase();
+    let mut words = Vec::new();
+    let mut i = 8;
+    while i + 64 <= h.len() {
+        // Low 128 bits are enough for timestamps/counters and cannot overflow.
+        words.push(u128::from_str_radix(&h[i + 32..i + 64], 16).ok()?);
+        i += 64;
+    }
+    Some((selector, words))
+}
+
+/// `Error(string)` payload → timing-class keep-waiting vs terminal message.
+fn classify_error_string(data_hex: &str) -> ProbeVerdict {
+    let h = data_hex.trim_start_matches("0x");
+    let msg = (|| -> Option<String> {
+        if h.len() < 8 + 128 {
+            return None;
+        }
+        let len = usize::from_str_radix(&h[8 + 64..8 + 128], 16).ok()?;
+        let start = 8 + 128;
+        if h.len() < start + len * 2 {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = (0..len)
+            .map(|i| u8::from_str_radix(&h[start + i * 2..start + i * 2 + 2], 16).ok())
+            .collect();
+        String::from_utf8(bytes?).ok()
+    })();
+    match msg {
+        Some(m) => {
+            let l = m.to_ascii_lowercase();
+            const TIMING: [&str; 8] = [
+                "not active",
+                "not live",
+                "not open",
+                "not started",
+                "hasn't started",
+                "has not started",
+                "too early",
+                "not yet",
+            ];
+            if TIMING.iter().any(|k| l.contains(k)) {
+                ProbeVerdict::NotYet {
+                    wake_at_ms: None,
+                    note: m,
+                }
+            } else {
+                ProbeVerdict::Terminal(m)
+            }
+        }
+        None => ProbeVerdict::NotYet {
+            wake_at_ms: None,
+            note: "reverted without a readable reason".into(),
+        },
+    }
+}
+
+/// Classify a custom-error payload seen during a war probe.
+fn classify_revert_payload(data_hex: &str, now_ms: i64) -> ProbeVerdict {
+    let Some((sel, words)) = selector_and_words(data_hex) else {
+        return ProbeVerdict::NotYet {
+            wake_at_ms: None,
+            note: format!("reverted {data_hex}"),
+        };
+    };
+    match sel.as_str() {
+        // NotActive(currentTime, startTime, endTime) — seconds.
+        "13da22f2" if words.len() >= 3 => {
+            let now_s = now_ms / 1000;
+            let start_s = words[1].min(i64::MAX as u128) as i64;
+            let end_s = words[2].min(i64::MAX as u128) as i64;
+            if now_s > end_s {
+                return ProbeVerdict::Terminal(format!(
+                    "the drop window already ended (ended at unix {end_s})"
+                ));
+            }
+            if start_s > now_s {
+                return ProbeVerdict::NotYet {
+                    wake_at_ms: Some(start_s.saturating_mul(1000)),
+                    note: format!("NotActive — the drop opens at unix {start_s}"),
+                };
+            }
+            ProbeVerdict::NotYet {
+                wake_at_ms: None,
+                note: "NotActive — the drop is not open at this time".into(),
+            }
+        }
+        // NotActive() without args, plus signed-stage start not reached yet —
+        // both can turn valid once the clock rolls forward.
+        "13da22f2" | "80cb55e2" | "333d33d0" | "6e1d357d" => ProbeVerdict::NotYet {
+            wake_at_ms: None,
+            note: "NotActive — the drop is not open at this time".into(),
+        },
+        "08c379a0" => classify_error_string(data_hex),
+        "4e487b71" => ProbeVerdict::Terminal(
+            "Panic(uint256) — the call reverts deterministically (bad params/value)".into(),
+        ),
+        other if WAR_TERMINAL_SELECTORS.contains(&other) => ProbeVerdict::Terminal(
+            decode_revert_selector(data_hex)
+                .unwrap_or("terminal revert — retrying cannot succeed")
+                .to_string(),
+        ),
+        // Unknown custom errors keep waiting: the cost is only probe traffic,
+        // and a wrong "terminal" call would lose the drop outright.
+        other => ProbeVerdict::NotYet {
+            wake_at_ms: None,
+            note: format!("unclassified revert {other} — still waiting"),
+        },
+    }
+}
+
+/// Verdict for one failed eth_call probe.
+fn probe_verdict(e: &AppError, now_ms: i64) -> ProbeVerdict {
+    let raw = e.to_string();
+    let lower = raw.to_ascii_lowercase();
+    if let Some(data) = rpc_error_data_hex(&raw) {
+        return classify_revert_payload(&data, now_ms);
+    }
+    if lower.contains("insufficient funds") {
+        return ProbeVerdict::Terminal("wallet has insufficient funds for this mint".into());
+    }
+    if lower.contains("execution reverted") {
+        // Revert without data: may be a timing gate that reports nothing.
+        return ProbeVerdict::NotYet {
+            wake_at_ms: None,
+            note: "reverted without a readable reason".into(),
+        };
+    }
+    ProbeVerdict::Transport(format!("probe failed: {raw}"))
+}
+
+/// Hold the fire until the contract would accept the mint call. Runs inside
+/// the task's lane; bounded by `retry_until` (extended toward a start time the
+/// chain itself reports, up to [`WAR_MAX_WAIT_MS`] from now).
+async fn wait_for_mint_ready(
+    id: i64,
+    endpoints: &[String],
+    tx: &serde_json::Value,
+    retry_until: i64,
+) -> WarVerdict {
+    let started = crate::db::now_ms();
+    let mut deadline = retry_until;
+    let mut last_note = "the drop is not accepting the mint yet".to_string();
+    let mut transport_since: Option<i64> = None;
+    loop {
+        let round_started = crate::db::now_ms();
+        if round_started >= deadline {
+            return WarVerdict::Expired(format!(
+                "{last_note} — war window elapsed before the drop opened"
+            ));
+        }
+        let mut wake_at: Option<i64> = None;
+        let mut saw_revert = false;
+        let mut round_note: Option<String> = None;
+        for url in endpoints {
+            match chain::rpc_call(url, "eth_call", serde_json::json!([tx, "latest"])).await {
+                Ok(_) => return WarVerdict::Ready,
+                Err(e) => match probe_verdict(&e, crate::db::now_ms()) {
+                    ProbeVerdict::Terminal(msg) => return WarVerdict::Terminal(msg),
+                    ProbeVerdict::NotYet { wake_at_ms, note } => {
+                        saw_revert = true;
+                        if wake_at_ms.is_some() {
+                            wake_at = wake_at_ms;
+                        }
+                        round_note = Some(note);
+                    }
+                    ProbeVerdict::Transport(msg) => {
+                        if round_note.is_none() {
+                            round_note = Some(msg);
+                        }
+                    }
+                },
+            }
+        }
+        // The fire path can bail out while the gate waits (signing error, bad
+        // params): stop probing the moment the task left 'signing' instead of
+        // lingering until the deadline.
+        let still_signing = crate::db::with_conn(|conn| {
+            let s: Option<String> = conn
+                .query_row("SELECT status FROM mint_tasks WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .ok();
+            Ok(s.as_deref() == Some("signing"))
+        })
+        .unwrap_or(true);
+        if !still_signing {
+            return WarVerdict::Expired("fire path stopped before the drop opened".into());
+        }
+        if let Some(n) = round_note {
+            last_note = n;
+        }
+        if saw_revert {
+            transport_since = None;
+        } else {
+            // No endpoint even executed the call — fire blind rather than pin
+            // the wallet's lane on a flaky node forever.
+            let since = *transport_since.get_or_insert(round_started);
+            if crate::db::now_ms() - since > WAR_BLIND_FIRE_MS {
+                crate::logging::warn(
+                    "mint.war",
+                    &format!(
+                        "Mint #{id}: every probe is a transport failure — firing blind ({last_note})"
+                    ),
+                );
+                return WarVerdict::Ready;
+            }
+        }
+        // The chain can report the real open time (NotActive args): extend the
+        // deadline toward it once and sleep until the wake lead instead of
+        // hammering the node in flat 100ms rounds.
+        if let Some(w) = wake_at {
+            let target_deadline = w.saturating_add(WAR_OPEN_GRACE_MS);
+            if target_deadline > deadline {
+                let cap = started.saturating_add(WAR_MAX_WAIT_MS);
+                if target_deadline > cap {
+                    return WarVerdict::Expired(format!(
+                        "{last_note} — the drop opens later than the war window allows; reschedule closer"
+                    ));
+                }
+                deadline = target_deadline;
+                let _ = crate::db::with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE mint_tasks SET retry_until=?1, updated_at=?2 WHERE id=?3",
+                        rusqlite::params![deadline, crate::db::now_ms(), id],
+                    )?;
+                    Ok(())
+                });
+                wallet_store::log_activity(
+                    "mint.war",
+                    &format!("Mint #{id}: deadline extended to the drop's own start time ({last_note})"),
+                    None,
+                    true,
+                );
+            }
+            let sleep_ms = (w - WAR_WAKE_LEAD_MS - crate::db::now_ms()).clamp(25, 30_000) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        } else {
+            let elapsed = crate::db::now_ms() - started;
+            let ms = if elapsed < WAR_PROBE_FAST_SPAN_MS {
+                WAR_PROBE_FAST_MS
+            } else {
+                WAR_PROBE_SLOW_MS
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+}
+
+/// One concurrent chain-id/nonce/gas-price round per endpoint, falling through
+/// on chain mismatch or failure. Returns `(chain_nonce, gas_price_prefetch)`.
+async fn read_chain_nonce_and_gas(
+    endpoints: &[String],
+    wallet_address: &str,
+    expected_chain_id: i64,
+    need_gas_price: bool,
+) -> Result<(u64, Option<u128>), String> {
+    let mut last_err: Option<String> = None;
+    let mut gas_price_prefetch: Option<u128> = None;
+    for url in endpoints {
+        let rpc = url.clone();
+        let addr = wallet_address.to_string();
+        let (cid, res, gp) = tokio::join!(
+            chain::eth_chain_id(url),
+            chain::get_transaction_count(&rpc, &addr),
+            async {
+                if need_gas_price {
+                    chain::gas_price(url).await.map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+        );
+        if let Ok(cid) = cid {
+            if cid != expected_chain_id {
+                last_err = Some(format!(
+                    "{} is chain {cid}, expected {expected_chain_id}",
+                    chain::redact_rpc(url)
+                ));
+                continue;
+            }
+        }
+        if gas_price_prefetch.is_none() {
+            if let Ok(Some(p)) = gp {
+                gas_price_prefetch = Some(p);
+            }
+        }
+        match res {
+            Ok(n) => return Ok((n, gas_price_prefetch)),
+            Err(e) => {
+                last_err = Some(format!("{url}: {e}"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "unknown".into()))
 }
 
 /// Runtime bytecode as lowercase hex without `0x`, or `None` when the RPC can't say.
@@ -709,6 +1108,14 @@ fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
             return Err(AppError::Invalid("scheduled_at must be >= 0".into()));
         }
     }
+    if let Some(rt) = a.retry_until {
+        if rt < 0 {
+            return Err(AppError::Invalid("retry_until must be >= 0".into()));
+        }
+    }
+    // War window: scheduled execute tasks probe-and-hold until the drop opens
+    // and re-arm on an early NotActive revert (see WAR_DEFAULT_WINDOW_MS).
+    let retry_until = default_retry_until(&mode, a.scheduled_at, a.retry_until);
 
     let rpc_json = a.rpc_endpoints.as_ref().and_then(|list| {
         let cleaned: Vec<&str> = list.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
@@ -769,9 +1176,9 @@ fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
                 chain_id, contract, quantity, value_wei, calldata, status, wallet_id, created_at, updated_at,
                 function_name, is_hex, parameters, rpc_endpoints, flashbots,
                 gas_limit, max_fee_gwei, priority_fee_gwei, nonce_override,
-                scheduled_at, delay_ms, mode, opensea_ref
+                scheduled_at, delay_ms, mode, opensea_ref, retry_until
              )
-             VALUES (?1,?2,?3,?4,?5,?20,?6,?7,?7, ?8,?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19,?21)",
+             VALUES (?1,?2,?3,?4,?5,?20,?6,?7,?7, ?8,?9,?10,?11,?12, ?13,?14,?15,?16, ?17,?18,?19,?21,?22)",
             rusqlite::params![
                 a.chain_id,
                 c,
@@ -794,6 +1201,7 @@ fn enqueue_inner(a: EnqueueArgs, status: &str) -> AppResult<MintTaskRow> {
                 mode,
                 status,
                 a.opensea_ref,
+                retry_until,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1723,6 +2131,18 @@ async fn prep_inner(id: i64) -> AppResult<()> {
         }
     }
 
+    // Warm the chain's own sequencer as well: finishing the TLS handshake now
+    // means the fire-time probe clears it in ~150ms instead of losing the drop
+    // to a cold DNS+TCP roundtrip. Best effort — an unreachable host (ISP DNS
+    // block) only means the fire path sends through the public RPCs.
+    if task.chain_id == ROBINHOOD_CHAIN_ID {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            crate::chain::eth_chain_id(ROBINHOOD_SEQUENCER_RPC),
+        )
+        .await;
+    }
+
     // Warm OpenSea collection metadata for a deferred task: fire time then
     // only has to wait for the stage to open, not for two roundtrips.
     if let Some(r) = task.opensea_ref.as_deref() {
@@ -2153,64 +2573,62 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         ));
     }
 
+    // ── War gate kick-off ───────────────────────────────────────────────────
+    // Scheduled execute tasks hold the fire until eth_call proves the mint
+    // would go through (see WAR_DEFAULT_WINDOW_MS). The probe runs detached
+    // and concurrently with the nonce/fee round below, so when the drop opens
+    // the signed tx is one send away — no serial RTT at T-0.
+    let war_deadline = if task.mode == "execute" {
+        task.retry_until.filter(|d| crate::db::now_ms() < *d)
+    } else {
+        None
+    };
+    let war_handle: Option<tokio::task::JoinHandle<WarVerdict>> = war_deadline.map(|deadline| {
+        let eps = endpoints.clone();
+        let probe_tx = tx.clone();
+        tokio::spawn(async move { wait_for_mint_ready(id, &eps, &probe_tx, deadline).await })
+    });
+
+    // Robinhood's sequencer accepts raw txs directly — the fastest ack at T-0.
+    // Probed with a hard timeout so an unreachable host (ISP DNS block) costs
+    // nothing beyond the cap; only a correct chain answer earns a send slot.
+    let sequencer_handle: Option<tokio::task::JoinHandle<Option<String>>> =
+        if task.chain_id == ROBINHOOD_CHAIN_ID && task.mode == "execute" && !task.flashbots {
+            Some(tokio::spawn(async {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(1_500),
+                    chain::eth_chain_id(ROBINHOOD_SEQUENCER_RPC),
+                )
+                .await
+                {
+                    Ok(Ok(cid)) if cid == ROBINHOOD_CHAIN_ID => {
+                        Some(ROBINHOOD_SEQUENCER_RPC.to_string())
+                    }
+                    _ => None,
+                }
+            }))
+        } else {
+            None
+        };
+
     // One round instead of three: chain-id verification, the nonce fetch and the
     // fee snapshot run concurrently on each endpoint, so a scheduled launch does
     // not burn serial RTTs at T-0 (OSNM-Z prefetches the same reads before the
     // phase opens). A mismatched RPC would otherwise sign a valid tx for the
     // wrong network; a failed nonce falls through to the next endpoint.
     let need_gas_price = task.max_fee_gwei.is_none() || task.priority_fee_gwei.is_none();
-    let mut last_err: Option<String> = None;
-    let mut nonce: Option<u64> = None;
-    let mut gas_price_prefetch: Option<u128> = None;
-    for url in &endpoints {
-        let rpc = url.clone();
-        let addr = wallet.address.clone();
-        let (cid, res, gp) = tokio::join!(
-            chain::eth_chain_id(url),
-            chain::get_transaction_count(&rpc, &addr),
-            async {
-                if need_gas_price {
-                    chain::gas_price(url).await.map(Some)
-                } else {
-                    Ok(None)
-                }
-            },
-        );
-        if let Ok(cid) = cid {
-            if cid != task.chain_id {
-                last_err = Some(format!(
-                    "{} is chain {cid}, expected {}",
-                    chain::redact_rpc(url),
-                    task.chain_id
-                ));
-                continue;
+    let (chain_nonce, gas_price_prefetch) =
+        match read_chain_nonce_and_gas(&endpoints, &wallet.address, task.chain_id, need_gas_price)
+            .await
+        {
+            Ok(v) => v,
+            Err(last_err) => {
+                return fail(format!(
+                    "nonce: all {} endpoint(s) failed: {last_err}",
+                    endpoints.len()
+                ))
             }
-        }
-        if gas_price_prefetch.is_none() {
-            if let Ok(Some(p)) = gp {
-                gas_price_prefetch = Some(p);
-            }
-        }
-        match res {
-            Ok(n) => {
-                nonce = Some(n);
-                break;
-            }
-            Err(e) => {
-                last_err = Some(format!("{url}: {e}"));
-            }
-        }
-    }
-    let chain_nonce = match nonce {
-        Some(n) => n,
-        None => {
-            return fail(format!(
-                "nonce: all {} endpoint(s) failed: {}",
-                endpoints.len(),
-                last_err.unwrap_or_else(|| "unknown".into())
-            ))
-        }
-    };
+        };
     // Reserve through the shared allocator: the fund runner or another lane
     // may already have taken this wallet's next nonce after our chain read.
     let override_nonce = match task.nonce_override.as_deref().map(str::trim) {
@@ -2220,7 +2638,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         },
         _ => None,
     };
-    let nonce = crate::nonce::reserve(wallet_id, task.chain_id, chain_nonce, override_nonce);
+    let mut nonce = crate::nonce::reserve(wallet_id, task.chain_id, chain_nonce, override_nonce);
     // Remember it on the row: every terminal path must be able to hand the
     // reservation back without threading the value through each closure.
     let _ = crate::db::with_conn(|conn| {
@@ -2230,6 +2648,9 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         )?;
         Ok(())
     });
+    // If the war gate below holds the fire this long, chain state has almost
+    // certainly moved and the nonce/gas snapshot is re-read before signing.
+    let nonce_read_at = crate::db::now_ms();
 
     let gas = if let Some(gl) = &task.gas_limit {
         match gl.parse::<u64>() {
@@ -2293,7 +2714,7 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
 
     let auto_mult = auto_fee_multiplier_pct(task.scheduled_at.is_some() && task.mode == "execute");
     // Snapshot taken in the same round as the nonce; re-query only if it failed.
-    let observed_gas_price: u128 = if need_gas_price {
+    let mut observed_gas_price: u128 = if need_gas_price {
         match gas_price_prefetch {
             Some(p) => p,
             None => match chain::gas_price(&primary).await {
@@ -2304,6 +2725,61 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     } else {
         0 // unreachable: both fee fields are manual
     };
+
+    // ── Await the war gate ──────────────────────────────────────────────────
+    // The probe has been running since before the nonce round; this is the
+    // only place the task waits on it. Terminal/expired verdicts stop the war
+    // here — nothing was signed or sent, so `fail` hands the nonce back.
+    if let Some(handle) = war_handle {
+        let verdict = match handle.await {
+            Ok(v) => v,
+            // The probe task panicked: never lose the drop over bookkeeping.
+            Err(_) => WarVerdict::Ready,
+        };
+        match verdict {
+            WarVerdict::Ready => {}
+            WarVerdict::Terminal(msg) => return fail(msg),
+            WarVerdict::Expired(msg) => return fail(msg),
+        }
+        // Held long enough that the chain moved under us (a NotActive wake or
+        // a slow open): refresh nonce and gas before signing.
+        if crate::db::now_ms() - nonce_read_at > WAR_REREAD_NONCE_MS {
+            match read_chain_nonce_and_gas(&endpoints, &wallet.address, task.chain_id, need_gas_price)
+                .await
+            {
+                Ok((fresh_nonce, fresh_gp)) => {
+                    // Hand the held reservation back before taking the fresh
+                    // one, so a nonce that never entered any mempool cannot
+                    // leave a gap behind.
+                    crate::nonce::release(wallet_id, task.chain_id, nonce);
+                    nonce = crate::nonce::reserve(
+                        wallet_id,
+                        task.chain_id,
+                        fresh_nonce,
+                        override_nonce,
+                    );
+                    let _ = crate::db::with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE mint_tasks SET tx_nonce=?1 WHERE id=?2",
+                            rusqlite::params![nonce as i64, id],
+                        )?;
+                        Ok(())
+                    });
+                    if let Some(p) = fresh_gp {
+                        observed_gas_price = p;
+                    }
+                }
+                Err(e) => {
+                    // Refresh failed: keep the held reservation untouched.
+                    crate::logging::warn(
+                        "mint.war",
+                        &format!("Mint #{id}: post-wait nonce refresh failed ({e}); using held nonce {nonce}"),
+                    );
+                }
+            }
+        }
+    }
+
     let (max_fee, tip) = if task.max_fee_gwei.is_some() || task.priority_fee_gwei.is_some() {
         let max_fee = match &task.max_fee_gwei {
             Some(s) => match s.parse::<f64>() {
@@ -2379,6 +2855,10 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
     };
     set_status(id, "broadcasting", Some(&local_hash), None);
 
+    let sequencer_url: Option<String> = match sequencer_handle {
+        Some(h) => h.await.ok().flatten(),
+        None => None,
+    };
     let send_targets: Vec<String> = match task.mode.as_str() {
         "spam" | "sweep" => endpoints,
         _ if task.flashbots => {
@@ -2396,10 +2876,21 @@ pub async fn process_task(id: i64) -> AppResult<MintTaskRow> {
         // Plain execute walks the endpoint list in order: a transient primary
         // rejection (429/503/timeout) previously killed the launch because the
         // fallbacks were only used for nonce/estimation, never for the send.
-        _ => endpoints,
+        // The chain's own sequencer goes first when the probe confirmed it —
+        // txs land one hop sooner at T-0, with the RPCs as rejection fallback.
+        _ => {
+            let mut v = endpoints;
+            if let Some(seq) = sequencer_url {
+                if !v.iter().any(|u| *u == seq) {
+                    v.insert(0, seq);
+                }
+            }
+            v
+        }
     };
 
     let mut first_hash: Option<String> = None;
+    let mut last_err: Option<String> = None;
 
     for (i, url) in send_targets.iter().enumerate() {
         if task.mode == "sweep" && first_hash.is_some() {
@@ -2583,6 +3074,43 @@ async fn poll_receipt(id: i64, hash: &str) -> AppResult<MintTaskRow> {
                                 true,
                             );
                             crate::logging::info("mint", &format!("Mint #{id} confirmed {h}"));
+                        } else if war_requeue_applies(
+                            &task.mode,
+                            task.retry_until,
+                            crate::db::now_ms(),
+                        ) {
+                            // Early fire on a no-mempool chain: the sequencer
+                            // executed the tx before the drop opened and it
+                            // reverted (SeaDrop NotActive) — the launch is NOT
+                            // lost while the war window is open. The reverted tx
+                            // consumed its nonce, so it is NOT released; the
+                            // task re-arms and the next fire re-probes and sends
+                            // the moment the contract would accept. A terminal
+                            // revert (sold out, caps) is classified by the probe
+                            // on that next fire and stops the loop there.
+                            let _ = crate::db::with_conn(|conn| {
+                                conn.execute(
+                                    "UPDATE mint_tasks SET status='pending', tx_hash=NULL, prev_tx_hash=NULL, tx_nonce=NULL, poll_attempts=0, bump_count=0, error=?1, updated_at=?2 WHERE id=?3",
+                                    rusqlite::params![
+                                        format!("reverted before the drop opened (tx {h}) — re-armed to fire at open"),
+                                        crate::db::now_ms(),
+                                        id
+                                    ],
+                                )?;
+                                Ok(())
+                            });
+                            crate::logging::warn(
+                                "mint.war",
+                                &format!(
+                                    "Mint #{id}: tx {h} reverted before the drop opened — re-armed"
+                                ),
+                            );
+                            wallet_store::log_activity(
+                                "mint.war",
+                                &format!("Mint #{id}: reverted before the drop opened — re-armed to fire at open (tx {h})"),
+                                None,
+                                true,
+                            );
                         } else {
                             set_status(id, "failed", Some(h), Some("reverted on-chain"));
                             crate::logging::error("mint", &format!("Mint #{id} reverted {h}"));
@@ -3023,6 +3551,137 @@ mod tests {
         assert_eq!(bumped_fee(0, 1), 1);
     }
 
+    // ── War window helpers ──────────────────────────────────────────────────
+
+    fn hx_word(v: u128) -> String {
+        format!("{v:064x}")
+    }
+
+    fn error_string_payload(msg: &str) -> String {
+        let bytes = msg.as_bytes();
+        let mut data = format!("08c379a0{}", hx_word(0x20));
+        data.push_str(&hx_word(bytes.len() as u128));
+        let mut hexed = String::new();
+        for b in bytes {
+            hexed.push_str(&format!("{b:02x}"));
+        }
+        while hexed.len() % 64 != 0 {
+            hexed.push('0');
+        }
+        data.push_str(&hexed);
+        format!("0x{data}")
+    }
+
+    #[test]
+    fn default_retry_until_only_shapes_scheduled_execute() {
+        assert_eq!(
+            default_retry_until("execute", Some(1_000), None),
+            Some(1_000 + WAR_DEFAULT_WINDOW_MS)
+        );
+        assert_eq!(
+            default_retry_until("execute", Some(1_000), Some(9_999)),
+            Some(9_999)
+        );
+        assert_eq!(default_retry_until("execute", None, None), None);
+        assert_eq!(default_retry_until("simulate", Some(1_000), None), None);
+        // Explicit values are ignored for non-execute modes — no window there.
+        assert_eq!(default_retry_until("simulate", Some(1_000), Some(9_999)), None);
+    }
+
+    #[test]
+    fn war_requeue_only_inside_window() {
+        assert!(war_requeue_applies("execute", Some(2_000), 1_999));
+        assert!(!war_requeue_applies("execute", Some(2_000), 2_000));
+        assert!(!war_requeue_applies("execute", None, 0));
+        assert!(!war_requeue_applies("simulate", Some(2_000), 0));
+        assert!(!war_requeue_applies("spam", Some(2_000), 0));
+    }
+
+    /// SeaDrop NotActive(current, start, end) carries the real open time: the
+    /// probe must sleep exactly to it, and stop once the window has closed.
+    #[test]
+    fn not_active_payload_parses_start_time() {
+        let now_s: u128 = 1_700_000_000;
+        let start = now_s + 49;
+        let end = start + 1_000;
+        let data = format!(
+            "0x13da22f2{}{}{}",
+            hx_word(now_s),
+            hx_word(start),
+            hx_word(end)
+        );
+
+        let now_ms = (now_s as i64) * 1_000;
+        match classify_revert_payload(&data, now_ms) {
+            ProbeVerdict::NotYet {
+                wake_at_ms: Some(w),
+                ..
+            } => assert_eq!(w, (start as i64) * 1_000),
+            other => panic!("expected NotYet with wake time, got {other:?}"),
+        }
+
+        // Past the reported end → terminal, retrying cannot succeed.
+        let after = ((end + 5) as i64) * 1_000;
+        assert!(matches!(
+            classify_revert_payload(&data, after),
+            ProbeVerdict::Terminal(_)
+        ));
+    }
+
+    #[test]
+    fn terminal_selectors_stop_the_war() {
+        for sel in ["e12d2314", "edc01273", "0d35e921", "09bde339"] {
+            let data = format!("0x{sel}");
+            assert!(
+                matches!(classify_revert_payload(&data, 0), ProbeVerdict::Terminal(_)),
+                "selector {sel} must be terminal"
+            );
+        }
+        // Unknown custom errors keep waiting — a wrong "terminal" call loses
+        // the drop, while a wrong "wait" only costs probe traffic.
+        assert!(matches!(
+            classify_revert_payload("0xdeadbeef", 0),
+            ProbeVerdict::NotYet { .. }
+        ));
+    }
+
+    #[test]
+    fn error_string_timing_words_keep_waiting() {
+        let timing = error_string_payload("drop is not active yet");
+        assert!(matches!(
+            classify_revert_payload(&timing, 0),
+            ProbeVerdict::NotYet { .. }
+        ));
+
+        let sold_out = error_string_payload("sold out");
+        assert!(matches!(
+            classify_revert_payload(&sold_out, 0),
+            ProbeVerdict::Terminal(_)
+        ));
+    }
+
+    #[test]
+    fn probe_verdict_reads_payloads_and_transport() {
+        let now_ms = 1_700_000_000_000i64;
+        let payload = r#"rpc: {"code":3,"message":"execution reverted","data":"0x13da22f2"}"#;
+        assert!(matches!(
+            probe_verdict(&AppError::Rpc(payload.into()), now_ms),
+            ProbeVerdict::NotYet { .. }
+        ));
+
+        let funds = AppError::Rpc("rpc: insufficient funds for gas * price + value".into());
+        assert!(matches!(
+            probe_verdict(&funds, now_ms),
+            ProbeVerdict::Terminal(_)
+        ));
+
+        let timeout = AppError::Rpc("rpc: request timed out".into());
+        assert!(matches!(
+            probe_verdict(&timeout, now_ms),
+            ProbeVerdict::Transport(_)
+        ));
+    }
+
     /// Quantity fields off real node payloads: hex with letters must parse as
     /// hex (the old generic helper read "0x12" as decimal 12 and dropped any
     /// value containing a-f — silently killing fee bumps).
@@ -3086,6 +3745,7 @@ mod tests {
             delay_ms: None,
             mode: Some("execute".into()),
             opensea_ref: None,
+            retry_until: None,
         })
         .expect("enqueue");
 
@@ -3619,6 +4279,7 @@ mod tests {
             delay_ms: Some(0),
             mode: Some("execute".into()),
             opensea_ref: None,
+            retry_until: None,
         };
 
         let first = enqueue(common.clone()).expect("first enqueue");
@@ -3888,6 +4549,7 @@ mod tests {
             delay_ms: Some(0),
             mode: Some("simulate".into()),
             opensea_ref: None,
+            retry_until: None,
         })
         .expect("enqueue live simulate");
 

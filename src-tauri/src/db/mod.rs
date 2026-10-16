@@ -82,6 +82,10 @@ fn migrate(conn: &Connection) -> AppResult<()> {
     // Nonce handed out by the shared allocator for this attempt — lets every
     // terminal path give it back so the next task does not sign a gap nonce.
     ensure_column(conn, "mint_tasks", "tx_nonce", "INTEGER")?;
+    // War window deadline (unix ms): a scheduled execute task whose tx reverts
+    // on-chain before the drop opens (SeaDrop NotActive) is re-armed instead of
+    // failed until this moment. NULL = legacy one-shot behavior.
+    ensure_column(conn, "mint_tasks", "retry_until", "INTEGER")?;
     // Fund receipt polling: attempts accumulate across runner re-entries so a
     // dropped tx cannot keep a job's queue alive forever.
     ensure_column(
