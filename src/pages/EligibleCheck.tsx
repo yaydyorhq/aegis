@@ -16,7 +16,9 @@ import { ipc } from "../lib/ipc";
 import type {
   ChainRow,
   EnqueueBatchResult,
+  SkippedWallet,
   StageMatrixResult,
+  StageMatrixRow,
 } from "../lib/types";
 import { EmptyState, PageHeader, pushToast } from "../components/ui";
 import { shortAddress } from "../lib/utils";
@@ -73,6 +75,8 @@ export function EligibleCheckPage() {
   const [viewMode, setViewMode] = useState<ViewMode>("table");
   /** Row indices (into matrix.rows) selected for manual queue. */
   const [manualSel, setManualSel] = useState<number[]>([]);
+  /** ON: create pending tasks with schedules (fire at stage open). OFF: legacy drafts. */
+  const [autoSchedule, setAutoSchedule] = useState(true);
 
   const navigate = useNavigate();
   const groupNames = useMemo(() => groupNameMap(groups), [groups]);
@@ -135,6 +139,25 @@ export function EligibleCheckPage() {
     [matrix],
   );
 
+  /** Rows auto-schedule can queue: live now, or a future stage with a start time. */
+  const schedulableRows = useMemo(
+    () =>
+      (matrix?.rows ?? []).filter(
+        (r) =>
+          r.wallet_id != null &&
+          (r.stages.some((s) => s.actionable) ||
+            r.stages.some(
+              (s) =>
+                s.eligible &&
+                s.live_status === "not_started" &&
+                s.starts_at_ms != null,
+            )),
+      ),
+    [matrix],
+  );
+
+  const queueCount = autoSchedule ? schedulableRows.length : eligibleRows.length;
+
   async function onRun(e: FormEvent) {
     e.preventDefault();
     if (selected.length === 0 || !chainId || !collection.trim()) return;
@@ -160,27 +183,94 @@ export function EligibleCheckPage() {
   const allVisibleSelected =
     visibleWallets.length > 0 && visibleWallets.every((w) => selected.includes(w.id));
 
-  async function createDraftTasks(walletIds: number[], label: string) {
-    if (!chainId || !collection.trim() || walletIds.length === 0) return;
+  async function enqueueBatch(
+    walletIds: number[],
+    opts: { scheduledAt?: number | null; draft?: boolean } = {},
+  ): Promise<EnqueueBatchResult> {
+    return ipc<EnqueueBatchResult>("mint_opensea_enqueue", {
+      args: {
+        wallet_ids: walletIds,
+        chain_id: Number(chainId),
+        collection: collection.trim(),
+        quantity: 1,
+        token_id: "0",
+        mode: "execute",
+        draft: opts.draft ?? false,
+        ...(opts.scheduledAt != null ? { scheduled_at: opts.scheduledAt } : {}),
+      },
+    });
+  }
+
+  /**
+   * Auto-schedule ON: live stages resolve now (pending); future stages become
+   * pending tasks scheduled for the stage open (SIWE + calldata resolve at fire
+   * time via the war window); rows with no start hint stay drafts.
+   * Auto-schedule OFF: legacy behavior — everything becomes a draft.
+   */
+  async function createTasks(rows: StageMatrixRow[], label: string) {
+    if (!chainId || !collection.trim() || rows.length === 0) return;
     setQueueing(true);
     setErr(null);
     try {
-      const result = await ipc<EnqueueBatchResult>("mint_opensea_enqueue", {
-        args: {
-          wallet_ids: walletIds,
-          chain_id: Number(chainId),
-          collection: collection.trim(),
-          quantity: 1,
-          token_id: "0",
-          mode: "execute",
-          draft: true, // store as draft — user schedules & runs on Minting page
-        },
-      });
-      const drafted = result.tasks.length;
-      const skipped = result.skipped.length;
-      if (drafted === 0) {
+      const skippedOut: SkippedWallet[] = [];
+      let liveNow = 0;
+      let scheduled = 0;
+      let drafts = 0;
+
+      if (!autoSchedule) {
+        const res = await enqueueBatch(
+          rows.map((r) => r.wallet_id as number),
+          { draft: true },
+        );
+        drafts += res.tasks.length;
+        skippedOut.push(...res.skipped);
+      } else {
+        const liveIds: number[] = [];
+        const byStart = new Map<number, number[]>();
+        const fallback: number[] = [];
+        for (const r of rows) {
+          const id = r.wallet_id as number;
+          if (r.stages.some((s) => s.actionable)) {
+            liveIds.push(id);
+            continue;
+          }
+          const starts = r.stages
+            .filter(
+              (s) =>
+                s.eligible &&
+                s.live_status === "not_started" &&
+                s.starts_at_ms != null,
+            )
+            .map((s) => s.starts_at_ms as number)
+            .sort((a, b) => a - b);
+          if (starts.length > 0) {
+            const when = starts[0];
+            byStart.set(when, [...(byStart.get(when) ?? []), id]);
+          } else {
+            fallback.push(id);
+          }
+        }
+        if (liveIds.length > 0) {
+          const res = await enqueueBatch(liveIds);
+          liveNow += res.tasks.length;
+          skippedOut.push(...res.skipped);
+        }
+        for (const [when, ids] of byStart) {
+          const res = await enqueueBatch(ids, { scheduledAt: when });
+          scheduled += res.tasks.length;
+          skippedOut.push(...res.skipped);
+        }
+        if (fallback.length > 0) {
+          const res = await enqueueBatch(fallback, { draft: true });
+          drafts += res.tasks.length;
+          skippedOut.push(...res.skipped);
+        }
+      }
+
+      const created = liveNow + scheduled + drafts;
+      if (created === 0) {
         const reason =
-          result.skipped
+          skippedOut
             .map((s) => `#${s.wallet_id}: ${s.reason}`)
             .join("; ")
             .slice(0, 400) || "Nothing created";
@@ -188,23 +278,26 @@ export function EligibleCheckPage() {
         pushToast("Task creation failed", "error", reason);
         return;
       }
+      const parts: string[] = [];
+      if (liveNow > 0) parts.push(`${liveNow} live now`);
+      if (scheduled > 0) parts.push(`${scheduled} at stage open`);
+      if (drafts > 0) parts.push(`${drafts} draft${drafts === 1 ? "" : "s"}`);
+      if (skippedOut.length > 0) parts.push(`${skippedOut.length} skipped`);
       pushToast(
-        `${label} created`,
+        `${label} — ${parts.join(" · ")}`,
         "ok",
-        skipped > 0
-          ? `${drafted} draft task(s) · ${skipped} skipped — opening Minting`
-          : `${drafted} draft task(s) — schedule & run on Minting`,
+        "Opening Minting — review, then Run queue",
       );
-      if (skipped > 0) {
+      if (skippedOut.length > 0) {
         setErr(
-          result.skipped
+          skippedOut
             .map((s) => `#${s.wallet_id}: ${s.reason}`)
             .join("; ")
             .slice(0, 400),
         );
       }
       setManualSel([]);
-      // Navigate to Minting so the user can schedule and run.
+      // Navigate to Minting so the user can review and run.
       setTimeout(() => navigate("/minting"), 600);
     } catch (e) {
       setErr(String(e));
@@ -215,17 +308,17 @@ export function EligibleCheckPage() {
   }
 
   function onCreateAll() {
-    void createDraftTasks(
-      eligibleRows.map((r) => r.wallet_id as number),
+    void createTasks(
+      autoSchedule ? schedulableRows : eligibleRows,
       "Auto-create eligible",
     );
   }
 
   function onCreateManual() {
-    const ids = manualSel
-      .map((i) => matrix?.rows[i]?.wallet_id)
-      .filter((id): id is number => id != null);
-    void createDraftTasks(ids, "Manual create");
+    const rows = manualSel
+      .map((i) => matrix?.rows[i])
+      .filter((r): r is StageMatrixRow => r != null && r.wallet_id != null);
+    void createTasks(rows, "Manual create");
   }
 
   function toggleManual(idx: number) {
@@ -262,8 +355,25 @@ export function EligibleCheckPage() {
               </button>
               <button
                 type="button"
+                onClick={() => setAutoSchedule((v) => !v)}
+                title="ON: create pending tasks with a schedule — live stages resolve now, future stages fire at stage open (war window). OFF: create drafts to review manually."
+                className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] ${
+                  autoSchedule
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-line text-muted hover:text-fg"
+                }`}
+              >
+                {autoSchedule ? (
+                  <CheckSquare className="h-3.5 w-3.5" />
+                ) : (
+                  <Square className="h-3.5 w-3.5" />
+                )}
+                Auto-schedule
+              </button>
+              <button
+                type="button"
                 onClick={onCreateAll}
-                disabled={queueing || eligibleRows.length === 0}
+                disabled={queueing || queueCount === 0}
                 className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-40"
               >
                 {queueing ? (
@@ -271,7 +381,7 @@ export function EligibleCheckPage() {
                 ) : (
                   <Zap className="h-3.5 w-3.5" />
                 )}
-                Create tasks ({eligibleRows.length})
+                Create tasks ({queueCount})
               </button>
             </div>
           ) : undefined
@@ -427,7 +537,10 @@ export function EligibleCheckPage() {
                 {pendingRows.length} wallet(s) eligible but stage not live yet —
                 {" "}
                 {pendingRows[0]?.stages.find((s) => s.eligible && !s.actionable)?.schedule_hint ?? "check schedule"}
-                . Queue disabled until the stage opens.
+                .{" "}
+                {autoSchedule
+                  ? "Auto-schedule ON — tasks fire when the stage opens."
+                  : "Queue disabled until the stage opens."}
               </span>
             </div>
           ) : null}
